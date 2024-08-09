@@ -5,6 +5,8 @@
 # directory of this source tree.
 
   $ . "${TEST_FIXTURES}/library.sh"
+  $ . "${TEST_FIXTURES}/library-push-redirector.sh"
+
   $ setup_common_config
   $ GIT_REPO="${TESTTMP}/repo-git"
   $ GIT_SUBMODULE_REPO="${TESTTMP}/repo-submodule"
@@ -21,16 +23,7 @@
   starting Mononoke
   cloning repo in hg client 'repo2'
   $ SKIP_CROSS_REPO_CONFIG=1 setup_configerator_configs
-  $ cat > "$PUSHREDIRECT_CONF/enable" <<EOF
-  > {
-  > "per_repo": {
-  >   "0": {
-  >      "draft_push": false,
-  >      "public_push": true
-  >    }
-  >   }
-  > }
-  > EOF
+  $ enable_pushredirect 0
 # Setup git repository to be used as submodule
   $ mkdir "$GIT_SUBMODULE_REPO"
   $ cd "$GIT_SUBMODULE_REPO"
@@ -83,7 +76,7 @@
   Cloning into '$TESTTMP/repo-git/repo-submodule'...
   done.
   $ git add .
-  $ git commit -am "Added git submodule" 
+  $ git commit -am "Added git submodule"
   [master 67328fd] Added git submodule
    2 files changed, 4 insertions(+)
    create mode 100644 .gitmodules
@@ -117,16 +110,7 @@
   Error: Execution failed
   [1]
 
-  $ cat > "$PUSHREDIRECT_CONF/enable" <<EOF
-  > {
-  > "per_repo": {
-  >   "0": {
-  >      "draft_push": false,
-  >      "public_push": false
-  >    }
-  >   }
-  > }
-  > EOF
+  $ enable_pushredirect 0 false false
 
   $ repo_import \
   > check-additional-setup-steps \
@@ -138,21 +122,7 @@
   * The destination bookmark name is: master_bookmark. * (glob)
   * There is no additional setup step needed! (glob)
 
-# run segmented changelog tailer on master bookmark
-  $ cat >> "$TESTTMP/mononoke-config/repos/repo/server.toml" <<CONFIG
-  > [segmented_changelog_config]
-  > heads_to_include = [
-  >    { bookmark = "master_bookmark" },
-  > ]
-  > CONFIG
-  $ segmented_changelog_tailer_reseed --repo repo  2>&1 | grep -e successfully -e segmented_changelog_tailer
-  * repo name 'repo' translates to id 0 (glob)
-  * SegmentedChangelogTailer initialized, repo_id: 0 (glob)
-  * successfully seeded segmented changelog, repo_id: 0 (glob)
-  * SegmentedChangelogTailer is done, repo_id: 0 (glob)
-
 # Import the repo
-# Segmented changelog should be rebuild for newly imported commits along the way.
   $ with_stripped_logs repo_import \
   > import \
   > "$GIT_REPO" \
@@ -169,7 +139,6 @@
   > --recovery-file-path "$GIT_REPO/recovery_file.json"
   using repo "repo" repoid RepositoryId(0)
   Started importing git commits to Mononoke
-  GitRepo:$TESTTMP/repo-git commit 1 of 2 - Oid:ce435b03 => Bid:071d73e6
   GitRepo:$TESTTMP/repo-git commit 2 of 2 - Oid:67328fd4 => Bid:6f63fa96
   Added commits to Mononoke
   Commit 1/2: Remapped ChangesetId(Blake2(071d73e6b97823ffbde324c6147a785013f479157ade3f83c9b016c8f40c09de)) => ChangesetId(Blake2(4f830791a5ae7a2981d6c252d2be0bd7ebd3b1090080074b4b4bae6deb250b4a))
@@ -178,19 +147,6 @@
   Saved shifted bonsai changesets
   Start deriving data types
   Finished deriving data types
-  Start tailing segmented changelog
-  Using the following segmented changelog heads: [Bookmark(BookmarkKey { name: BookmarkName { bookmark: "master_bookmark" }, category: Branch })]
-  repo 0: SegmentedChangelogTailer initialized
-  starting incremental update to segmented changelog
-  iddag initialized, it covers 3 ids
-  starting the actual update
-  Adding hints for idmap_version 1
-  idmap_version 1 has a full set of hints (4 unhinted IDs is less than chunk size of 5000)
-  IdMap updated, IdDag updated
-  segmented changelog version saved, idmap_version: 1, iddag_version: 858d30cfb08f0cc339b20663ddc4ed84ab67146515a386d735d5d903d2c67586
-  successful incremental update to segmented changelog
-  repo 0: SegmentedChangelogTailer is done
-  Finished tailing segmented changelog
   Start moving the bookmark
   Created bookmark BookmarkKey { name: BookmarkName { bookmark: "repo_import_new_repo" }, category: Branch } pointing to 4f830791a5ae7a2981d6c252d2be0bd7ebd3b1090080074b4b4bae6deb250b4a
   Set bookmark BookmarkKey { name: BookmarkName { bookmark: "repo_import_new_repo" }, category: Branch } to point to ChangesetId(Blake2(a1740c3d4a0f8e012b12c0c93f5a69cc902fe7398d8f334ef202f33c32fc247c))
@@ -309,7 +265,7 @@ Normal log works
   $
 
 But using --stat crashes
-  $ hgedenapi log -r "ancestors(master_bookmark)" --stat
+  $ sl log -r "ancestors(master_bookmark)" --stat
   commit:      426bada5c675
   user:        test
   date:        Thu Jan 01 00:00:00 1970 +0000
@@ -364,7 +320,7 @@ But using --stat crashes
    3 files changed, 5 insertions(+), 0 deletions(-)
   
 
-  $ hgedenapi show 4ad443ff73f01bf1762918fa2be9c21cbdf038ea
+  $ sl show 4ad443ff73f01bf1762918fa2be9c21cbdf038ea
   commit:      4ad443ff73f0
   user:        mononoke <mononoke@mononoke>
   date:        Sat Jan 01 00:00:00 2000 +0000

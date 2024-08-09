@@ -2,7 +2,7 @@
   "name": "sapling-scm",
   "displayName": "Sapling SCM",
   "description": "Sapling: A Scalable, User-Friendly Source Control System",
-  "version": "0.1.52",
+  "version": "0.1.54",
   "publisher": "meta",
   "license": "MIT",
   "engines": {
@@ -52,6 +52,19 @@
           "type": "boolean",
           "description": "%settings.markConflictingFilesResolvedOnSave.description%",
           "default": true
+        },
+        "sapling.comparisonPanelMode": {
+          "type": "string",
+          "enum": [
+            "Auto",
+            "Always Separate Panel"
+          ],
+          "enumDescriptions": [
+            "%settings.comparisonPanelMode.enumDescriptions.auto%",
+            "%settings.comparisonPanelMode.enumDescriptions.always-separate-panel%"
+          ],
+          "description": "%settings.comparisonPanelMode.description%",
+          "default": "Auto"
         },
         "sapling.isl.showInSidebar": {
           "type": "boolean",
@@ -109,6 +122,26 @@
         "category": "%sapling.command-category%"
       },
       {
+        "command": "sapling.open-comparison-view-uncommitted",
+        "title": "%sapling.open-comparison-view-uncommitted-command%",
+        "category": "%sapling.command-category%"
+      },
+      {
+        "command": "sapling.open-comparison-view-head",
+        "title": "%sapling.open-comparison-view-head-command%",
+        "category": "%sapling.command-category%"
+      },
+      {
+        "command": "sapling.open-comparison-view-stack",
+        "title": "%sapling.open-comparison-view-stack-command%",
+        "category": "%sapling.command-category%"
+      },
+      {
+        "command": "sapling.open-comparison-view",
+        "title": "%sapling.open-comparison-view-command%",
+        "when": false
+      },
+      {
         "command": "sapling.isl.focus",
         "title": "Focus Sapling ISL Sidebar"
       },
@@ -121,6 +154,20 @@
         "command": "sapling.copy-remote-file-link",
         "title": "Copy Code Review Link",
         "enablement": "sapling:hasRemoteLinkRepo"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "sapling.open-comparison-view-uncommitted",
+        "key": "ctrl-'",
+        "mac": "cmd-'",
+        "when": "activeWebviewPanelId != 'sapling.isl'"
+      },
+      {
+        "command": "sapling.open-comparison-view-head",
+        "key": "ctrl-shift-'",
+        "mac": "cmd-shift-'",
+        "when": "activeWebviewPanelId != 'sapling.isl'"
       }
     ],
     "menus": {
@@ -184,9 +231,9 @@
     "vsce": "^2.15.0"
   },
   "devDependencies": {
-    "@stylexjs/stylex": "^0.4.1",
     "@rollup/plugin-json": "^6.1.0",
     "@rollup/plugin-replace": "^5.0.5",
+    "@stylexjs/stylex": "^0.4.1",
     "@types/circular-dependency-plugin": "^5.0.5",
     "@types/jest": "29.5.12",
     "@types/node": "^16.11.7",
@@ -201,7 +248,7 @@
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "ts-jest": "29",
-    "ts-node": "^10.9.1",
+    "tsx": "^4.16.2",
     "typescript": "^5.4.5",
     "vite-plugin-stylex": "^0.4.1",
     "vscode-uri": "^3.0.6"

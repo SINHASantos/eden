@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use anyhow::Error;
-use changeset_fetcher::ChangesetFetcherRef;
+use commit_graph::CommitGraphRef;
 use context::CoreContext;
 use fbinit::FacebookInit;
 use maplit::btreemap;
@@ -18,6 +18,7 @@ use megarepo_config::Target;
 use megarepo_mapping::CommitRemappingState;
 use megarepo_mapping::SourceName;
 use megarepo_mapping::REMAPPING_STATE_FILE;
+use metaconfig_types::RepoConfigArc;
 use mononoke_types::NonRootMPath;
 use tests_utils::bookmark;
 use tests_utils::list_working_copy_utf8;
@@ -25,6 +26,7 @@ use tests_utils::resolve_cs_id;
 use tests_utils::CreateCommitContext;
 
 use crate::add_sync_target::AddSyncTarget;
+use crate::common::MegarepoOp;
 use crate::megarepo_test_utils::MegarepoTest;
 use crate::megarepo_test_utils::SyncTargetConfigBuilder;
 use crate::remerge_source::RemergeSource;
@@ -73,11 +75,17 @@ async fn test_remerge_source_simple(fb: FacebookInit) -> Result<(), Error> {
 
     let configs_storage: Arc<dyn MononokeMegarepoConfigs> = Arc::new(test.configs_storage.clone());
 
-    let sync_target_config =
-        test.configs_storage
-            .get_config_by_version(ctx.clone(), target.clone(), version.clone())?;
     let add_sync_target =
         AddSyncTarget::new(&configs_storage, &test.mononoke, &test.mutable_renames);
+    let repo = add_sync_target
+        .find_repo_by_id(&ctx, target.repo_id)
+        .await?;
+    let repo_config = repo.repo().repo_config_arc();
+
+    let sync_target_config = test
+        .configs_storage
+        .get_config_by_version(ctx.clone(), repo_config, target.clone(), version.clone())
+        .await?;
     add_sync_target
         .run(
             &ctx,
@@ -149,8 +157,8 @@ async fn test_remerge_source_simple(fb: FacebookInit) -> Result<(), Error> {
 
     let parents = test
         .blobrepo
-        .changeset_fetcher()
-        .get_parents(&ctx, target_cs_id)
+        .commit_graph()
+        .changeset_parents(&ctx, target_cs_id)
         .await?;
     assert_eq!(parents[0], old_target_cs_id);
 

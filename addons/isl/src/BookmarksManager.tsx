@@ -6,11 +6,11 @@
  */
 
 import type {BookmarkKind} from './Bookmark';
-import type {TypeaheadResult} from './CommitInfoView/types';
 import type {Result, StableInfo} from './types';
+import type {TypeaheadResult} from 'isl-components/Types';
 import type {ReactNode} from 'react';
 
-import {Banner, BannerKind} from './Banner';
+import {spacing} from '../../components/theme/tokens.stylex';
 import {Bookmark} from './Bookmark';
 import {
   addManualStable,
@@ -20,26 +20,26 @@ import {
   removeManualStable,
 } from './BookmarksData';
 import serverAPI from './ClientToServerAPI';
-import {extractTokens} from './CommitInfoView/Tokens';
 import {Column, Row, ScrollY} from './ComponentUtils';
 import {DropdownFields} from './DropdownFields';
-import {InlineErrorBadge} from './ErrorNotice';
 import {useCommandEvent} from './ISLShortcuts';
 import {Internal} from './Internal';
-import {Kbd} from './Kbd';
-import {Subtle} from './Subtle';
-import {Tooltip} from './Tooltip';
-import {Button} from './components/Button';
-import {Checkbox} from './components/Checkbox';
-import {Typeahead} from './components/Typeahead';
 import {T, t} from './i18n';
 import {readAtom} from './jotaiUtils';
 import {latestDag} from './serverAPIState';
-import {spacing} from './tokens.stylex';
 import * as stylex from '@stylexjs/stylex';
+import {Banner, BannerKind} from 'isl-components/Banner';
+import {Button} from 'isl-components/Button';
+import {Checkbox} from 'isl-components/Checkbox';
+import {InlineErrorBadge} from 'isl-components/ErrorNotice';
+import {Icon} from 'isl-components/Icon';
+import {Kbd} from 'isl-components/Kbd';
+import {Subtle} from 'isl-components/Subtle';
+import {extractTokens} from 'isl-components/Tokens';
+import {Tooltip} from 'isl-components/Tooltip';
+import {Typeahead} from 'isl-components/Typeahead';
 import {atom, useAtom, useAtomValue} from 'jotai';
 import React, {useState} from 'react';
-import {Icon} from 'shared/Icon';
 import {KeyCode, Modifier} from 'shared/KeyboardShortcuts';
 import {firstLine, notEmpty} from 'shared/utils';
 

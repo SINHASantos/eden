@@ -28,9 +28,11 @@ use crate::errors::NotFoundError;
 use crate::id::Group;
 use crate::id::Id;
 use crate::iddagstore::IdDagStore;
-use crate::iddagstore::InProcessStore;
 #[cfg(any(test, feature = "indexedlog-backend"))]
 use crate::iddagstore::IndexedLogStore;
+use crate::iddagstore::MemStore;
+use crate::idset;
+use crate::idset::Span;
 use crate::ops::Persist;
 use crate::ops::StorageVersion;
 #[cfg(any(test, feature = "indexedlog-backend"))]
@@ -39,8 +41,6 @@ use crate::segment::FlatSegment;
 use crate::segment::PreparedFlatSegments;
 use crate::segment::Segment;
 use crate::segment::SegmentFlags;
-use crate::spanset;
-use crate::spanset::Span;
 use crate::types_ext::PreparedFlatSegmentsExt;
 use crate::Error::Programming;
 use crate::IdSegment;
@@ -64,7 +64,7 @@ use crate::VerLink;
 /// graphs about how segments help with ancestry queries.
 ///
 /// [`IdDag`] is often used together with [`IdMap`] to allow customized names
-/// on vertexes. The [`NameDag`] type provides an easy-to-use interface to
+/// on vertexes. The [`Dag`] type provides an easy-to-use interface to
 /// keep [`IdDag`] and [`IdMap`] in sync.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct IdDag<Store> {
@@ -122,11 +122,11 @@ impl TryClone for IdDag<IndexedLogStore> {
     }
 }
 
-impl IdDag<InProcessStore> {
+impl IdDag<MemStore> {
     /// Instantiate an [`IdDag`] that stores all it's data in process. Useful for scenarios that
     /// do not require data persistance.
-    pub fn new_in_process() -> Self {
-        let store = InProcessStore::new();
+    pub fn new_in_memory() -> Self {
+        let store = MemStore::new();
         Self {
             store,
             new_seg_size: default_seg_size(),
@@ -169,7 +169,7 @@ impl<Store: IdDagStore> IdDag<Store> {
 
     /// Returns whether the iddag contains segments for the given `id`.
     pub fn contains_id(&self, id: Id) -> Result<bool> {
-        Ok(self.all()?.contains(id))
+        Ok(self.all_with_virtual()?.contains(id))
     }
 
     pub(crate) fn version(&self) -> &VerLink {
@@ -576,7 +576,7 @@ impl<Store: IdDagStore> IdDag<Store> {
 
         let push = |seg: FlatSegment| segments.push(seg);
         let span_iter = set.as_spans().iter().cloned();
-        spanset::intersect_iter(seg_iter, span_iter, push);
+        idset::intersect_iter(seg_iter, span_iter, push);
 
         Ok(PreparedFlatSegments {
             segments: segments.into_iter().collect(),
@@ -586,7 +586,15 @@ impl<Store: IdDagStore> IdDag<Store> {
 
 // User-facing DAG-related algorithms.
 pub trait IdDagAlgorithm: IdDagStore {
-    /// Return a [`IdSet`] that covers all ids stored in this [`IdDag`].
+    /// Return a [`IdSet`] that covers all ids stored in this [`IdDag`],
+    /// i.e. everything including the VIRTUAL group.
+    fn all_with_virtual(&self) -> Result<IdSet> {
+        // Intentionally skip the VIRTUAL group.
+        self.all_ids_in_groups(&Group::ALL)
+    }
+
+    /// Return a [`IdSet`] that covers persistable ids stored in this [`IdDag`],
+    /// i.e. everything exluding the VIRTUAL group.
     fn all(&self) -> Result<IdSet> {
         // Intentionally skip the VIRTUAL group.
         self.all_ids_in_groups(&[Group::MASTER, Group::NON_MASTER])
@@ -1261,7 +1269,7 @@ pub trait IdDagAlgorithm: IdDagStore {
         };
 
         let max_level = self.max_level()?;
-        for span in self.all()?.as_spans() {
+        for span in self.all_with_virtual()?.as_spans() {
             visit_segments(&mut ctx, *span, max_level)?;
         }
 
@@ -1397,7 +1405,8 @@ pub trait IdDagAlgorithm: IdDagStore {
     fn descendants(&self, set: IdSet) -> Result<IdSet> {
         debug!(target: "dag::algo::descendants", "descendants({:?})", &set);
         let roots = set;
-        let result = self.descendants_intersection(&roots, &self.all()?)?;
+        let all = self.all_with_virtual()?;
+        let result = self.descendants_intersection(&roots, &all)?;
         trace!(target: "dag::algo::descendants", " result: {:?}", &result);
         Ok(result)
     }
@@ -2068,6 +2077,10 @@ mod tests {
 
     use super::*;
     use crate::iddagstore::tests::dump_store_state;
+    use crate::tests::dbg;
+    use crate::tests::dbg_iter;
+    use crate::tests::nid;
+    use crate::tests::vid;
 
     #[test]
     fn test_segment_basic_lookups() {
@@ -2163,11 +2176,11 @@ mod tests {
         dag.build_segments(Id(1001), &get_parents).unwrap();
         let all = dag.all().unwrap();
         // Id 0 is not referred.
-        assert_eq!(format!("{:?}", &all), "1..=1001");
+        assert_eq!(dbg(&all), "1..=1001");
         assert_eq!(all.count(), 1001);
 
         // Insert discontinuous segments.
-        let mut dag = IdDag::new_in_process();
+        let mut dag = IdDag::new_in_memory();
         // 10..=20
         dag.build_segments(Id(20), &|p| {
             Ok(if p > Id(10) { vec![p - 1] } else { vec![] })
@@ -2185,7 +2198,7 @@ mod tests {
         })
         .unwrap();
         let all = dag.all().unwrap();
-        assert_eq!(format!("{:?}", &all), "3 4 5 10..=20 30..=40");
+        assert_eq!(dbg(&all), "3 4 5 10..=20 30..=40");
         assert_eq!(all.count(), 25);
     }
 
@@ -2239,7 +2252,7 @@ mod tests {
 
         // Segment 20..=30 shouldn't have the "ONLY_HEAD" flag because of the gap.
         // In debug output it does not have "H" prefix.
-        let mut dag = IdDag::new_in_process();
+        let mut dag = IdDag::new_in_memory();
         dag.build_segments_from_prepared_flat_segments(&prepared)
             .unwrap();
         let iter = dag.iter_segments_ascending(Id(0), 0).unwrap();
@@ -2250,7 +2263,7 @@ mod tests {
     fn test_roots_max_level_empty() {
         // Create segments in a way that the highest level
         // contains no segments in the master group.
-        let mut iddag = IdDag::new_in_process();
+        let mut iddag = IdDag::new_in_memory();
         let mut prepared = PreparedFlatSegments {
             segments: vec![
                 FlatSegment {
@@ -2289,15 +2302,15 @@ mod tests {
         assert_eq!(iddag.max_level().unwrap(), 2);
 
         let all = iddag.all().unwrap();
-        assert_eq!(format!("{:?}", &all), "0..=10 N0..=N19");
+        assert_eq!(dbg(&all), "0..=10 N0..=N19");
 
         let roots = iddag.roots(all).unwrap();
-        assert_eq!(format!("{:?}", roots), "0 N0 N5 N10 N15");
+        assert_eq!(dbg(roots), "0 N0 N5 N10 N15");
     }
 
     #[test]
     fn test_strip() {
-        let mut iddag = IdDag::new_in_process();
+        let mut iddag = IdDag::new_in_memory();
         let mut prepared = PreparedFlatSegments::default();
         prepared.segments.insert(FlatSegment {
             low: Id(0),
@@ -2339,7 +2352,7 @@ mod tests {
             all_after_remove.union(&removed).as_spans(),
             all_before_remove.as_spans()
         );
-        assert_eq!(format!("{:?}", &removed), "70..=100 201..=300 N0..=N100");
+        assert_eq!(dbg(&removed), "70..=100 201..=300 N0..=N100");
         assert_eq!(
             dump_store_state(&iddag.store, &all_before_remove),
             "\nLv0: RH0-69[], 101-200[50], N101-N200[50]\nP->C: 50->101, 50->N101"
@@ -2347,8 +2360,67 @@ mod tests {
     }
 
     #[test]
+    fn test_virtual() -> Result<()> {
+        let dir = tempdir()?;
+        let mut iddag = IdDag::open(dir.path())?;
+        let mut prepared = PreparedFlatSegments::default();
+        prepared.segments.insert(FlatSegment {
+            low: nid(0),
+            high: nid(5),
+            parents: Vec::new(),
+        });
+        prepared.segments.insert(FlatSegment {
+            low: vid(0),
+            high: vid(3),
+            parents: vec![nid(2)],
+        });
+        prepared.segments.insert(FlatSegment {
+            low: vid(5),
+            high: vid(8),
+            parents: vec![nid(3), vid(2)],
+        });
+        iddag.build_segments_from_prepared_flat_segments(&prepared)?;
+
+        // all() skips VIRTUAL.
+        assert_eq!(dbg(iddag.all()?), "N0..=N5");
+
+        // all_with_virtual() includes VIRTUAL.
+        assert_eq!(dbg(iddag.all_with_virtual()?), "N0..=N5 V0..=V3 V5..=V8");
+
+        // children() follows into VIRTUAL.
+        assert_eq!(dbg(iddag.children(nid(3).into())?), "N4 V5");
+        assert_eq!(dbg(iddag.children_id(nid(3))?), "N4 V5");
+        assert_eq!(dbg(iddag.children_set(nid(3).into())?), "N4 V5");
+        assert_eq!(dbg(iddag.children_id(vid(2))?), "V3 V5");
+        assert_eq!(dbg(iddag.children_set(vid(2).into())?), "V3 V5");
+
+        // descenants() follows into VIRTUAL.
+        assert_eq!(
+            dbg(iddag.descendants(nid(2).into())?),
+            "N2..=N5 V0..=V3 V5..=V8"
+        );
+        assert_eq!(dbg(iddag.descendants(vid(2).into())?), "V2 V3 V5..=V8");
+
+        // range() works with VIRTUAL.
+        assert_eq!(
+            dbg(iddag.range(nid(1).into(), vid(2).into())?),
+            "N1 N2 V0 V1 V2"
+        );
+
+        // Reloading drops VIRTUAL.
+        {
+            let lock = iddag.lock()?;
+            iddag.persist(&lock)?;
+            let iddag2 = IdDag::open(dir.path())?;
+            assert_eq!(dbg(iddag2.all_with_virtual()?), "N0..=N5");
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn test_id_set_to_id_segments() {
-        let mut iddag = IdDag::new_in_process();
+        let mut iddag = IdDag::new_in_memory();
 
         // Insert some segments. Create a few levels.
         let mut prepared = PreparedFlatSegments::default();
@@ -2451,26 +2523,13 @@ mod tests {
             .back()
             .unwrap()
             .clone();
-        assert_eq!(format!("{:?}", &high_level_id_seg), "L2 0..=24 []R");
+        assert_eq!(dbg(&high_level_id_seg), "L2 0..=24 []R");
         let low_level_id_segs = iddag
             .id_segment_to_lower_level_id_segments(&high_level_id_seg)
             .unwrap();
         assert_eq!(
-            format!("{:?}", &low_level_id_segs),
+            dbg(&low_level_id_segs),
             "[L1 15..=24 [11, 14, 9], L1 0..=14 []R]"
         );
-    }
-
-    fn dbg_iter<'a, T: std::fmt::Debug>(iter: Box<dyn Iterator<Item = Result<T>> + 'a>) -> String {
-        let v = iter.map(|s| s.unwrap()).collect::<Vec<_>>();
-        dbg(v)
-    }
-
-    fn dbg<T: std::fmt::Debug>(t: T) -> String {
-        format!("{:?}", t)
-    }
-
-    fn nid(i: u64) -> Id {
-        Group::NON_MASTER.min_id() + i
     }
 }

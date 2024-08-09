@@ -17,6 +17,14 @@
 #include "eden/common/utils/RefPtr.h"
 #include "eden/fs/eden-config.h"
 
+/**
+ * All the EdenFS stats are documented in the EdenFS wiki
+ * https://www.internalfb.com/intern/wiki/EdenFS/Development_Tips/EdenFS_ODS_Counters_and_Duration/
+ * as well as the .md files in eden/fs/docs/stats/EdenStats.md
+ * if you are adding or editing stats, please consider updating
+ * the wiki and the .md files.
+ */
+
 namespace facebook::eden {
 
 struct FuseStats;
@@ -32,6 +40,7 @@ struct InodeMapStats;
 struct InodeMetadataTableStats;
 struct BlobCacheStats;
 struct TreeCacheStats;
+struct ScmStatusCacheStats;
 struct FakeStats;
 
 class EdenStats : public RefCounted {
@@ -87,6 +96,7 @@ class EdenStats : public RefCounted {
   ThreadLocal<InodeMetadataTableStats> inodeMetadataTableStats_;
   ThreadLocal<BlobCacheStats> blobCacheStats_;
   ThreadLocal<TreeCacheStats> treeCacheStats_;
+  ThreadLocal<ScmStatusCacheStats> scmStatusCacheStats_;
   ThreadLocal<FakeStats> fakeStats_;
 };
 
@@ -163,6 +173,12 @@ inline BlobCacheStats& EdenStats::getStatsForCurrentThread<BlobCacheStats>() {
 template <>
 inline TreeCacheStats& EdenStats::getStatsForCurrentThread<TreeCacheStats>() {
   return *treeCacheStats_.get();
+}
+
+template <>
+inline ScmStatusCacheStats&
+EdenStats::getStatsForCurrentThread<ScmStatusCacheStats>() {
+  return *scmStatusCacheStats_.get();
 }
 
 template <>
@@ -412,8 +428,19 @@ struct PrjfsStats : StatsGroup<PrjfsStats> {
  */
 struct ObjectStoreStats : StatsGroup<ObjectStoreStats> {
   Duration getTree{"store.get_tree_us"};
+  Duration getTreeMemoryDuration{"store.get_tree.memory_us"};
+  Duration getTreeLocalstoreDuration{"store.get_tree.localstore_us"};
+  Duration getTreeBackingstoreDuration{"store.get_tree.backingstore_us"};
+  Duration getTreeMetadata{"store.get_tree_metadata_us"};
   Duration getBlob{"store.get_blob_us"};
   Duration getBlobMetadata{"store.get_blob_metadata_us"};
+  Duration getBlobMetadataMemoryDuration{"store.get_blob_metadata.memory_us"};
+  Duration getBlobMetadataLocalstoreDuration{
+      "store.get_blob_metadata.localstore_us"};
+  Duration getBlobMetadataBackingstoreDuration{
+      "store.get_blob_metadata.backingstore_us"};
+  Duration getBlobMetadataFromBlobDuration{
+      "store.get_blob_metadata.from_blob_us"};
   Duration getRootTree{"store.get_root_tree_us"};
 
   Counter getBlobFromMemory{"object_store.get_blob.memory"};
@@ -425,6 +452,11 @@ struct ObjectStoreStats : StatsGroup<ObjectStoreStats> {
   Counter getTreeFromLocalStore{"object_store.get_tree.local_store"};
   Counter getTreeFromBackingStore{"object_store.get_tree.backing_store"};
   Counter getTreeFailed{"object_store.get_tree_failed"};
+
+  Counter getTreeMetadataFromMemory{"object_store.get_tree_metadata.memory"};
+  Counter getTreeMetadataFromBackingStore{
+      "object_store.get_tree_metadata.backing_store"};
+  Counter getTreeMetadataFailed{"object_store.get_tree_metadata_failed"};
 
   Counter getRootTreeFromBackingStore{
       "object_store.get_root_tree.backing_store"};
@@ -472,6 +504,12 @@ struct SaplingBackingStoreStats : StatsGroup<SaplingBackingStoreStats> {
   Counter fetchTreeFailure{"store.sapling.fetch_tree_failure"};
   Counter fetchTreeRetrySuccess{"store.sapling.fetch_tree_retry_success"};
   Counter fetchTreeRetryFailure{"store.sapling.fetch_tree_retry_failure"};
+  Duration getTreeMetadata{"store.sapling.get_tree_metadata_us"};
+  Duration fetchTreeMetadata{"store.sapling.fetch_tree_metadata_us"};
+  Counter fetchTreeMetadataLocal{"store.sapling.fetch_tree_metadata_local"};
+  Counter fetchTreeMetadataRemote{"store.sapling.fetch_tree_metadata_remote"};
+  Counter fetchTreeMetadataSuccess{"store.sapling.fetch_tree_metadata_success"};
+  Counter fetchTreeMetadataFailure{"store.sapling.fetch_tree_metadata_failure"};
   Counter getRootTreeLocal{"store.sapling.get_root_tree_local"};
   Counter getRootTreeRemote{"store.sapling.get_root_tree_remote"};
   Counter getRootTreeSuccess{"store.sapling.get_root_tree_success"};
@@ -520,6 +558,10 @@ struct SaplingBackingStoreStats : StatsGroup<SaplingBackingStoreStats> {
 struct JournalStats : StatsGroup<JournalStats> {
   Counter truncatedReads{"journal.truncated_reads"};
   Counter filesAccumulated{"journal.files_accumulated"};
+  Counter journalStatusCacheHit{"journal.status_cache_hit"};
+  Counter journalStatusCachePend{"journal.status_cache_pend"};
+  Counter journalStatusCacheMiss{"journal.status_cache_miss"};
+  Counter journalStatusCacheSkip{"journal.status_cache_skip"};
   Duration accumulateRange{"journal.accumulate_range_us"};
 };
 
@@ -529,6 +571,20 @@ struct ThriftStats : StatsGroup<ThriftStats> {
 
   Duration streamSelectedChangesSince{
       "thrift.StreamingEdenService.streamSelectedChangesSince.streaming_time_us"};
+
+  Counter globFilesSaplingRemoteAPISuccess{
+      "thrift.EdenServiceHandler.glob_files.sapling_remote_api_success"};
+  Counter globFilesSaplingRemoteAPIFallback{
+      "thrift.EdenServiceHandler.glob_files.sapling_remote_api_fallback"};
+  Counter globFilesLocal{"thrift.EdenServiceHandler.glob_files.local_success"};
+  Duration globFilesSaplingRemoteAPISuccessDuration{
+      "thrift.EdenServiceHandler.glob_files.sapling_remote_api_success_duration_us"};
+  Duration globFilesSaplingRemoteAPIFallbackDuration{
+      "thrift.EdenServiceHandler.glob_files.sapling_remote_api_fallback_duration_us"};
+  Duration globFilesLocalDuration{
+      "thrift.EdenServiceHandler.glob_files.local_duration_us"};
+  Duration globFilesLocalOffloadableDuration{
+      "thrift.EdenServiceHandler.glob_files.local_offloadable_duration_us"};
 };
 
 struct OverlayStats : StatsGroup<OverlayStats> {
@@ -601,6 +657,13 @@ struct TreeCacheStats : StatsGroup<TreeCacheStats> {
   Counter getMiss{"tree_cache.get_miss"};
   Counter insertEviction{"tree_cache.insert_eviction"};
   Counter objectDrop{"tree_cache.object_drop"};
+};
+
+struct ScmStatusCacheStats : StatsGroup<TreeCacheStats> {
+  Counter getHit{"scm_status_cache.get_hit"};
+  Counter getMiss{"scm_status_cache.get_miss"};
+  Counter insertEviction{"scm_status_cache.insert_eviction"};
+  Counter objectDrop{"scm_status_cache.object_drop"};
 };
 
 /*

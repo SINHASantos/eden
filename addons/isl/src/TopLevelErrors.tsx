@@ -10,14 +10,14 @@ import type {RepoInfo} from './types';
 import type {TrackErrorName} from 'isl-server/src/analytics/eventNames';
 import type {ReactNode} from 'react';
 
-import {ErrorNotice} from './ErrorNotice';
 import {Internal} from './Internal';
 import {tracker} from './analytics';
 import {allDiffSummaries} from './codeReview/CodeReviewInfo';
-import {Button} from './components/Button';
 import {t, T} from './i18n';
 import platform from './platform';
 import {reconnectingStatus, repositoryInfo} from './serverAPIState';
+import {Button} from 'isl-components/Button';
+import {ErrorNotice} from 'isl-components/ErrorNotice';
 import {useAtomValue} from 'jotai';
 import {useThrottledEffect} from 'shared/hooks';
 

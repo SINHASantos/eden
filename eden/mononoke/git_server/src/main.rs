@@ -20,15 +20,10 @@ use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Error;
 use anyhow::Result;
-use bonsai_git_mapping::BonsaiGitMapping;
-use bonsai_tag_mapping::BonsaiTagMapping;
-use bookmarks::Bookmarks;
-use bookmarks_cache::BookmarksCache;
 use clap::Parser;
 use clientinfo::ClientEntryPoint;
 use cloned::cloned;
 use cmdlib_caching::CachelibSettings;
-use commit_graph::CommitGraph;
 use connection_security_checker::ConnectionSecurityChecker;
 use environment::BookmarkCacheDerivedData;
 use environment::BookmarkCacheKind;
@@ -39,7 +34,6 @@ use futures::channel::oneshot;
 use futures::future::try_select;
 use futures::pin_mut;
 use futures::TryFutureExt;
-use git_symbolic_refs::GitSymbolicRefs;
 use gotham_ext::handler::MononokeHttpHandler;
 use gotham_ext::middleware::ConfigInfoMiddleware;
 use gotham_ext::middleware::LoadMiddleware;
@@ -54,8 +48,9 @@ use gotham_ext::middleware::TlsSessionDataMiddleware;
 use gotham_ext::serve;
 use http::HeaderValue;
 use metaconfig_parser::RepoConfigs;
-use metaconfig_types::RepoConfig;
 use metaconfig_types::ShardedService;
+use middleware::PushvarsParsingMiddleware;
+use mononoke_api::Repo;
 use mononoke_app::args::McrouterAppExtension;
 use mononoke_app::args::ReadonlyArgs;
 use mononoke_app::args::RepoFilterAppExtension;
@@ -67,10 +62,6 @@ use mononoke_app::fb303::Fb303AppExtension;
 use mononoke_app::MononokeApp;
 use mononoke_app::MononokeAppBuilder;
 use mononoke_app::MononokeReposManager;
-use repo_blobstore::RepoBlobstore;
-use repo_derived_data::RepoDerivedData;
-use repo_identity::RepoIdentity;
-use repo_permission_checker::RepoPermissionChecker;
 use slog::info;
 use tokio::net::TcpListener;
 
@@ -91,6 +82,7 @@ mod scuba;
 mod service;
 mod sharding;
 mod util;
+mod write;
 
 const SERVICE_NAME: &str = "mononoke_git_server";
 const SM_CLEANUP_TIMEOUT_SECS: u64 = 60;
@@ -99,46 +91,6 @@ const SM_CLEANUP_TIMEOUT_SECS: u64 = 60;
 // object size results in more entries and possibly higher idle memory usage.
 // More info: https://fburl.com/wiki/i78i3uzk
 const CACHE_OBJECT_SIZE: usize = 256 * 1024;
-
-#[facet::container]
-#[derive(Clone)]
-pub struct Repo {
-    #[facet]
-    repo_identity: RepoIdentity,
-
-    #[init(repo_identity.name().to_string())]
-    name: String,
-
-    #[facet]
-    repo_config: RepoConfig,
-
-    #[facet]
-    repo_blobstore: RepoBlobstore,
-
-    #[facet]
-    bookmarks: dyn Bookmarks,
-
-    #[facet]
-    bonsai_tag_mapping: dyn BonsaiTagMapping,
-
-    #[facet]
-    bonsai_git_mapping: dyn BonsaiGitMapping,
-
-    #[facet]
-    repo_derived_data: RepoDerivedData,
-
-    #[facet]
-    git_symbolic_refs: dyn GitSymbolicRefs,
-
-    #[facet]
-    commit_graph: CommitGraph,
-
-    #[facet]
-    repo_permission_checker: dyn RepoPermissionChecker,
-
-    #[facet]
-    pub warm_bookmarks_cache: dyn BookmarksCache,
-}
 
 /// Mononoke Git Server
 #[derive(Parser)]
@@ -206,7 +158,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
         .with_default_scuba_dataset("mononoke_git_server")
         .with_bookmarks_cache(BookmarkCacheOptions {
             cache_kind: BookmarkCacheKind::Local,
-            derived_data: BookmarkCacheDerivedData::GitOnly,
+            derived_data: BookmarkCacheDerivedData::NoDerivation, // Derivation is already done at push time
         })
         .with_app_extension(WarmBookmarksCacheExtension {})
         .with_app_extension(McrouterAppExtension {})
@@ -298,6 +250,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
                     logger.clone(),
                     common.internal_identity.clone(),
                     ClientEntryPoint::MononokeGitServer,
+                    false,
                 ))
                 .add(RequestContentEncodingMiddleware {})
                 .add(RequestContextMiddleware::new(
@@ -307,6 +260,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
                     None,
                     args.readonly.readonly,
                 ))
+                .add(PushvarsParsingMiddleware {})
                 .add(ResponseContentTypeMiddleware {})
                 .add(PostResponseMiddleware::default())
                 .add(LoadMiddleware::new())

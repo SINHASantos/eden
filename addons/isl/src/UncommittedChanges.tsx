@@ -11,7 +11,6 @@ import type {ChangedFile, ChangedFileType, MergeConflicts, RepoRelativePath} fro
 import type {Comparison} from 'shared/Comparison';
 
 import {Avatar} from './Avatar';
-import {Banner, BannerKind} from './Banner';
 import {File} from './ChangedFile';
 import {
   ChangedFileDisplayTypePicker,
@@ -34,18 +33,13 @@ import {PendingDiffStats} from './CommitInfoView/DiffStats';
 import {temporaryCommitTitle} from './CommitTitle';
 import {OpenComparisonViewButton} from './ComparisonView/OpenComparisonViewButton';
 import {Row} from './ComponentUtils';
-import {ErrorNotice} from './ErrorNotice';
 import {FileTree, FileTreeFolderHeader} from './FileTree';
 import {useGeneratedFileStatuses} from './GeneratedFile';
 import {Internal} from './Internal';
-import {DOCUMENTATION_DELAY, Tooltip} from './Tooltip';
 import {UnsavedFilesCount, confirmUnsavedFiles} from './UnsavedFiles';
 import {tracker} from './analytics';
 import {latestCommitMessageFields} from './codeReview/CodeReviewInfo';
-import {Badge} from './components/Badge';
-import {Button} from './components/Button';
 import GatedComponent from './components/GatedComponent';
-import {TextField} from './components/TextField';
 import {islDrawerState} from './drawerState';
 import {externalMergeToolAtom} from './externalMergeTool';
 import {T, t} from './i18n';
@@ -80,10 +74,16 @@ import {selectedCommits} from './selection';
 import {latestHeadCommit, uncommittedChangesFetchError} from './serverAPIState';
 import {GeneratedStatus} from './types';
 import * as stylex from '@stylexjs/stylex';
+import {Badge} from 'isl-components/Badge';
+import {Banner, BannerKind} from 'isl-components/Banner';
+import {Button} from 'isl-components/Button';
+import {ErrorNotice} from 'isl-components/ErrorNotice';
+import {Icon} from 'isl-components/Icon';
+import {TextField} from 'isl-components/TextField';
+import {DOCUMENTATION_DELAY, Tooltip} from 'isl-components/Tooltip';
 import {useAtom, useAtomValue} from 'jotai';
 import React, {useCallback, useMemo, useEffect, useRef, useState} from 'react';
 import {ComparisonType} from 'shared/Comparison';
-import {Icon} from 'shared/Icon';
 import {useDeepMemo} from 'shared/hooks';
 import {minimalDisambiguousPaths} from 'shared/minimalDisambiguousPaths';
 import {group, notEmpty, partition} from 'shared/utils';

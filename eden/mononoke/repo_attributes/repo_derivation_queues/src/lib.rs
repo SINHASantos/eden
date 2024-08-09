@@ -10,11 +10,14 @@ mod errors;
 mod underived;
 
 use std::collections::HashMap;
+use std::iter::Iterator;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use context::CoreContext;
 use derived_data_manager::DerivedDataManager;
+use ephemeral_blobstore::Bubble;
+use futures::stream::BoxStream;
 use mononoke_types::RepositoryId;
 
 pub use crate::dag_items::DagItemId;
@@ -37,10 +40,15 @@ impl RepoDerivationQueues {
     pub fn queue(&self, config_name: &str) -> Option<Arc<dyn DerivationQueue + Send + Sync>> {
         self.configs_to_queues.get(config_name).cloned()
     }
+    pub fn queues(&self) -> impl Iterator<Item = Arc<dyn DerivationQueue + Send + Sync>> + '_ {
+        self.configs_to_queues.values().cloned()
+    }
 }
 
 #[async_trait]
 pub trait DerivationQueue {
+    fn for_bubble(&self, bubble: Bubble) -> Arc<dyn DerivationQueue + Send + Sync>;
+
     async fn enqueue(
         &self,
         ctx: &CoreContext,
@@ -68,6 +76,8 @@ pub trait DerivationQueue {
         ctx: &CoreContext,
         item_id: DagItemId,
     ) -> Result<EnqueueResponse, InternalError>;
+
+    async fn summary(&self, ctx: &CoreContext) -> Result<DerivationQueueSummary, InternalError>;
 
     fn derived_data_manager(&self) -> &DerivedDataManager;
 
@@ -104,5 +114,9 @@ pub enum DequeueResponse {
         ready_queue_watch:
             Box<dyn futures::future::Future<Output = anyhow::Result<()>> + Unpin + Send + Sync>,
     },
-    Items(Vec<DerivationDagItem>),
+    Items(BoxStream<'static, Result<DerivationDagItem, InternalError>>),
+}
+
+pub struct DerivationQueueSummary {
+    pub items: Vec<DerivationDagItem>,
 }

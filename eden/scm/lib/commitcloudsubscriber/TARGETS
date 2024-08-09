@@ -1,7 +1,7 @@
 load("@fbcode_macros//build_defs:rust_library.bzl", "rust_library")
 load("@fbsource//tools/build_defs:glob_defs.bzl", "glob")
 
-oncall("mercurial_release")
+oncall("sapling")
 
 rust_library(
     name = "commitcloudsubscriber",
@@ -36,12 +36,12 @@ rust_library(
         "fbsource//third-party/rust:parking_lot",
         "fbsource//third-party/rust:regex",
         "fbsource//third-party/rust:reqwest",
-        "fbsource//third-party/rust:rust-ini",
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:serde_json",
         "fbsource//third-party/rust:thiserror",
         "fbsource//third-party/rust:tokio",
         "//common/rust/shed/hostcaps:hostcaps",
+        "//eden/scm/lib/config/set:configset",
         "//eden/scm/lib/identity:identity",
     ],
 )

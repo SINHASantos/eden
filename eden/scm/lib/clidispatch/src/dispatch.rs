@@ -48,11 +48,6 @@ pub fn args() -> Result<Vec<String>> {
 }
 
 fn last_chance_to_abort(early: &HgGlobalOpts, full: &HgGlobalOpts) -> Result<()> {
-    abort_if!(
-        full.profile,
-        "--profile does not support Rust commands (yet)"
-    );
-
     if full.help {
         return Err(errors::UnknownCommand("--help".to_string()).into());
     }
@@ -68,7 +63,7 @@ fn last_chance_to_abort(early: &HgGlobalOpts, full: &HgGlobalOpts) -> Result<()>
     // parse.
     abort_if!(
         early.config != full.config,
-        "option --config may not be abbreviated or used in aliases",
+        "option --config may not be abbreviated, used in aliases, or used as a value for another option",
     );
 
     abort_if!(
@@ -103,7 +98,7 @@ fn early_parse(args: &[String]) -> Result<ParseOutput, ParseError> {
         .parse_args(args)
 }
 
-fn parse(definition: &CommandDefinition, args: &Vec<String>) -> Result<ParseOutput, ParseError> {
+fn parse(definition: &CommandDefinition, args: &[String]) -> Result<ParseOutput, ParseError> {
     let flags = definition
         .flags()
         .into_iter()
@@ -252,17 +247,26 @@ impl Dispatcher {
         // Passing in --verbose also disables this behavior,
         // but that option is handled somewhere else
         if self.early_global_opts.help || hgplain::is_plain(None) {
-            return Err(errors::UnknownCommand(String::new()));
+            return Err(UnknownCommand(String::new()));
         }
-        Ok(if let OptionalRepo::Some(repo) = &self.optional_repo {
-            repo.config().get("commands", "naked-default.in-repo")
-        } else {
+        let command = if let (OptionalRepo::None(_), Some(command)) = (
+            &self.optional_repo,
             self.optional_repo
                 .config()
-                .get("commands", "naked-default.no-repo")
-        }
-        .ok_or_else(|| errors::UnknownCommand(String::new()))?
-        .to_string())
+                .get_nonempty("commands", "naked-default.no-repo"),
+        ) {
+            command
+        } else {
+            // When there is no repo and no default command is specified, users are
+            // unlikely to know what's going on. Because having the in-repo command
+            // is now the expected behavior, we should fall back to that unless
+            // the naked command for no repo is specified.
+            self.optional_repo
+                .config()
+                .get_nonempty("commands", "naked-default.in-repo")
+                .ok_or_else(|| UnknownCommand(String::new()))?
+        };
+        Ok(command.to_string())
     }
 
     fn prepare_command<'a>(

@@ -12,9 +12,8 @@ use bonsai_globalrev_mapping::BonsaiGlobalrevMapping;
 use bonsai_hg_mapping::BonsaiHgMapping;
 use bookmarks::BookmarkUpdateLog;
 use bookmarks::Bookmarks;
-use changeset_fetcher::ChangesetFetcher;
-use changesets::Changesets;
 use commit_graph::CommitGraph;
+use commit_graph::CommitGraphWriter;
 use filenodes::Filenodes;
 use filestore::FilestoreConfig;
 use metaconfig_types::RepoConfig;
@@ -22,12 +21,14 @@ use mononoke_types::RepositoryId;
 use mutable_counters::MutableCounters;
 use phases::Phases;
 use pushrebase_mutation_mapping::PushrebaseMutationMapping;
+use pushredirect::PushRedirectionConfig;
 use repo_blobstore::RepoBlobstore;
 use repo_bookmark_attrs::RepoBookmarkAttrs;
 use repo_cross_repo::RepoCrossRepo;
 use repo_derived_data::RepoDerivedData;
 use repo_identity::RepoIdentity;
 use repo_identity::RepoIdentityRef;
+use sql_query_config::SqlQueryConfig;
 use synced_commit_mapping::SyncedCommitMapping;
 
 #[facet::container]
@@ -44,12 +45,11 @@ pub struct Repo {
         dyn BonsaiHgMapping,
         dyn Bookmarks,
         dyn BookmarkUpdateLog,
-        dyn ChangesetFetcher,
-        dyn Changesets,
         dyn Phases,
         dyn PushrebaseMutationMapping,
         dyn MutableCounters,
         CommitGraph,
+        dyn CommitGraphWriter,
         dyn Filenodes,
     )]
     blob_repo: BlobRepo,
@@ -62,6 +62,12 @@ pub struct Repo {
 
     #[facet]
     config: RepoConfig,
+
+    #[facet]
+    push_redirection_config: dyn PushRedirectionConfig,
+
+    #[facet]
+    sql_query_config: SqlQueryConfig,
 }
 
 impl Repo {

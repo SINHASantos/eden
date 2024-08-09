@@ -42,6 +42,7 @@ pub use crate::changeset::ChangesetContext;
 pub use crate::changeset::ChangesetDiffItem;
 pub use crate::changeset::ChangesetFileOrdering;
 pub use crate::changeset::ChangesetHistoryOptions;
+pub use crate::changeset::ChangesetLinearHistoryOptions;
 pub use crate::changeset::Generation;
 pub use crate::changeset_path::ChangesetPathContentContext;
 pub use crate::changeset_path::ChangesetPathHistoryOptions;
@@ -64,6 +65,8 @@ pub use crate::file::FileType;
 pub use crate::file::HeaderlessUnifiedDiff;
 pub use crate::repo::create_changeset::CreateChange;
 pub use crate::repo::create_changeset::CreateChangeFile;
+pub use crate::repo::create_changeset::CreateChangeFileContents;
+pub use crate::repo::create_changeset::CreateChangeGitLfs;
 pub use crate::repo::create_changeset::CreateCopyInfo;
 pub use crate::repo::create_changeset::CreateInfo;
 pub use crate::repo::land_stack::PushrebaseOutcome;
@@ -190,6 +193,12 @@ impl Mononoke {
 
         Ok(())
     }
+}
+
+pub(crate) fn invalid_push_redirected_request(method_name: &str) -> MononokeError {
+    MononokeError::InvalidRequest(format!(
+        "{method_name} is not supported for push redirected repos"
+    ))
 }
 
 pub mod test_impl {

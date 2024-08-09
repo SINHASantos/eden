@@ -10,20 +10,18 @@ import type {CommitInfo, SuccessorInfo} from './types';
 import type {ReactNode} from 'react';
 import type {ContextMenuItem} from 'shared/ContextMenu';
 
+import {spacing} from '../../components/theme/tokens.stylex';
 import {Bookmarks, createBookmarkAtCommit} from './Bookmark';
 import {openBrowseUrlForHash, supportsBrowseUrlForHash} from './BrowseRepo';
 import {hasUnsavedEditedCommitMessage} from './CommitInfoView/CommitInfoState';
-import {currentComparisonMode} from './ComparisonView/atoms';
+import {showComparison} from './ComparisonView/atoms';
 import {Row} from './ComponentUtils';
 import {DragToRebase} from './DragToRebase';
 import {EducationInfoTip} from './Education';
 import {HighlightCommitsWhileHovering} from './HighlightedCommits';
 import {Internal} from './Internal';
 import {SubmitSelectionButton} from './SubmitSelectionButton';
-import {Subtle} from './Subtle';
-import {latestSuccessorUnlessExplicitlyObsolete} from './SuccessionTracker';
 import {getSuggestedRebaseOperation, suggestedRebaseDestinations} from './SuggestedRebase';
-import {Tooltip} from './Tooltip';
 import {UncommitButton} from './UncommitButton';
 import {UncommittedChanges} from './UncommittedChanges';
 import {tracker} from './analytics';
@@ -35,7 +33,6 @@ import {
 } from './codeReview/CodeReviewInfo';
 import {DiffFollower, DiffInfo} from './codeReview/DiffBadge';
 import {SyncStatus, syncStatusAtom} from './codeReview/syncStatus';
-import {Button} from './components/Button';
 import {FoldButton, useRunFoldPreview} from './fold';
 import {findPublicBaseAncestor} from './getCommitTree';
 import {t, T} from './i18n';
@@ -60,17 +57,19 @@ import {inMergeConflicts, mergeConflicts} from './serverAPIState';
 import {useConfirmUnsavedEditsBeforeSplit} from './stackEdit/ui/ConfirmUnsavedEditsBeforeSplit';
 import {SplitButton} from './stackEdit/ui/SplitButton';
 import {editingStackIntentionHashes} from './stackEdit/ui/stackEditState';
+import {latestSuccessorUnlessExplicitlyObsolete} from './successionUtils';
 import {copyAndShowToast} from './toast';
-import {spacing} from './tokens.stylex';
 import {succeedableRevset} from './types';
 import {short} from './utils';
 import * as stylex from '@stylexjs/stylex';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
+import {Subtle} from 'isl-components/Subtle';
+import {Tooltip} from 'isl-components/Tooltip';
 import {atom, useAtomValue, useSetAtom} from 'jotai';
-import {useAtomCallback} from 'jotai/utils';
 import React, {memo} from 'react';
 import {ComparisonType} from 'shared/Comparison';
 import {useContextMenu} from 'shared/ContextMenu';
-import {Icon} from 'shared/Icon';
 import {MS_PER_DAY} from 'shared/constants';
 import {useAutofocusRef} from 'shared/hooks';
 import {notEmpty} from 'shared/utils';
@@ -142,13 +141,6 @@ export const Commit = memo(
     const clipboardCopy = (text: string, url?: string) =>
       copyAndShowToast(text, url == null ? undefined : clipboardLinkHtml(text, url));
 
-    const viewChangesCallback = useAtomCallback((_get, set) => {
-      set(currentComparisonMode, {
-        comparison: {type: ComparisonType.Committed, hash: commit.hash},
-        visible: true,
-      });
-    });
-
     const confirmUnsavedEditsBeforeSplit = useConfirmUnsavedEditsBeforeSplit();
     async function handleSplit() {
       if (!(await confirmUnsavedEditsBeforeSplit([commit], 'split'))) {
@@ -194,7 +186,7 @@ export const Commit = memo(
       if (!isPublic) {
         items.push({
           label: <T>View Changes in Commit</T>,
-          onClick: viewChangesCallback,
+          onClick: () => showComparison({type: ComparisonType.Committed, hash: commit.hash}),
         });
       }
       if (!isPublic && syncStatus != null && syncStatus !== SyncStatus.InSync) {
@@ -203,10 +195,7 @@ export const Commit = memo(
           items.push({
             label: <T replace={{$provider: provider?.label ?? 'remote'}}>Compare with $provider</T>,
             onClick: () => {
-              writeAtom(currentComparisonMode, {
-                comparison: {type: ComparisonType.SinceLastCodeReviewSubmit, hash: commit.hash},
-                visible: true,
-              });
+              showComparison({type: ComparisonType.SinceLastCodeReviewSubmit, hash: commit.hash});
             },
           });
         }

@@ -5,8 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import {Divider} from './components/Divider';
-import {Icon} from 'shared/Icon';
+import {Divider} from 'isl-components/Divider';
+import {Icon} from 'isl-components/Icon';
 
 import './DropdownFields.css';
 

@@ -10,34 +10,36 @@ mod errors;
 use anyhow::Error;
 use blobstore::Blobstore;
 use blobstore::Loadable;
+use bytes::BytesMut;
 use cas_client::CasClient;
 use context::CoreContext;
 pub use errors::ErrorKind;
 use futures::stream;
 use futures::StreamExt;
+use futures::TryStreamExt;
 use mercurial_types::HgAugmentedManifestId;
 use mercurial_types::HgFileNodeId;
 use mononoke_types::ContentId;
 use mononoke_types::MononokeDigest;
 use stats::prelude::*;
 
-#[cfg(fbcode_build)]
-pub type MononokeCasClient<'a> = ScmCasClient<cas_client::RemoteExecutionCasdClient<'a>>;
-#[cfg(not(fbcode_build))]
-pub type MononokeCasClient<'a> = ScmCasClient<cas_client::DummyCasClient<'a>>;
-
 define_stats! {
     prefix = "mononoke.cas_client";
     uploaded_manifests_count: timeseries(Rate, Sum),
     uploaded_files_count: timeseries(Rate, Sum),
+    uploaded_bytes: dynamic_histogram("{}.uploaded_bytes", (repo_name: String); 1_500_000, 0, 150_000_000, Average, Sum, Count; P 5; P 25; P 50; P 75; P 95; P 97; P 99),
+    small_blobs_uploaded_bytes: dynamic_histogram("{}.small_blobs.uploaded_bytes", (repo_name: String); 1_500_000, 0, 150_000_000, Average, Sum, Count; P 5; P 25; P 50; P 75; P 95; P 97; P 99),
+    large_blobs_uploaded_bytes: dynamic_histogram("{}.large_blobs.uploaded_bytes", (repo_name: String); 1_500_000, 0, 150_000_000, Average, Sum, Count; P 5; P 25; P 50; P 75; P 95; P 97; P 99),
 }
 
 const MAX_CONCURRENT_UPLOADS_TREES: usize = 200;
 const MAX_CONCURRENT_UPLOADS_FILES: usize = 100;
+const MAX_BYTES_FOR_INLINE_UPLOAD: u64 = 3_000_000;
+const SMALL_BLOBS_THRESHOLD: u64 = 2_621_440;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum UploadOutcome {
-    Uploaded,
+    Uploaded(u64),
     AlreadyPresent,
 }
 
@@ -60,6 +62,51 @@ where
         self.client.lookup_blob(digest).await
     }
 
+    fn log_upload_size(&self, size: u64) {
+        let repo_name = self.client.repo_name().to_string();
+        STATS::uploaded_bytes.add_value(size as i64, (repo_name.clone(),));
+        if size <= SMALL_BLOBS_THRESHOLD {
+            STATS::small_blobs_uploaded_bytes.add_value(size as i64, (repo_name,));
+        } else {
+            STATS::large_blobs_uploaded_bytes.add_value(size as i64, (repo_name,));
+        }
+    }
+
+    async fn get_file_digest<'a>(
+        &self,
+        ctx: &'a CoreContext,
+        blobstore: &'a impl Blobstore,
+        content_id: &ContentId,
+    ) -> Result<MononokeDigest, Error> {
+        let meta = filestore::get_metadata(blobstore, ctx, &content_id.to_owned().into())
+            .await?
+            .ok_or(ErrorKind::ContentMissingInBlobstore(content_id.clone()))?;
+        Ok(MononokeDigest(meta.seeded_blake3, meta.total_size))
+    }
+
+    async fn fetch_upload_file<'a>(
+        &self,
+        ctx: &'a CoreContext,
+        blobstore: &'a impl Blobstore,
+        content_id: ContentId,  // for fetching
+        digest: MononokeDigest, // for uploading
+    ) -> Result<UploadOutcome, Error> {
+        let stream = filestore::fetch(blobstore, ctx.clone(), &content_id.into())
+            .await?
+            .ok_or(ErrorKind::MissingInBlobstore(content_id))?;
+        if digest.1 <= MAX_BYTES_FOR_INLINE_UPLOAD {
+            let bytes_to_upload = stream.try_collect::<BytesMut>().await?;
+            self.client
+                .upload_blob(&digest, bytes_to_upload.into())
+                .await?;
+        } else {
+            self.client.streaming_upload_blob(&digest, stream).await?;
+        }
+        STATS::uploaded_files_count.add_value(1);
+        self.log_upload_size(digest.1);
+        Ok(UploadOutcome::Uploaded(digest.1))
+    }
+
     /// Upload a given file to a CAS backend.
     /// Digest of a file can be known a priori (from Augmented Manifest, for example), but it is not required.
     /// Prior lookup flag is used to check if a digest already exists in the CAS backend before fetching data from Mononoke blobstore.
@@ -80,27 +127,15 @@ where
         let digest = match digest {
             Some(digest) => digest.clone(),
             None => {
-                let meta = filestore::get_metadata(blobstore, ctx, &fetch_key.into())
-                    .await?
-                    .ok_or(ErrorKind::ContentMetadataMissingInBlobstore(
-                        filenode_id.clone().into_nodehash(),
-                    ))?;
-                let digest = MononokeDigest(meta.seeded_blake3, meta.total_size);
+                let digest = self.get_file_digest(ctx, blobstore, &fetch_key).await?;
                 if prior_lookup && self.lookup_digest(&digest).await? {
                     return Ok(UploadOutcome::AlreadyPresent);
                 }
                 digest
             }
         };
-        let stream = filestore::fetch(blobstore, ctx.clone(), &fetch_key.into())
-            .await?
-            .ok_or(ErrorKind::MissingInBlobstore(
-                filenode_id.clone().into_nodehash(),
-            ))?;
-
-        self.client.streaming_upload_blob(&digest, stream).await?;
-        STATS::uploaded_files_count.add_value(1);
-        Ok(UploadOutcome::Uploaded)
+        self.fetch_upload_file(ctx, blobstore, fetch_key, digest)
+            .await
     }
 
     /// Upload a given file to a CAS backend (by Content Id)
@@ -111,23 +146,12 @@ where
         content_id: &ContentId,
         prior_lookup: bool,
     ) -> Result<UploadOutcome, Error> {
-        let meta = filestore::get_metadata(blobstore, ctx, &content_id.to_owned().into())
-            .await?
-            .ok_or(ErrorKind::ContentMissingInBlobstore(content_id.clone()))?;
-        let digest = MononokeDigest(meta.seeded_blake3, meta.total_size);
+        let digest = self.get_file_digest(ctx, blobstore, content_id).await?;
         if prior_lookup && self.lookup_digest(&digest).await? {
             return Ok(UploadOutcome::AlreadyPresent);
         }
-        self.client
-            .streaming_upload_blob(
-                &digest,
-                filestore::fetch(blobstore, ctx.clone(), &content_id.to_owned().into())
-                    .await?
-                    .ok_or(ErrorKind::ContentMissingInBlobstore(content_id.clone()))?,
-            )
-            .await?;
-        STATS::uploaded_files_count.add_value(1);
-        Ok(UploadOutcome::Uploaded)
+        self.fetch_upload_file(ctx, blobstore, content_id.clone(), digest)
+            .await
     }
 
     /// Upload given file contents to a Cas backend (batched API)
@@ -229,11 +253,19 @@ where
         }
         let bytes_stream =
             augmented_manifest_envelope.into_content_addressed_manifest_blob(ctx, blobstore);
-        self.client
-            .streaming_upload_blob(&digest, bytes_stream)
-            .await?;
+        if digest.1 <= MAX_BYTES_FOR_INLINE_UPLOAD {
+            let bytes_to_upload = bytes_stream.try_collect::<BytesMut>().await?;
+            self.client
+                .upload_blob(&digest, bytes_to_upload.into())
+                .await?;
+        } else {
+            self.client
+                .streaming_upload_blob(&digest, bytes_stream)
+                .await?;
+        }
         STATS::uploaded_manifests_count.add_value(1);
-        Ok(UploadOutcome::Uploaded)
+        self.log_upload_size(digest.1);
+        Ok(UploadOutcome::Uploaded(digest.1))
     }
 
     /// Upload given augmented trees to a Cas backend (batched API)

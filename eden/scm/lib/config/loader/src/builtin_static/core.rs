@@ -44,6 +44,10 @@ status.modified=blue bold
 status.removed=red bold
 status.unknown=magenta bold underline
 
+[commands]
+naked-default.in-repo=sl
+naked-default.no-repo=help
+
 [git]
 filter=blob:none
 
@@ -51,7 +55,6 @@ filter=blob:none
 filtersuspectsymlink=true
 
 [experimental]
-bisect2=true
 exportstack-max-bytes=1M
 
 log-implicit-follow-threshold=10000
@@ -75,6 +78,9 @@ selectivepulldiscovery=true
 autopullhoistpattern=
 autopullpattern=re:^(?:default|remote)/[A-Za-z0-9._/-]+$
 hoist=default
+
+[scmstore]
+handle-tree-parents=true
 
 [filetype-patterns]
 **/BUCK=buck

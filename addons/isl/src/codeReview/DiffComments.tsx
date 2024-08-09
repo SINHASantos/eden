@@ -8,25 +8,25 @@
 import type {DiffId, DiffComment, DiffCommentReaction} from '../types';
 import type {ParsedDiff} from 'shared/patch/parse';
 
+import {colors, font, radius, spacing} from '../../../components/theme/tokens.stylex';
 import {AvatarImg} from '../Avatar';
 import serverAPI from '../ClientToServerAPI';
 import {SplitDiffTable} from '../ComparisonView/SplitDiffView/SplitDiffHunk';
 import {Column, Row} from '../ComponentUtils';
-import {ErrorNotice} from '../ErrorNotice';
 import {Link} from '../Link';
-import {Subtle} from '../Subtle';
-import {Tooltip} from '../Tooltip';
 import {t} from '../i18n';
 import {atomFamilyWeak, atomLoadableWithRefresh} from '../jotaiUtils';
 import foundPlatform from '../platform';
 import {RelativeDate} from '../relativeDate';
 import {layout} from '../stylexUtils';
-import {colors, font, radius, spacing} from '../tokens.stylex';
 import * as stylex from '@stylexjs/stylex';
+import {ErrorNotice} from 'isl-components/ErrorNotice';
+import {Icon} from 'isl-components/Icon';
+import {Subtle} from 'isl-components/Subtle';
+import {Tooltip} from 'isl-components/Tooltip';
 import {useAtom} from 'jotai';
 import {useEffect} from 'react';
 import {ComparisonType} from 'shared/Comparison';
-import {Icon} from 'shared/Icon';
 import {group} from 'shared/utils';
 
 const diffCommentData = atomFamilyWeak((diffId: DiffId) =>

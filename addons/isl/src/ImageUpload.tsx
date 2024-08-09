@@ -8,19 +8,19 @@
 import type {RefObject} from 'react';
 
 import clientToServerAPI from './ClientToServerAPI';
-import {InlineErrorBadge} from './ErrorNotice';
-import {Tooltip} from './Tooltip';
-import {Button} from './components/Button';
 import {T, t} from './i18n';
-import {readAtom, writeAtom} from './jotaiUtils';
+import {atomFamilyWeak, readAtom, writeAtom} from './jotaiUtils';
 import platform from './platform';
 import {replaceInTextArea, insertAtCursor} from './textareaUtils';
+import {Button} from 'isl-components/Button';
+import {InlineErrorBadge} from 'isl-components/ErrorNotice';
+import {Icon} from 'isl-components/Icon';
+import {Tooltip} from 'isl-components/Tooltip';
 import {atom, useAtomValue} from 'jotai';
 import {useState, type ReactNode, useId} from 'react';
-import {Icon} from 'shared/Icon';
 import {randomId} from 'shared/utils';
 
-export type ImageUploadStatus = {id: number} & (
+export type ImageUploadStatus = {id: number; field: string} & (
   | {status: 'pending'}
   | {status: 'complete'}
   | {status: 'error'; error: Error; resolved: boolean}
@@ -30,19 +30,28 @@ export const imageUploadState = atom<{next: number; states: Record<number, Image
   next: 1,
   states: {},
 });
-export const numPendingImageUploads = atom((get): number => {
-  const state = get(imageUploadState);
-  return Object.values(state.states).filter(state => state.status === 'pending').length;
-});
+
+/**
+ * Number of currently ongoing image uploads for a given field name.
+ * If undefined is givens as the field name, all pending uploads across all fields are counted. */
+export const numPendingImageUploads = atomFamilyWeak((fieldName: string | undefined) =>
+  atom((get): number => {
+    const state = get(imageUploadState);
+    return Object.values(state.states).filter(
+      state => (fieldName == null || state.field === fieldName) && state.status === 'pending',
+    ).length;
+  }),
+);
+
 type UnresolvedErrorImageUploadStatus = ImageUploadStatus & {status: 'error'; resolved: false};
-export const unresolvedErroredImagedUploads = atom(
-  (get): Array<UnresolvedErrorImageUploadStatus> => {
+export const unresolvedErroredImagedUploads = atomFamilyWeak((fieldName: string) =>
+  atom(get => {
     const state = get(imageUploadState);
     return Object.values(state.states).filter(
       (state): state is UnresolvedErrorImageUploadStatus =>
-        state.status === 'error' && !state.resolved,
+        state.field == fieldName && state.status === 'error' && !state.resolved,
     );
-  },
+  }),
 );
 
 function placeholderForImageUpload(id: number): string {
@@ -78,9 +87,15 @@ export async function uploadFile(file: File): Promise<string> {
 /**
  * Summary of ongoing image uploads. Click to cancel all ongoing uploads.
  */
-export function PendingImageUploads({textAreaRef}: {textAreaRef: RefObject<HTMLTextAreaElement>}) {
-  const numPending = useAtomValue(numPendingImageUploads);
-  const unresolvedErrors = useAtomValue(unresolvedErroredImagedUploads);
+export function PendingImageUploads({
+  fieldName,
+  textAreaRef,
+}: {
+  fieldName: string;
+  textAreaRef: RefObject<HTMLTextAreaElement>;
+}) {
+  const numPending = useAtomValue(numPendingImageUploads(fieldName));
+  const unresolvedErrors = useAtomValue(unresolvedErroredImagedUploads(fieldName));
   const [isHovering, setIsHovering] = useState(false);
   const onCancel = () => {
     setIsHovering(false);
@@ -88,17 +103,14 @@ export function PendingImageUploads({textAreaRef}: {textAreaRef: RefObject<HTMLT
     // it just deletes the tracking state, by replacing 'pending' uploads as 'cancelled'.
     writeAtom(imageUploadState, current => {
       const canceledIds: Array<number> = [];
-      // TODO: This cancels ALL ongoing uploads, even from other text areas, if any exist.
-      // imageUploadStates should contain a unique id per text area,
-      // so we can cancel just this text area's uploads
       const newState = {
         ...current,
         states: Object.fromEntries(
           Object.entries(current.states).map(([idStr, state]) => {
             const id = Number(idStr);
-            if (state.status === 'pending') {
+            if (state.field === fieldName && state.status === 'pending') {
               canceledIds.push(id);
-              return [id, {state: 'cancelled', id}];
+              return [id, {state: 'cancelled', id, fieldName}];
             }
             return [id, state];
           }),
@@ -122,7 +134,9 @@ export function PendingImageUploads({textAreaRef}: {textAreaRef: RefObject<HTMLT
       states: Object.fromEntries(
         Object.entries(value.states).map(([id, state]) => [
           id,
-          state.status === 'error' ? {...state, resolved: true} : state,
+          state.field === fieldName && state.status === 'error'
+            ? {...state, resolved: true}
+            : state,
         ]),
       ),
     }));
@@ -210,6 +224,13 @@ export function FilePicker({uploadFiles}: {uploadFiles: (files: Array<File>) => 
                     uploadFiles(chosen);
                   }
                 });
+              } else {
+                // By default, <button> clicks do not forward to the parent <label>'s htmlFor target.
+                // Manually trigger a click on the element instead.
+                const input = document.getElementById(id);
+                if (input) {
+                  input.click();
+                }
               }
             }}>
             <PaperclipIcon />
@@ -221,6 +242,7 @@ export function FilePicker({uploadFiles}: {uploadFiles: (files: Array<File>) => 
 }
 
 export function useUploadFilesCallback(
+  fieldName: string,
   ref: RefObject<HTMLTextAreaElement>,
   onInput: (e: {currentTarget: HTMLTextAreaElement}) => unknown,
 ) {
@@ -244,7 +266,7 @@ export function useUploadFilesCallback(
         files.map(async file => {
           const id = next;
           next += 1;
-          const state = {status: 'pending' as const, id};
+          const state: ImageUploadStatus = {status: 'pending' as const, id, field: fieldName};
           writeAtom(imageUploadState, v => ({next, states: {...v.states, [id]: state}}));
           // insert pending text
           const placeholder = placeholderForImageUpload(state.id);
@@ -256,7 +278,7 @@ export function useUploadFilesCallback(
             const uploadedFileText = await uploadFile(file);
             writeAtom(imageUploadState, v => ({
               next,
-              states: {...v.states, [id]: {status: 'complete' as const, id}},
+              states: {...v.states, [id]: {status: 'complete' as const, id, field: fieldName}},
             }));
             replaceInTextArea(textArea, placeholder, uploadedFileText);
             emitChangeEvent();
@@ -265,7 +287,13 @@ export function useUploadFilesCallback(
               next,
               states: {
                 ...v.states,
-                [id]: {status: 'error' as const, id, error: error as Error, resolved: false},
+                [id]: {
+                  status: 'error' as const,
+                  id,
+                  field: fieldName,
+                  error: error as Error,
+                  resolved: false,
+                },
               },
             }));
             replaceInTextArea(textArea, placeholder, ''); // delete placeholder

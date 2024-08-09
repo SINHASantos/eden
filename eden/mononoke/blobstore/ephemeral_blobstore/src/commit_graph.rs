@@ -14,7 +14,9 @@ use anyhow::Context;
 use anyhow::Result;
 use async_trait::async_trait;
 use blobstore::Loadable;
+use commit_graph::BaseCommitGraphWriter;
 use commit_graph::CommitGraph;
+use commit_graph::CommitGraphWriter;
 use commit_graph::ParentsFetcher;
 use commit_graph_types::edges::ChangesetEdges;
 use commit_graph_types::storage::CommitGraphStorage;
@@ -76,18 +78,18 @@ mononoke_queries! {
 #[derive(Clone)]
 pub struct EphemeralCommitGraphStorage {
     /// Storage containing only the ephemeral bubble changesets.
-    ephemeral_only_storage: Arc<EphemeralOnlyStorage>,
+    ephemeral_only_storage: Arc<EphemeralOnlyChangesetStorage>,
     /// A storage that wraps the persistent commit graph storage and writes
     /// new changesets to memory.
     mem_writes_storage: Arc<MemWritesCommitGraphStorage>,
     /// Another view of the MemWrites storage to allow traversing the commit graph
-    /// (through CommitGraph::add_recursive) to create ChangesetEdges.
-    mem_writes_commit_graph: CommitGraph,
+    /// (through CommitGraphWriter::add_recursive) to create ChangesetEdges.
+    mem_writes_commit_graph_writer: BaseCommitGraphWriter,
 }
 
 /// A storage that allows fetching snapshot changesets.
 #[derive(Clone)]
-pub struct EphemeralOnlyStorage {
+pub struct EphemeralOnlyChangesetStorage {
     repo_id: RepositoryId,
     bubble_id: BubbleId,
     repo_blobstore: RepoBlobstore,
@@ -104,20 +106,22 @@ impl EphemeralCommitGraphStorage {
     ) -> Self {
         let mem_writes_storage = Arc::new(MemWritesCommitGraphStorage::new(persistent_storage));
         Self {
-            ephemeral_only_storage: Arc::new(EphemeralOnlyStorage::new(
+            ephemeral_only_storage: Arc::new(EphemeralOnlyChangesetStorage::new(
                 repo_id,
                 bubble_id,
                 repo_blobstore,
                 connections,
             )),
             mem_writes_storage: mem_writes_storage.clone(),
-            mem_writes_commit_graph: CommitGraph::new(mem_writes_storage),
+            mem_writes_commit_graph_writer: BaseCommitGraphWriter::new(CommitGraph::new(
+                mem_writes_storage,
+            )),
         }
     }
 }
 
-impl EphemeralOnlyStorage {
-    fn new(
+impl EphemeralOnlyChangesetStorage {
+    pub(crate) fn new(
         repo_id: RepositoryId,
         bubble_id: BubbleId,
         repo_blobstore: RepoBlobstore,
@@ -150,7 +154,7 @@ impl EphemeralOnlyStorage {
         Ok(result.last_insert_id().is_some())
     }
 
-    async fn known_changesets(
+    pub async fn known_changesets(
         &self,
         _ctx: &CoreContext,
         cs_ids: Vec<ChangesetId>,
@@ -214,7 +218,7 @@ impl EphemeralOnlyStorage {
 }
 
 #[async_trait]
-impl ParentsFetcher for EphemeralOnlyStorage {
+impl ParentsFetcher for EphemeralOnlyChangesetStorage {
     async fn fetch_parents(
         &self,
         ctx: &CoreContext,
@@ -241,7 +245,7 @@ impl CommitGraphStorage for EphemeralCommitGraphStorage {
 
     async fn add(&self, ctx: &CoreContext, edges: ChangesetEdges) -> Result<bool> {
         let modified = self.ephemeral_only_storage.add(ctx, &edges).await?;
-        self.mem_writes_commit_graph
+        self.mem_writes_commit_graph_writer
             .add_recursive(
                 ctx,
                 self.ephemeral_only_storage.clone(),
@@ -341,7 +345,7 @@ impl CommitGraphStorage for EphemeralCommitGraphStorage {
                     .ephemeral_only_storage
                     .fetch_parents(ctx, cs_id)
                     .await?;
-                self.mem_writes_commit_graph
+                self.mem_writes_commit_graph_writer
                     .add_recursive(
                         ctx,
                         self.ephemeral_only_storage.clone(),

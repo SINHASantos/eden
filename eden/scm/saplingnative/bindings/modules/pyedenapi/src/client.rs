@@ -61,6 +61,7 @@ use edenapi_types::UpdateReferencesParams;
 use edenapi_types::UploadSnapshotResponse;
 use edenapi_types::UploadToken;
 use edenapi_types::WorkspaceDataResponse;
+use edenapi_types::WorkspacesDataResponse;
 use futures::TryStreamExt;
 use minibytes::Bytes;
 use pyconfigloader::config;
@@ -541,15 +542,23 @@ py_class!(pub class client |py| {
         self.inner(py).as_ref().cloud_workspace_py(workspace,reponame, py)
     }
 
+    def cloudworkspaces(&self, prefix: String, reponame : String)
+        -> PyResult<Serde<WorkspacesDataResponse>>
+    {
+        self.inner(py).as_ref().cloud_workspaces_py(prefix,reponame, py)
+    }
+
     def suffix_query(
         &self,
         commit: Serde<CommitId>,
         suffixes: Serde<Vec<String>>,
+        prefixes: Serde<Option<Vec<String>>>,
     ) -> PyResult<TStream<anyhow::Result<Serde<SuffixQueryResponse>>>> {
         let api = self.inner(py).as_ref();
         let suffix_query_response = py.allow_threads(|| block_unless_interrupted(api.suffix_query(
             commit.0,
-            suffixes.0)))
+            suffixes.0,
+            prefixes.0)))
             .map_pyerr(py)?
             .map_pyerr(py)?
             .entries;

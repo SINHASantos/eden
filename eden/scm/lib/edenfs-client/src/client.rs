@@ -119,7 +119,10 @@ impl EdenFsClient {
             },
         )))?;
 
-        tracing::debug!(target: "measuredtimes", edenclientstatus_time=start_time.elapsed().as_millis() as u64);
+        hg_metrics::increment_counter(
+            "edenclientstatus_time",
+            start_time.elapsed().as_millis() as u64,
+        );
 
         let mut result = BTreeMap::new();
         for (path_bytes, status) in thrift_result.status.entries {
@@ -210,12 +213,16 @@ impl EdenFsClient {
             &params,
         )))?;
 
-        tracing::debug!(target: "measuredtimes", edenclientcheckout_time=start_time.elapsed().as_millis() as u64);
+        hg_metrics::increment_counter(
+            "edenclientcheckout_time",
+            start_time.elapsed().as_millis() as u64,
+        );
 
         let result = thrift_result
             .into_iter()
             .filter_map(|c| CheckoutConflict::local_try_from(c).ok())
-            .collect();
+            .collect::<Vec<_>>();
+        hg_metrics::increment_counter("eden_conflict_count", result.len() as u64);
         Ok(result)
     }
 }
@@ -240,9 +247,10 @@ pub(crate) fn extract_error<V, E: std::error::Error + Send + Sync + 'static>(
 
 async fn get_socket_transport(sock_path: &Path) -> Result<SocketTransport<UnixStream>> {
     let sock = UnixStream::connect(&sock_path).await?;
-    Ok(SocketTransport::new_with_error_handler(sock, |error| {
-        error!(?error, "thrift transport error")
-    }))
+    Ok(SocketTransport::new_with_error_handler(
+        sock,
+        |error| error!(target: "transport_errors", thrift_transport_error=?error),
+    ))
 }
 
 #[derive(Deserialize)]

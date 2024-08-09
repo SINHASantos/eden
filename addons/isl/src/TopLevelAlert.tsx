@@ -8,21 +8,21 @@
 import type {Alert, AlertSeverity} from './types';
 import type {ReactNode} from 'react';
 
-import {Banner, BannerKind} from './Banner';
+import {colors, font, radius, spacing} from '../../components/theme/tokens.stylex';
 import serverAPI from './ClientToServerAPI';
 import {Link} from './Link';
-import {Subtle} from './Subtle';
 import {tracker} from './analytics';
-import {Button} from './components/Button';
 import {T} from './i18n';
 import {localStorageBackedAtom, writeAtom} from './jotaiUtils';
 import {applicationinfo} from './serverAPIState';
 import {layout} from './stylexUtils';
-import {colors, font, radius, spacing} from './tokens.stylex';
 import * as stylex from '@stylexjs/stylex';
+import {Banner, BannerKind} from 'isl-components/Banner';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
+import {Subtle} from 'isl-components/Subtle';
 import {atom, useAtom, useAtomValue} from 'jotai';
 import {useEffect} from 'react';
-import {Icon} from 'shared/Icon';
 
 const dismissedAlerts = localStorageBackedAtom<{[key: string]: boolean}>(
   'isl.dismissed-alerts',

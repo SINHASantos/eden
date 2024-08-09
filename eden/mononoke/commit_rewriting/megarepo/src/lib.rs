@@ -14,7 +14,8 @@ use anyhow::Error;
 use blobstore::Loadable;
 use bonsai_hg_mapping::BonsaiHgMappingRef;
 use bookmarks::BookmarksRef;
-use changesets::ChangesetsRef;
+use commit_graph::CommitGraphRef;
+use commit_graph::CommitGraphWriterRef;
 use context::CoreContext;
 use futures::future;
 use futures::Stream;
@@ -30,10 +31,12 @@ use mononoke_types::ChangesetId;
 use mononoke_types::ContentId;
 use mononoke_types::FileChange;
 use mononoke_types::FileType;
+use mononoke_types::GitLfs;
 use movers::Mover;
 use phases::PhasesRef;
 use repo_blobstore::RepoBlobstoreRef;
 use repo_derived_data::RepoDerivedDataRef;
+use repo_identity::RepoIdentityRef;
 use slog::info;
 
 pub mod chunking;
@@ -59,9 +62,11 @@ const REPORTING_INTERVAL_FILES: usize = 10000;
 pub trait Repo = BonsaiHgMappingRef
     + RepoBlobstoreRef
     + RepoDerivedDataRef
-    + ChangesetsRef
+    + CommitGraphRef
+    + CommitGraphWriterRef
     + PhasesRef
     + BookmarksRef
+    + RepoIdentityRef
     + Send
     + Sync
     + Clone;
@@ -218,6 +223,7 @@ where
                     file_move.file_type,
                     file_move.file_size,
                     Some((file_move.old_path, parent_bcs_id)),
+                    GitLfs::FullContent,
                 );
                 file_changes.insert(to, fc);
             }
@@ -251,9 +257,9 @@ mod test {
     use anyhow::Result;
     use bonsai_hg_mapping::BonsaiHgMapping;
     use bookmarks::Bookmarks;
-    use changeset_fetcher::ChangesetFetcher;
-    use changesets::Changesets;
     use cloned::cloned;
+    use commit_graph::CommitGraph;
+    use commit_graph::CommitGraphWriter;
     use fbinit::FacebookInit;
     use filestore::FilestoreConfig;
     use fixtures::Linear;
@@ -267,6 +273,7 @@ mod test {
     use phases::Phases;
     use repo_blobstore::RepoBlobstore;
     use repo_derived_data::RepoDerivedData;
+    use repo_identity::RepoIdentity;
     use sorted_vector_map::sorted_vector_map;
     use tests_utils::resolve_cs_id;
 
@@ -281,13 +288,15 @@ mod test {
         #[facet]
         repo_derived_data: RepoDerivedData,
         #[facet]
-        changeset_fetcher: dyn ChangesetFetcher,
+        commit_graph: CommitGraph,
         #[facet]
-        changesets: dyn Changesets,
+        commit_graph_writer: dyn CommitGraphWriter,
         #[facet]
         filestore_config: FilestoreConfig,
         #[facet]
         pub phases: dyn Phases,
+        #[facet]
+        repo_identity: RepoIdentity,
     }
 
     use super::*;

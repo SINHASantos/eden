@@ -12,13 +12,7 @@ import type {ParsedDiff} from 'shared/patch/parse';
 
 import serverAPI from '../ClientToServerAPI';
 import {EmptyState} from '../EmptyState';
-import {ErrorBoundary, ErrorNotice} from '../ErrorNotice';
 import {useGeneratedFileStatuses} from '../GeneratedFile';
-import {Subtle} from '../Subtle';
-import {Tooltip} from '../Tooltip';
-import {Button} from '../components/Button';
-import {Dropdown} from '../components/Dropdown';
-import {RadioGroup} from '../components/Radio';
 import {T, t} from '../i18n';
 import {atomFamilyWeak, atomLoadableWithRefresh, localStorageBackedAtom} from '../jotaiUtils';
 import platform from '../platform';
@@ -26,6 +20,13 @@ import {latestHeadCommit} from '../serverAPIState';
 import {GeneratedStatus} from '../types';
 import {SplitDiffView} from './SplitDiffView';
 import {currentComparisonMode} from './atoms';
+import {Button} from 'isl-components/Button';
+import {Dropdown} from 'isl-components/Dropdown';
+import {ErrorBoundary, ErrorNotice} from 'isl-components/ErrorNotice';
+import {Icon} from 'isl-components/Icon';
+import {RadioGroup} from 'isl-components/Radio';
+import {Subtle} from 'isl-components/Subtle';
+import {Tooltip} from 'isl-components/Tooltip';
 import {useAtom, useAtomValue, useSetAtom} from 'jotai';
 import {useEffect, useMemo, useState} from 'react';
 import {
@@ -34,7 +35,6 @@ import {
   ComparisonType,
   comparisonStringKey,
 } from 'shared/Comparison';
-import {Icon} from 'shared/Icon';
 import {parsePatch} from 'shared/patch/parse';
 import {group, notEmpty} from 'shared/utils';
 
@@ -115,7 +115,13 @@ const comparisonDisplayMode = localStorageBackedAtom<ComparisonDisplayMode | 're
   'responsive',
 );
 
-export default function ComparisonView({comparison}: {comparison: Comparison}) {
+export default function ComparisonView({
+  comparison,
+  dismiss,
+}: {
+  comparison: Comparison;
+  dismiss?: () => void;
+}) {
   const compared = useAtomValue(currentComparisonData(comparison));
 
   const displayMode = useComparisonDisplayMode();
@@ -207,6 +213,7 @@ export default function ComparisonView({comparison}: {comparison: Comparison}) {
         comparison={comparison}
         collapsedFiles={collapsedFiles}
         setCollapsedFile={setCollapsedFile}
+        dismiss={dismiss}
       />
       <div className="comparison-view-details">{content}</div>
     </div>
@@ -222,10 +229,12 @@ function ComparisonViewHeader({
   comparison,
   collapsedFiles,
   setCollapsedFile,
+  dismiss,
 }: {
   comparison: Comparison;
   collapsedFiles: Map<string, boolean>;
   setCollapsedFile: (path: string, collapsed: boolean) => unknown;
+  dismiss?: () => void;
 }) {
   const setComparisonMode = useSetAtom(currentComparisonMode);
   const [compared, reloadComparison] = useAtom(currentComparisonData(comparison));
@@ -249,15 +258,23 @@ function ComparisonViewHeader({
           <Dropdown
             data-testid="comparison-view-picker"
             value={comparison.type}
-            onChange={event =>
+            onChange={event => {
+              const newComparison = {
+                type: (event as React.FormEvent<HTMLSelectElement>).currentTarget
+                  .value as (typeof defaultComparisons)[0],
+              };
               setComparisonMode(previous => ({
                 ...previous,
-                comparison: {
-                  type: (event as React.FormEvent<HTMLSelectElement>).currentTarget
-                    .value as (typeof defaultComparisons)[0],
-                },
-              }))
-            }
+                comparison: newComparison,
+              }));
+              // When viewed in a dedicated viewer, change the title as the comparison changes
+              if (window.islAppMode != null && window.islAppMode.mode != 'isl') {
+                serverAPI.postMessage({
+                  type: 'platform/changeTitle',
+                  title: labelForComparison(newComparison),
+                });
+              }
+            }}
             options={[
               ...defaultComparisons.map(comparison => ({
                 value: comparison,
@@ -309,12 +326,11 @@ function ComparisonViewHeader({
           </Tooltip>
           {isLoading ? <Icon icon="loading" data-testid="comparison-loading" /> : null}
         </span>
-        <Button
-          data-testid="close-comparison-view-button"
-          icon
-          onClick={() => setComparisonMode(previous => ({...previous, visible: false}))}>
-          <Icon icon="x" />
-        </Button>
+        {dismiss == null ? null : (
+          <Button data-testid="close-comparison-view-button" icon onClick={dismiss}>
+            <Icon icon="x" />
+          </Button>
+        )}
       </div>
     </>
   );

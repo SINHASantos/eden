@@ -53,7 +53,6 @@ use futures::stream;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
 use futures::try_join;
-use live_commit_sync_config::CfgrLiveCommitSyncConfig;
 use live_commit_sync_config::LiveCommitSyncConfig;
 use mercurial_derivation::DeriveHgChangeset;
 use mercurial_types::HgChangesetId;
@@ -299,14 +298,13 @@ pub async fn backsync_forever<M>(
     target_repo_dbs: Arc<TargetRepoDbs>,
     source_repo_name: String,
     target_repo_name: String,
-    live_commit_sync_config: CfgrLiveCommitSyncConfig,
+    live_commit_sync_config: Arc<dyn LiveCommitSyncConfig>,
     cancellation_requested: Arc<AtomicBool>,
 ) -> Result<(), Error>
 where
     M: SyncedCommitMapping + Clone + 'static,
 {
     let target_repo_id = commit_syncer.get_target_repo_id();
-    let live_commit_sync_config = Arc::new(live_commit_sync_config);
     let mut commit_only_backsync_future: Box<dyn futures::Future<Output = ()> + Send + Unpin> =
         Box::new(future::ready(()));
 
@@ -319,7 +317,9 @@ where
         }
         // We only care about public pushes because draft pushes are not in the bookmark
         // update log at all.
-        let enabled = live_commit_sync_config.push_redirector_enabled_for_public(target_repo_id);
+        let enabled = live_commit_sync_config
+            .push_redirector_enabled_for_public(&ctx, target_repo_id)
+            .await?;
 
         if enabled {
             let delay = calculate_delay(&ctx, &commit_syncer, &target_repo_dbs).await?;
@@ -522,8 +522,7 @@ async fn run(
         "syncing from repoid {:?} into repoid {:?}", source_repo.id, target_repo.id,
     );
 
-    let config_store = matches.config_store();
-    let live_commit_sync_config = CfgrLiveCommitSyncConfig::new(logger, config_store)?;
+    let live_commit_sync_config = commit_syncer.live_commit_sync_config.clone();
 
     match matches.subcommand() {
         (ARG_MODE_BACKSYNC_ALL, _) => {

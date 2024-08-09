@@ -88,7 +88,7 @@ pub(crate) async fn check_restriction_ensure_ancestor_of(
     }
 
     if let Some(config) = &repo.repo_config().pushrebase.globalrev_config {
-        if config.small_repo_id.is_none() {
+        if config.globalrevs_small_repo_id.is_none() {
             // On large repo, it's fine not to be descendant of the bookmark.
             descendant_bookmarks.push(&config.publishing_bookmark);
         }
@@ -139,7 +139,8 @@ pub(crate) async fn ensure_ancestor_of(
         .await?)
 }
 
-pub fn check_bookmark_sync_config(
+pub async fn check_bookmark_sync_config(
+    ctx: &CoreContext,
     repo: &(impl RepoIdentityRef + RepoCrossRepoRef),
     bookmark: &BookmarkKey,
     kind: BookmarkKind,
@@ -149,7 +150,8 @@ pub fn check_bookmark_sync_config(
             if repo
                 .repo_cross_repo()
                 .live_commit_sync_config()
-                .push_redirector_enabled_for_public(repo.repo_identity().id())
+                .push_redirector_enabled_for_public(ctx, repo.repo_identity().id())
+                .await?
             {
                 return Err(BookmarkMovementError::PushRedirectorEnabledForPublishing {
                     bookmark: bookmark.clone(),
@@ -160,7 +162,8 @@ pub fn check_bookmark_sync_config(
             if repo
                 .repo_cross_repo()
                 .live_commit_sync_config()
-                .push_redirector_enabled_for_draft(repo.repo_identity().id())
+                .push_redirector_enabled_for_draft(ctx, repo.repo_identity().id())
+                .await?
             {
                 return Err(BookmarkMovementError::PushRedirectorEnabledForScratch {
                     bookmark: bookmark.clone(),

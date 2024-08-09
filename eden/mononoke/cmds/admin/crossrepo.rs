@@ -15,11 +15,14 @@ use anyhow::Error;
 use backsyncer::format_counter as format_backsyncer_counter;
 use blobrepo::save_bonsai_changesets;
 use blobstore::Loadable;
+use blobstore_factory::MetadataSqlFactory;
+use blobstore_factory::ReadOnlyStorage;
 use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateLogRef;
 use bookmarks::BookmarkUpdateReason;
 use bookmarks::BookmarksRef;
 use bookmarks::Freshness;
+use bulk_derivation::BulkDerivation;
 use cached_config::ConfigStore;
 use clap_old::App;
 use clap_old::Arg;
@@ -46,7 +49,6 @@ use cross_repo_sync::Small;
 use cross_repo_sync::SubmoduleDeps;
 use cross_repo_sync::Syncers;
 use cross_repo_sync::CHANGE_XREPO_MAPPING_EXTRA;
-use derived_data_utils::derive_all_enabled_datatypes_for_csids;
 use fbinit::FacebookInit;
 use filestore::FilestoreConfigRef;
 use futures::stream;
@@ -68,17 +70,21 @@ use mononoke_types::ChangesetId;
 use mononoke_types::DateTime;
 use mononoke_types::FileChange;
 use mononoke_types::FileType;
+use mononoke_types::GitLfs;
 use mononoke_types::NonRootMPath;
 use mononoke_types::RepositoryId;
 use mutable_counters::MutableCountersRef;
 use pushrebase::do_pushrebase_bonsai;
 use pushrebase::FAIL_PUSHREBASE_EXTRA;
+use pushredirect::SqlPushRedirectionConfigBuilder;
 use repo_blobstore::RepoBlobstoreRef;
+use repo_derived_data::RepoDerivedDataRef;
 use repo_identity::RepoIdentityRef;
 use slog::info;
 use slog::warn;
 use slog::Logger;
 use sorted_vector_map::sorted_vector_map;
+use sql_query_config::SqlQueryConfig;
 use synced_commit_mapping::EquivalentWorkingCopyEntry;
 use synced_commit_mapping::SqlSyncedCommitMapping;
 use synced_commit_mapping::SyncedCommitMapping;
@@ -143,7 +149,6 @@ pub async fn subcommand_crossrepo<'a>(
     sub_m: &'a ArgMatches<'_>,
 ) -> Result<(), SubcommandError> {
     let config_store = matches.config_store();
-    let live_commit_sync_config = CfgrLiveCommitSyncConfig::new(&logger, config_store)?;
 
     let ctx = CoreContext::new_with_logger_and_client_info(
         fb,
@@ -157,6 +162,9 @@ pub async fn subcommand_crossrepo<'a>(
 
             let submodule_deps = SubmoduleDeps::NotNeeded;
 
+            let live_commit_sync_config =
+                get_live_commit_sync_config(&ctx, fb, matches, source_repo.repo_identity().id())
+                    .await?;
             let common_config =
                 live_commit_sync_config.get_common_config(source_repo.repo_identity().id())?;
             let commit_sync_repos =
@@ -208,7 +216,7 @@ pub async fn subcommand_crossrepo<'a>(
         }
         (VERIFY_BOOKMARKS_SUBCOMMAND, Some(sub_sub_m)) => {
             let (source_repo, target_repo, mapping) =
-                get_source_target_repos_and_mapping(fb, logger, matches).await?;
+                get_source_target_repos_and_mapping::<CrossRepo>(fb, logger, matches).await?;
 
             let mode = if sub_sub_m.is_present(UPDATE_LARGE_REPO_BOOKMARKS) {
                 VerifyRunMode::UpdateLargeRepoBookmarks {
@@ -227,6 +235,9 @@ pub async fn subcommand_crossrepo<'a>(
                 VerifyRunMode::JustVerify
             };
 
+            let live_commit_sync_config =
+                get_live_commit_sync_config(&ctx, fb, matches, source_repo.repo_identity().id())
+                    .await?;
             subcommand_verify_bookmarks(
                 ctx,
                 source_repo,
@@ -239,9 +250,17 @@ pub async fn subcommand_crossrepo<'a>(
             .await
         }
         (SUBCOMMAND_CONFIG, Some(sub_sub_m)) => {
-            run_config_sub_subcommand(matches, sub_sub_m, live_commit_sync_config).await
+            let config_store = matches.config_store();
+            let repo_id = args::not_shardmanager_compatible::get_repo_id(config_store, matches)?;
+            let live_commit_sync_config =
+                get_live_commit_sync_config(&ctx, fb, matches, repo_id).await?;
+            run_config_sub_subcommand(matches, sub_sub_m, repo_id, live_commit_sync_config).await
         }
         (PUSHREDIRECTION_SUBCOMMAND, Some(sub_sub_m)) => {
+            let source_repo_id =
+                args::not_shardmanager_compatible::get_source_repo_id(config_store, matches)?;
+            let live_commit_sync_config =
+                get_live_commit_sync_config(&ctx, fb, matches, source_repo_id).await?;
             run_pushredirection_subcommand(
                 fb,
                 ctx,
@@ -253,6 +272,10 @@ pub async fn subcommand_crossrepo<'a>(
             .await
         }
         (INSERT_SUBCOMMAND, Some(sub_sub_m)) => {
+            let source_repo_id =
+                args::not_shardmanager_compatible::get_source_repo_id(config_store, matches)?;
+            let live_commit_sync_config =
+                get_live_commit_sync_config(&ctx, fb, matches, source_repo_id).await?;
             run_insert_subcommand(ctx, matches, sub_sub_m, live_commit_sync_config).await
         }
         _ => Err(SubcommandError::InvalidArgs),
@@ -260,14 +283,11 @@ pub async fn subcommand_crossrepo<'a>(
 }
 
 async fn run_config_sub_subcommand<'a>(
-    matches: &'a MononokeMatches<'_>,
+    _matches: &'a MononokeMatches<'_>,
     config_subcommand_matches: &'a ArgMatches<'a>,
+    repo_id: RepositoryId,
     live_commit_sync_config: CfgrLiveCommitSyncConfig,
 ) -> Result<(), SubcommandError> {
-    let config_store = matches.config_store();
-
-    let repo_id = args::not_shardmanager_compatible::get_repo_id(config_store, matches)?;
-
     match config_subcommand_matches.subcommand() {
         (SUBCOMMAND_BY_VERSION, Some(sub_m)) => {
             let version_name: String = sub_m.value_of(ARG_VERSION_NAME).unwrap().to_string();
@@ -310,9 +330,13 @@ async fn run_pushredirection_subcommand<'a>(
             )
             .await?;
 
-            if live_commit_sync_config.push_redirector_enabled_for_public(
-                commit_syncer.get_small_repo().repo_identity().id(),
-            ) {
+            if live_commit_sync_config
+                .push_redirector_enabled_for_public(
+                    &ctx,
+                    commit_syncer.get_small_repo().repo_identity().id(),
+                )
+                .await?
+            {
                 return Err(format_err!(
                     "not allowed to run {} if pushredirection is enabled",
                     PREPARE_ROLLOUT_SUBCOMMAND
@@ -377,9 +401,13 @@ async fn run_pushredirection_subcommand<'a>(
                 return Ok(());
             }
 
-            if live_commit_sync_config.push_redirector_enabled_for_public(
-                commit_syncer.get_small_repo().repo_identity().id(),
-            ) {
+            if live_commit_sync_config
+                .push_redirector_enabled_for_public(
+                    &ctx,
+                    commit_syncer.get_small_repo().repo_identity().id(),
+                )
+                .await?
+            {
                 return Err(format_err!(
                     "not allowed to run {} if pushredirection is enabled",
                     CHANGE_MAPPING_VERSION_SUBCOMMAND
@@ -486,7 +514,11 @@ async fn change_mapping_via_extras<'a>(
 ) -> Result<(), Error> {
     // XXX(mitrandir): remove this check once this mode works regardless of sync direction
     if !live_commit_sync_config
-        .push_redirector_enabled_for_public(commit_syncer.get_small_repo().repo_identity().id())
+        .push_redirector_enabled_for_public(
+            ctx,
+            commit_syncer.get_small_repo().repo_identity().id(),
+        )
+        .await?
         && std::env::var("MONONOKE_ADMIN_ALWAYS_ALLOW_MAPPING_CHANGE_VIA_EXTRA").is_err()
     {
         return Err(format_err!(
@@ -545,7 +577,8 @@ async fn change_mapping_via_extras<'a>(
         &large_bookmark,
         &repo_config.pushrebase,
         None,
-    )?;
+    )
+    .await?;
 
     let bcs = large_cs_id
         .load(ctx, &large_repo.repo_blobstore().clone())
@@ -842,14 +875,14 @@ async fn create_file_changes(
         // rewrite to a small repo, then the whole mapping change commit isn't
         // going to exist in the small repo.
 
+        let movers = commit_syncer.get_movers_by_version(mapping_version).await?;
+
         let mover = if commit_syncer.get_source_repo().repo_identity().id()
             == large_repo.repo_identity().id()
         {
-            commit_syncer.get_mover_by_version(mapping_version).await?
+            movers.mover
         } else {
-            commit_syncer
-                .get_reverse_mover_by_version(mapping_version)
-                .await?
+            movers.reverse_mover
         };
 
         if mover(&path)?.is_none() {
@@ -899,8 +932,13 @@ async fn create_file_changes(
         )
         .await?;
 
-        let file_change =
-            FileChange::tracked(content_metadata.content_id, FileType::Regular, size, None);
+        let file_change = FileChange::tracked(
+            content_metadata.content_id,
+            FileType::Regular,
+            size,
+            None,
+            GitLfs::FullContent,
+        );
 
         file_changes.insert(path, file_change);
     }
@@ -1220,7 +1258,17 @@ async fn update_large_repo_bookmarks(
                 };
 
                 if let Some(large_cs_id) = new_value {
-                    derive_all_enabled_datatypes_for_csids(&ctx, large_repo, vec![large_cs_id])?
+                    let derived_data_types = large_repo
+                        .repo_derived_data()
+                        .active_config()
+                        .types
+                        .iter()
+                        .copied()
+                        .collect::<Vec<_>>();
+                    large_repo
+                        .repo_derived_data()
+                        .manager()
+                        .derive_bulk(&ctx, &[large_cs_id], None, &derived_data_types, None)
                         .await?;
                     let reason = BookmarkUpdateReason::XRepoSync;
                     let large_bookmark = bookmark_renamer(target_bookmark).ok_or_else(|| {
@@ -1542,6 +1590,34 @@ async fn get_large_to_small_commit_syncer<'a>(
     )
     .await?
     .large_to_small)
+}
+
+async fn get_live_commit_sync_config<'a>(
+    ctx: &'a CoreContext,
+    fb: FacebookInit,
+    matches: &'a MononokeMatches<'_>,
+    repo_id: RepositoryId,
+) -> Result<CfgrLiveCommitSyncConfig, Error> {
+    let config_store = matches.config_store();
+    let mysql_options = matches.mysql_options();
+    let (_, config) = args::get_config_by_repoid(config_store, matches, repo_id)?;
+    let readonly_storage = ReadOnlyStorage(false);
+    let sql_factory: MetadataSqlFactory = MetadataSqlFactory::new(
+        fb,
+        config.storage_config.metadata,
+        mysql_options.clone(),
+        readonly_storage,
+    )
+    .await?;
+    let builder = sql_factory
+        .open::<SqlPushRedirectionConfigBuilder>()
+        .await?;
+    let push_redirection_config = builder.build(Arc::new(SqlQueryConfig { caching: None }));
+    CfgrLiveCommitSyncConfig::new_with_xdb(
+        ctx.logger(),
+        config_store,
+        Arc::new(push_redirection_config),
+    )
 }
 
 #[cfg(test)]

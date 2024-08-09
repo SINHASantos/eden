@@ -14,7 +14,6 @@ use blobstore::BlobstoreBytes;
 use blobstore::Loadable;
 use cloned::cloned;
 use context::CoreContext;
-use derived_data::impl_bonsai_derived_via_manager;
 use derived_data_manager::dependencies;
 use derived_data_manager::BonsaiDerivable;
 use derived_data_manager::DerivableType;
@@ -191,8 +190,6 @@ async fn fetch_unode_parents<B: Blobstore>(
     Ok(res)
 }
 
-impl_bonsai_derived_via_manager!(RootFastlog);
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -205,9 +202,9 @@ mod tests {
     use bonsai_hg_mapping::BonsaiHgMapping;
     use bookmarks::BookmarkKey;
     use bookmarks::Bookmarks;
-    use changesets::Changesets;
     use commit_graph::CommitGraph;
     use commit_graph::CommitGraphRef;
+    use commit_graph::CommitGraphWriter;
     use context::CoreContext;
     use fbinit::FacebookInit;
     use filestore::FilestoreConfig;
@@ -236,6 +233,7 @@ mod tests {
     use repo_blobstore::RepoBlobstore;
     use repo_derived_data::RepoDerivedData;
     use repo_derived_data::RepoDerivedDataRef;
+    use repo_identity::RepoIdentity;
 
     use super::*;
     use crate::fastlog_impl::fetch_fastlog_batch_by_unode_id;
@@ -257,7 +255,9 @@ mod tests {
         #[facet]
         commit_graph: CommitGraph,
         #[facet]
-        changesets: dyn Changesets,
+        commit_graph_writer: dyn CommitGraphWriter,
+        #[facet]
+        repo_identity: RepoIdentity,
     }
 
     #[fbinit::test]

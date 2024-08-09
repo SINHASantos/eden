@@ -100,7 +100,7 @@ testedwith = "ships-with-fb-ext"
 amendopts = [
     ("", "rebase", None, _("rebases children after the amend")),
     ("", "fixup", None, _("rebase children from a previous amend (DEPRECATED)")),
-    ("", "to", "", _("amend to a specific commit in the current stack (ADVANCED)")),
+    ("", "to", "", _("amend to a specific commit in the current stack")),
 ] + cmdutil.templateopts
 
 # Never restack commits on amend.
@@ -209,23 +209,6 @@ def uisetup(ui):
         )
 
     extensions.afterloaded("automv", has_automv)
-
-    def evolveloaded(loaded):
-        if not loaded:
-            return
-
-        evolvemod = extensions.find("evolve")
-
-        # Remove conflicted commands from evolve.
-        table = evolvemod.cmdtable
-        for name in ["prev", "next", "split", "fold", "metaedit", "prune"]:
-            todelete = [k for k in table if name in k]
-            for k in todelete:
-                oldentry = table[k]
-                table["debugevolve%s" % name] = oldentry
-                del table[k]
-
-    extensions.afterloaded("evolve", evolveloaded)
 
     def rebaseloaded(loaded):
         if not loaded:

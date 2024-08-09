@@ -22,18 +22,17 @@ use bonsai_svnrev_mapping::BonsaiSvnrevMappingRef;
 use bookmarks::BookmarkKey;
 use bytes::Bytes;
 use changeset_info::ChangesetInfo;
-use changesets::ChangesetsRef;
 use chrono::DateTime;
 use chrono::FixedOffset;
 use cloned::cloned;
 use commit_graph::AncestorsStreamBuilder;
 use commit_graph::CommitGraphArc;
 use commit_graph::CommitGraphRef;
+use commit_graph::LinearAncestorsStreamBuilder;
 use context::CoreContext;
 use deleted_manifest::DeletedManifestOps;
 use deleted_manifest::RootDeletedManifestIdCommon;
 use deleted_manifest::RootDeletedManifestV2Id;
-use derived_data::BonsaiDerived;
 use derived_data_manager::BonsaiDerivable;
 use fsnodes::RootFsnodeId;
 use futures::future::try_join;
@@ -63,6 +62,7 @@ use mononoke_types::Svnrev;
 use repo_blobstore::RepoBlobstoreArc;
 use repo_blobstore::RepoBlobstoreRef;
 use repo_derived_data::RepoDerivedDataArc;
+use repo_derived_data::RepoDerivedDataRef;
 use skeleton_manifest::RootSkeletonManifestId;
 use smallvec::SmallVec;
 use sorted_vector_map::SortedVectorMap;
@@ -135,6 +135,13 @@ pub struct ChangesetHistoryOptions {
     pub until_timestamp: Option<i64>,
     pub descendants_of: Option<ChangesetId>,
     pub exclude_changeset_and_ancestors: Option<ChangesetId>,
+}
+
+#[derive(Default)]
+pub struct ChangesetLinearHistoryOptions {
+    pub descendants_of: Option<ChangesetId>,
+    pub exclude_changeset_and_ancestors: Option<ChangesetId>,
+    pub skip: u64,
 }
 
 #[derive(Clone)]
@@ -627,20 +634,24 @@ impl ChangesetContext {
 
     /// The generation number of the given changeset
     pub async fn generation(&self) -> Result<Generation, MononokeError> {
-        Ok(Generation::new(
-            self.repo
-                .blob_repo()
-                .changesets()
-                .get(self.ctx(), self.id)
-                .await?
-                .ok_or_else(|| {
-                    MononokeError::NotAvailable(format!(
-                        "Generation number missing for {:?}",
-                        &self.id
-                    ))
-                })?
-                .gen,
-        ))
+        self.repo
+            .commit_graph()
+            .changeset_generation(self.ctx(), self.id)
+            .await
+            .map_err(|_| {
+                MononokeError::NotAvailable(format!("Generation number missing for {:?}", &self.id))
+            })
+    }
+
+    /// The linear depth of the given changeset
+    pub async fn linear_depth(&self) -> Result<u64, MononokeError> {
+        self.repo
+            .commit_graph()
+            .changeset_linear_depth(self.ctx(), self.id)
+            .await
+            .map_err(|_| {
+                MononokeError::NotAvailable(format!("Linear depth missing for {:?}", &self.id))
+            })
     }
 
     /// All mercurial commit extras as (name, value) pairs.
@@ -1150,7 +1161,10 @@ impl ChangesetContext {
                     cloned!(ctx, repo, cs_info_enabled);
                     async move {
                         let info = if cs_info_enabled {
-                            ChangesetInfo::derive(&ctx, repo.repo(), cs_id).await?
+                            repo.repo()
+                                .repo_derived_data()
+                                .derive::<ChangesetInfo>(&ctx, cs_id)
+                                .await?
                         } else {
                             let bonsai = cs_id.load(&ctx, repo.repo().repo_blobstore()).await?;
                             ChangesetInfo::new(cs_id, bonsai)
@@ -1172,6 +1186,41 @@ impl ChangesetContext {
         }
 
         let cs_ids_stream = ancestors_stream_builder.build().await?;
+
+        Ok(cs_ids_stream
+            .map_err(MononokeError::from)
+            .and_then(move |cs_id| async move {
+                Ok::<_, MononokeError>(ChangesetContext::new(self.repo().clone(), cs_id))
+            })
+            .boxed())
+    }
+
+    pub async fn linear_history(
+        &self,
+        opts: ChangesetLinearHistoryOptions,
+    ) -> Result<BoxStream<'_, Result<ChangesetContext, MononokeError>>, MononokeError> {
+        let mut linear_ancestors_stream_builder = LinearAncestorsStreamBuilder::new(
+            self.repo().repo().commit_graph_arc(),
+            self.ctx().clone(),
+            self.id(),
+        )
+        .await?;
+
+        if let Some(exclude_changeset_and_ancestors) = opts.exclude_changeset_and_ancestors {
+            linear_ancestors_stream_builder = linear_ancestors_stream_builder
+                .exclude_ancestors_of(exclude_changeset_and_ancestors)
+                .await?;
+        }
+
+        if let Some(descendants_of) = opts.descendants_of {
+            linear_ancestors_stream_builder = linear_ancestors_stream_builder
+                .descendants_of(descendants_of)
+                .await?;
+        }
+
+        linear_ancestors_stream_builder = linear_ancestors_stream_builder.skip(opts.skip);
+
+        let cs_ids_stream = linear_ancestors_stream_builder.build().await?;
 
         Ok(cs_ids_stream
             .map_err(MononokeError::from)

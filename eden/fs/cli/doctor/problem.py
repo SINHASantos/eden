@@ -63,6 +63,10 @@ class FixableProblem(ProblemBase):
     def perform_fix(self) -> None:
         """Attempt to automatically fix the problem."""
 
+    @abc.abstractmethod
+    def check_fix(self) -> bool:
+        """Checks if the problem has been fixed."""
+
 
 class Problem(ProblemBase):
     def __init__(
@@ -158,10 +162,19 @@ class ProblemFixer(ProblemTracker):
         self.debug = debug
         self.num_problems = 0
         self.num_fixed_problems = 0
+        self.num_fixable = 0
         self.num_failed_fixes = 0
         self.num_manual_fixes = 0
+        self.num_no_fixes = 0
+        self.num_advisory_fixes = 0
         self.problem_types: Set[str] = set()
+        self.problem_fixable: Set[str] = set()
+        self.problem_failed_fixes: Set[str] = set()
+        self.problem_manual_fixes: Set[str] = set()
+        self.problem_no_fixes: Set[str] = set()
+        self.problem_advisory_fixes: Set[str] = set()
         self.problem_description: List[str] = []
+        self.problem_failed_fixes_exceptions: List[str] = []
 
     def add_problem_impl(self, problem: ProblemBase) -> None:
         self.num_problems += 1
@@ -176,10 +189,25 @@ class ProblemFixer(ProblemTracker):
         if isinstance(problem, FixableProblem):
             self.fix_problem(problem)
         else:
-            self.num_manual_fixes += 1
             msg = problem.get_manual_remediation_message()
             if msg:
+                if problem.severity() == ProblemSeverity.ADVICE:
+                    self.num_advisory_fixes += 1
+                    self.problem_advisory_fixes.add(problem.__class__.__name__)
+                else:
+                    self.num_manual_fixes += 1
+                    self.problem_manual_fixes.add(problem.__class__.__name__)
                 self._filtered_out.write(problem.severity(), msg, end="\n\n")
+            else:
+                self.num_no_fixes += 1
+                self.problem_no_fixes.add(problem.__class__.__name__)
+                self._filtered_out.write(
+                    problem.severity(),
+                    f"Found problem with no documented fix: {problem.__class__.__name__}, please contact the eden team for support",
+                    fg=self._filtered_out.out.RED,
+                    end="\n\n",
+                    flush=True,
+                )
 
     def fix_problem(self, problem: FixableProblem) -> None:
         self._filtered_out.write(
@@ -187,25 +215,41 @@ class ProblemFixer(ProblemTracker):
         )
         try:
             problem.perform_fix()
-            self._filtered_out.write(
-                problem.severity(),
-                "fixed",
-                fg=self._filtered_out.out.GREEN,
-                end="\n\n",
-                flush=True,
-            )
-            self.num_fixed_problems += 1
+            if problem.check_fix():
+                self._filtered_out.write(
+                    problem.severity(),
+                    "fixed",
+                    fg=self._filtered_out.out.GREEN,
+                    end="\n\n",
+                    flush=True,
+                )
+                self.num_fixed_problems += 1
+            else:
+                self._filtered_out.writeln(
+                    problem.severity(), "error", fg=self._filtered_out.out.RED
+                )
+                self._filtered_out.write(
+                    problem.severity(),
+                    f"Attempted and failed to fix problem {problem.__class__.__name__}",
+                    end="\n\n",
+                    flush=True,
+                )
+                self.num_failed_fixes += 1
+                self.problem_failed_fixes.add(problem.__class__.__name__)
         except Exception as ex:
             self._filtered_out.writeln(
                 problem.severity(), "error", fg=self._filtered_out.out.RED
             )
+            errMsg = f"Failed to fix or verify fix for problem {problem.__class__.__name__}: {format_exception(ex, with_tb=True)}"
             self._filtered_out.write(
                 problem.severity(),
-                f"Failed to fix problem: {format_exception(ex, with_tb=True)}",
+                errMsg,
                 end="\n\n",
                 flush=True,
             )
             self.num_failed_fixes += 1
+            self.problem_failed_fixes.add(problem.__class__.__name__)
+            self.problem_failed_fixes_exceptions.append(errMsg)
 
 
 class DryRunFixer(ProblemFixer):

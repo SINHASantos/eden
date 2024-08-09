@@ -549,7 +549,17 @@ class basetreemanifestlog:
         if node == nullid or self._isgit or self._iseager:
             return treemanifestctx(self, dir, node)
         if node in self._treemanifestcache:
-            return self._treemanifestcache[node]
+            m = self._treemanifestcache[node]
+            if m.dirty():
+                # Manifest has been modified in memory - don't share it.
+                del self._treemanifestcache[node]
+            else:
+                # Manifest is clean. Copy it so mutations aren't shared between
+                # objects accidentally. Since the manifest is clean, this should
+                # be a cheap, shallow copy.
+                if m._tree:
+                    m._tree = m._tree.copy()
+                return m
 
         store = self.datastore
 
@@ -714,6 +724,9 @@ class treemanifestctx:
 
     def find(self, key):
         return self.read().find(key)
+
+    def dirty(self):
+        return self._tree and self._tree.dirty()
 
 
 class memtreemanifestctx:

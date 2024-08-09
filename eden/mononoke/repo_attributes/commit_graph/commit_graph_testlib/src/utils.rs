@@ -14,7 +14,10 @@ use anyhow::anyhow;
 use anyhow::Result;
 use cloned::cloned;
 use commit_graph::AncestorsStreamBuilder;
+use commit_graph::BaseCommitGraphWriter;
 use commit_graph::CommitGraph;
+use commit_graph::CommitGraphWriter;
+use commit_graph::LinearAncestorsStreamBuilder;
 use commit_graph_types::edges::ChangesetNode;
 use commit_graph_types::segments::BoundaryChangesets;
 use commit_graph_types::segments::SegmentDescription;
@@ -80,7 +83,9 @@ pub async fn from_dag(
 ) -> Result<CommitGraph> {
     let mut added: BTreeMap<String, ChangesetId> = BTreeMap::new();
     let dag = drawdag::parse(dag);
-    let graph = CommitGraph::new(storage.clone());
+
+    let graph = CommitGraph::new(storage);
+    let graph_writer = BaseCommitGraphWriter::new(graph.clone());
 
     while added.len() < dag.len() {
         let mut made_progress = false;
@@ -98,7 +103,7 @@ pub async fn from_dag(
             let parent_ids = parents.iter().map(|parent| added[parent].clone()).collect();
 
             let cs_id = name_cs_id(name);
-            graph.add(ctx, cs_id, parent_ids).await?;
+            graph_writer.add(ctx, cs_id, parent_ids).await?;
             added.insert(name.clone(), cs_id);
             made_progress = true;
         }
@@ -746,6 +751,46 @@ pub async fn assert_ancestors_within_distance(
             .copied()
             .collect::<HashSet<_>>()
     );
+
+    Ok(())
+}
+
+pub async fn assert_linear_ancestors_stream(
+    ctx: &CoreContext,
+    graph: &CommitGraph,
+    head: &str,
+    exclude_ancestors_of: Option<&str>,
+    descendants_of: Option<&str>,
+    skip: Option<u64>,
+    expected_output: Vec<&str>,
+) -> Result<()> {
+    let head = name_cs_id(head);
+    let exclude_ancestors_of = exclude_ancestors_of.map(name_cs_id);
+    let descendants_of = descendants_of.map(name_cs_id);
+    let expected_output = expected_output
+        .into_iter()
+        .map(name_cs_id)
+        .collect::<Vec<_>>();
+
+    let mut builder =
+        LinearAncestorsStreamBuilder::new(Arc::new(graph.clone()), ctx.clone(), head).await?;
+
+    if let Some(exclude_ancestors_of) = exclude_ancestors_of {
+        builder = builder.exclude_ancestors_of(exclude_ancestors_of).await?;
+    }
+
+    if let Some(descendants_of) = descendants_of {
+        builder = builder.descendants_of(descendants_of).await?;
+    }
+
+    if let Some(skip) = skip {
+        builder = builder.skip(skip);
+    }
+
+    let stream = builder.build().await?;
+    let ancestors = stream.try_collect::<Vec<_>>().await?;
+
+    assert_eq!(ancestors, expected_output);
 
     Ok(())
 }

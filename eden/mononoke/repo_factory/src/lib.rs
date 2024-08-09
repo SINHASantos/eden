@@ -67,17 +67,17 @@ use cacheblob::LeaseOps;
 use cacheblob::MemcacheOps;
 use caching_commit_graph_storage::CachingCommitGraphStorage;
 use caching_ext::CacheHandlerFactory;
-use changeset_fetcher::ArcChangesetFetcher;
-use changeset_fetcher::SimpleChangesetFetcher;
 use changesets::ArcChangesets;
-use changesets_impl::CachingChangesets;
 use changesets_impl::SqlChangesetsBuilder;
 use commit_cloud::sql::builder::SqlCommitCloudBuilder;
 use commit_cloud::ArcCommitCloud;
 use commit_cloud::CommitCloud;
 use commit_graph::ArcCommitGraph;
+use commit_graph::ArcCommitGraphWriter;
+use commit_graph::BaseCommitGraphWriter;
 use commit_graph::CommitGraph;
-use commit_graph_compat::ChangesetsCommitGraphCompat;
+use commit_graph::CompatCommitGraphWriter;
+use commit_graph::LoggingCommitGraphWriter;
 use commit_graph_types::storage::CommitGraphStorage;
 use context::CoreContext;
 use context::SessionContainer;
@@ -107,11 +107,13 @@ use filenodes::ArcFilenodes;
 use filestore::ArcFilestoreConfig;
 use filestore::FilestoreConfig;
 use futures_watchdog::WatchdogExt;
+use git_push_redirect::ArcGitPushRedirectConfig;
+use git_push_redirect::SqlGitPushRedirectConfigBuilder;
 use git_symbolic_refs::ArcGitSymbolicRefs;
 use git_symbolic_refs::SqlGitSymbolicRefsBuilder;
 use hook_manager::manager::ArcHookManager;
 use hook_manager::manager::HookManager;
-use hook_manager::TextOnlyHookFileContentProvider;
+use hook_manager::TextOnlyHookStateProvider;
 use hooks::hook_loader::load_hooks;
 use live_commit_sync_config::CfgrLiveCommitSyncConfig;
 use memcache::KeyGen;
@@ -139,6 +141,8 @@ use phases::ArcPhases;
 use preloaded_commit_graph_storage::PreloadedCommitGraphStorage;
 use pushrebase_mutation_mapping::ArcPushrebaseMutationMapping;
 use pushrebase_mutation_mapping::SqlPushrebaseMutationMappingConnection;
+use pushredirect::ArcPushRedirectionConfig;
+use pushredirect::SqlPushRedirectionConfigBuilder;
 use readonlyblob::ReadOnlyBlobstore;
 use redactedblobstore::ArcRedactionConfigBlobstore;
 use redactedblobstore::RedactedBlobs;
@@ -154,7 +158,7 @@ use repo_cross_repo::RepoCrossRepo;
 use repo_derivation_queues::ArcRepoDerivationQueues;
 use repo_derived_data::ArcRepoDerivedData;
 use repo_derived_data::RepoDerivedData;
-use repo_hook_file_content_provider::RepoHookFileContentProvider;
+use repo_hook_file_content_provider::RepoHookStateProvider;
 use repo_identity::ArcRepoIdentity;
 use repo_identity::RepoIdentity;
 use repo_lock::AlwaysLockedRepoLock;
@@ -173,12 +177,9 @@ use repo_stats_logger::RepoStatsLogger;
 use requests_table::ArcLongRunningRequestsQueue;
 use requests_table::SqlLongRunningRequestsQueue;
 use scuba_ext::MononokeScubaSampleBuilder;
-use segmented_changelog::new_server_segmented_changelog;
-use segmented_changelog::new_server_segmented_changelog_manager;
-use segmented_changelog::ArcSegmentedChangelogManager;
-use segmented_changelog::SegmentedChangelogSqlConnections;
-use segmented_changelog_types::ArcSegmentedChangelog;
 use slog::o;
+use sql_commit_graph_storage::ArcCommitGraphBulkFetcher;
+use sql_commit_graph_storage::CommitGraphBulkFetcher;
 use sql_commit_graph_storage::SqlCommitGraphStorageBuilder;
 use sql_construct::SqlConstructFromDatabaseConfig;
 use sql_construct::SqlConstructFromMetadataDatabaseConfig;
@@ -681,6 +682,9 @@ pub enum RepoFactoryError {
     #[error("Error opening repo-metadata-checkpoint")]
     RepoMetadataCheckpoint,
 
+    #[error("Error opening git-push-redirect-config")]
+    GitPushRedirectConfig,
+
     #[error("Error opening pushrebase mutation mapping")]
     PushrebaseMutationMapping,
 
@@ -689,12 +693,6 @@ pub enum RepoFactoryError {
 
     #[error("Error opening hg mutation store")]
     HgMutationStore,
-
-    #[error("Error opening segmented changelog")]
-    SegmentedChangelog,
-
-    #[error("Error starting segmented changelog manager")]
-    SegmentedChangelogManager,
 
     #[error("Missing cache pool: {0}")]
     MissingCachePool(String),
@@ -729,14 +727,17 @@ pub enum RepoFactoryError {
     #[error("Error creating repo handler base")]
     RepoHandlerBase,
 
-    #[error("Error openning bonsai blob mapping DB")]
+    #[error("Error opening bonsai blob mapping DB")]
     BonsaiBlobMapping,
 
-    #[error("Error openning deletion log DB")]
+    #[error("Error opening deletion log DB")]
     SqlDeletionLog,
 
-    #[error("Error openning commit cloud DB")]
+    #[error("Error opening commit cloud DB")]
     SqlCommitCloud,
+
+    #[error("Error opening push redirector DB")]
+    PushRedirectConfig,
 }
 
 #[facet::factory(name: String, repo_config_param: RepoConfig, common_config_param: CommonConfig)]
@@ -761,7 +762,6 @@ impl RepoFactory {
         &self,
         repo_identity: &ArcRepoIdentity,
         repo_config: &ArcRepoConfig,
-        commit_graph: &ArcCommitGraph,
     ) -> Result<ArcChangesets> {
         let builder = self
             .open_sql::<SqlChangesetsBuilder>(repo_config)
@@ -769,23 +769,7 @@ impl RepoFactory {
             .context(RepoFactoryError::Changesets)?;
         let changesets = builder.build(self.env.rendezvous_options, repo_identity.id());
 
-        let possibly_cached_changesets: ArcChangesets =
-            if let Some(cache_handler_factory) = self.cache_handler_factory("changesets")? {
-                Arc::new(CachingChangesets::new(
-                    Arc::new(changesets),
-                    cache_handler_factory,
-                ))
-            } else {
-                Arc::new(changesets)
-            };
-
-        Ok(Arc::new(ChangesetsCommitGraphCompat::new(
-            self.env.fb,
-            possibly_cached_changesets,
-            commit_graph.clone(),
-            repo_identity.name().to_string(),
-            repo_config.commit_graph_config.scuba_table.as_deref(),
-        )?))
+        Ok(Arc::new(changesets))
     }
 
     pub async fn repo_stats_logger(
@@ -807,17 +791,6 @@ impl RepoFactory {
                 repo_derived_data.clone(),
             )
             .await?,
-        ))
-    }
-
-    pub fn changeset_fetcher(
-        &self,
-        repo_identity: &ArcRepoIdentity,
-        changesets: &ArcChangesets,
-    ) -> ArcChangesetFetcher {
-        Arc::new(SimpleChangesetFetcher::new(
-            changesets.clone(),
-            repo_identity.id(),
         ))
     }
 
@@ -855,7 +828,7 @@ impl RepoFactory {
         repo_identity: &ArcRepoIdentity,
         repo_config: &ArcRepoConfig,
         bookmarks: &ArcBookmarks,
-        changeset_fetcher: &ArcChangesetFetcher,
+        commit_graph: &ArcCommitGraph,
     ) -> Result<ArcPhases> {
         let mut sql_phases_builder = self
             .open_sql::<SqlPhasesBuilder>(repo_config)
@@ -865,7 +838,7 @@ impl RepoFactory {
             sql_phases_builder.enable_caching(cache_handler_factory);
         }
         let heads_fetcher = bookmark_heads_fetcher(bookmarks.clone());
-        Ok(sql_phases_builder.build(repo_identity.id(), changeset_fetcher.clone(), heads_fetcher))
+        Ok(sql_phases_builder.build(repo_identity.id(), commit_graph.clone(), heads_fetcher))
     }
 
     pub async fn bonsai_hg_mapping(
@@ -1008,6 +981,18 @@ impl RepoFactory {
         Ok(Arc::new(repo_metadata_info))
     }
 
+    pub async fn git_push_redirect_config(
+        &self,
+        repo_config: &ArcRepoConfig,
+    ) -> Result<ArcGitPushRedirectConfig> {
+        let git_push_redirect_config = self
+            .open_sql::<SqlGitPushRedirectConfigBuilder>(repo_config)
+            .await
+            .context(RepoFactoryError::GitPushRedirectConfig)?
+            .build();
+        Ok(Arc::new(git_push_redirect_config))
+    }
+
     pub async fn pushrebase_mutation_mapping(
         &self,
         repo_config: &ArcRepoConfig,
@@ -1106,72 +1091,16 @@ impl RepoFactory {
         }
     }
 
-    pub async fn segmented_changelog(
-        &self,
-        repo_config: &ArcRepoConfig,
-        repo_identity: &ArcRepoIdentity,
-        changeset_fetcher: &ArcChangesetFetcher,
-        bookmarks: &ArcBookmarks,
-        repo_blobstore: &ArcRepoBlobstore,
-    ) -> Result<ArcSegmentedChangelog> {
-        let sql_connections = self
-            .open_sql::<SegmentedChangelogSqlConnections>(repo_config)
-            .await
-            .context(RepoFactoryError::SegmentedChangelog)?;
-        let cache_handler_factory = self.cache_handler_factory("segmented_changelog")?;
-        let segmented_changelog = new_server_segmented_changelog(
-            &self.ctx(Some(repo_identity)),
-            repo_identity,
-            repo_config.segmented_changelog_config.clone(),
-            sql_connections,
-            changeset_fetcher.clone(),
-            bookmarks.clone(),
-            repo_blobstore.clone(),
-            cache_handler_factory,
-        )
-        .await
-        .context(RepoFactoryError::SegmentedChangelog)?;
-        Ok(segmented_changelog)
-    }
-
-    pub async fn segmented_changelog_manager(
-        &self,
-        repo_config: &ArcRepoConfig,
-        repo_identity: &ArcRepoIdentity,
-        changeset_fetcher: &ArcChangesetFetcher,
-        bookmarks: &ArcBookmarks,
-        repo_blobstore: &ArcRepoBlobstore,
-    ) -> Result<ArcSegmentedChangelogManager> {
-        let sql_connections = self
-            .open_sql::<SegmentedChangelogSqlConnections>(repo_config)
-            .await
-            .context(RepoFactoryError::SegmentedChangelogManager)?;
-        let cache_handler_factory = self.cache_handler_factory("segmented_changelog")?;
-        let manager = new_server_segmented_changelog_manager(
-            &self.ctx(Some(repo_identity)),
-            repo_identity,
-            repo_config.segmented_changelog_config.clone(),
-            sql_connections,
-            changeset_fetcher.clone(),
-            bookmarks.clone(),
-            repo_blobstore.clone(),
-            cache_handler_factory,
-        )
-        .await
-        .context(RepoFactoryError::SegmentedChangelogManager)?;
-        Ok(Arc::new(manager))
-    }
-
     pub fn repo_derived_data(
         &self,
         repo_identity: &ArcRepoIdentity,
         repo_config: &ArcRepoConfig,
-        changesets: &ArcChangesets,
         commit_graph: &ArcCommitGraph,
         bonsai_hg_mapping: &ArcBonsaiHgMapping,
         bonsai_git_mapping: &ArcBonsaiGitMapping,
         filenodes: &ArcFilenodes,
         repo_blobstore: &ArcRepoBlobstore,
+        filestore_config: &ArcFilestoreConfig,
     ) -> Result<ArcRepoDerivedData> {
         let config = repo_config.derived_data_config.clone();
         let lease = self.lease(DERIVED_DATA_LEASE)?;
@@ -1185,12 +1114,12 @@ impl RepoFactory {
         Ok(Arc::new(RepoDerivedData::new(
             repo_identity.id(),
             repo_identity.name().to_string(),
-            changesets.clone(),
             commit_graph.clone(),
             bonsai_hg_mapping.clone(),
             bonsai_git_mapping.clone(),
             filenodes.clone(),
             repo_blobstore.as_ref().clone(),
+            **filestore_config,
             lease,
             scuba,
             config,
@@ -1304,23 +1233,23 @@ impl RepoFactory {
         &self,
         repo_identity: &ArcRepoIdentity,
         repo_config: &ArcRepoConfig,
-        changesets: &ArcChangesets,
         commit_graph: &ArcCommitGraph,
         bonsai_hg_mapping: &ArcBonsaiHgMapping,
         bonsai_git_mapping: &ArcBonsaiGitMapping,
         filenodes: &ArcFilenodes,
         repo_blobstore: &ArcRepoBlobstore,
+        filestore_config: &FilestoreConfig,
     ) -> Result<ArcRepoDerivationQueues> {
         #[cfg(not(fbcode_build))]
         {
             let _ = (
                 repo_identity,
                 repo_config,
-                changesets,
                 commit_graph,
                 bonsai_hg_mapping,
                 bonsai_git_mapping,
                 repo_blobstore,
+                filestore_config,
                 filenodes,
             );
             anyhow::bail!("RepoDerivationQueues is not supported in non-fbcode builds")
@@ -1342,12 +1271,12 @@ impl RepoFactory {
                     self.env.fb,
                     repo_identity.id(),
                     repo_identity.name().to_string(),
-                    changesets.clone(),
                     commit_graph.clone(),
                     bonsai_hg_mapping.clone(),
                     bonsai_git_mapping.clone(),
                     filenodes.clone(),
                     repo_blobstore.as_ref().clone(),
+                    *filestore_config,
                     lease,
                     derived_data_scuba,
                     config,
@@ -1373,15 +1302,17 @@ impl RepoFactory {
         &self,
         repo_identity: &ArcRepoIdentity,
         synced_commit_mapping: &ArcSyncedCommitMapping,
+        push_redirection_config: &ArcPushRedirectionConfig,
     ) -> Result<ArcRepoCrossRepo> {
         let sync_lease = create_commit_syncer_lease(self.env.fb, self.env.caching)?;
         let logger = self
             .env
             .logger
             .new(o!("repo" => repo_identity.name().to_string()));
-        let live_commit_sync_config = Arc::new(CfgrLiveCommitSyncConfig::new(
+        let live_commit_sync_config = Arc::new(CfgrLiveCommitSyncConfig::new_with_xdb(
             &logger,
             &self.env.config_store,
+            push_redirection_config.clone(),
         )?);
 
         Ok(Arc::new(RepoCrossRepo::new(
@@ -1419,6 +1350,7 @@ impl RepoFactory {
         repo_derived_data: &ArcRepoDerivedData,
         bookmarks: &ArcBookmarks,
         repo_blobstore: &ArcRepoBlobstore,
+        bonsai_tag_mapping: &ArcBonsaiTagMapping,
     ) -> Result<ArcHookManager> {
         let name = repo_identity.name();
 
@@ -1443,11 +1375,12 @@ impl RepoFactory {
         }
 
         let hook_manager = async {
-            let content_provider = Box::new(TextOnlyHookFileContentProvider::new(
-                RepoHookFileContentProvider::from_parts(
+            let content_provider = Box::new(TextOnlyHookStateProvider::new(
+                RepoHookStateProvider::from_parts(
                     bookmarks.clone(),
                     repo_blobstore.clone(),
                     repo_derived_data.clone(),
+                    bonsai_tag_mapping.clone(),
                 ),
                 repo_config.hook_max_file_size,
             ));
@@ -1747,6 +1680,57 @@ impl RepoFactory {
         }
     }
 
+    pub async fn commit_graph_writer(
+        &self,
+        repo_identity: &ArcRepoIdentity,
+        repo_config: &ArcRepoConfig,
+        commit_graph: &CommitGraph,
+        changesets: &ArcChangesets,
+    ) -> Result<ArcCommitGraphWriter> {
+        let scuba_table = repo_config.commit_graph_config.scuba_table.as_deref();
+        let scuba = match scuba_table {
+            Some(scuba_table) => MononokeScubaSampleBuilder::new(self.env.fb, scuba_table)
+                .with_context(
+                    || "Couldn't create scuba sample builder for table mononoke_commit_graph",
+                )?,
+            None => MononokeScubaSampleBuilder::with_discard(),
+        };
+
+        let base_writer = Arc::new(BaseCommitGraphWriter::new(commit_graph.clone()));
+
+        let writer: ArcCommitGraphWriter = if justknobs::eval(
+            "scm/mononoke:disable_double_writing_to_changesets_table",
+            None,
+            None,
+        )? {
+            base_writer
+        } else {
+            Arc::new(CompatCommitGraphWriter::new(
+                base_writer,
+                changesets.clone(),
+            ))
+        };
+
+        Ok(Arc::new(LoggingCommitGraphWriter::new(
+            writer,
+            scuba,
+            repo_identity.name().to_string(),
+        )))
+    }
+
+    pub async fn commit_graph_bulk_fetcher(
+        &self,
+        repo_identity: &ArcRepoIdentity,
+        repo_config: &ArcRepoConfig,
+    ) -> Result<ArcCommitGraphBulkFetcher> {
+        let sql_storage = self
+            .open_sql::<SqlCommitGraphStorageBuilder>(repo_config)
+            .await?
+            .build(self.env.rendezvous_options, repo_identity.id());
+
+        Ok(Arc::new(CommitGraphBulkFetcher::new(Arc::new(sql_storage))))
+    }
+
     pub async fn bonsai_blob_mapping(
         &self,
         repo_config: &ArcRepoConfig,
@@ -1781,15 +1765,31 @@ impl RepoFactory {
             .open_sql::<SqlCommitCloudBuilder>(repo_config)
             .await
             .context(RepoFactoryError::SqlCommitCloud)?;
-        Ok(Arc::new(CommitCloud {
-            storage: sql_commit_cloud.new(matches!(
+        Ok(Arc::new(CommitCloud::new(
+            sql_commit_cloud.new(matches!(
                 &repo_config.storage_config.metadata,
                 MetadataDatabaseConfig::Remote(_)
             )),
-            bonsai_hg_mapping: bonsai_hg_mapping.clone(),
-            repo_derived_data: repo_derived_data.clone(),
-            core_ctx: self.ctx(None),
-        }))
+            bonsai_hg_mapping.clone(),
+            repo_derived_data.clone(),
+            self.ctx(None),
+            self.env.acl_provider.clone(),
+            repo_config.commit_cloud_config.clone().into(),
+        )))
+    }
+
+    pub async fn push_redirection_config(
+        &self,
+        repo_config: &ArcRepoConfig,
+        sql_query_config: &ArcSqlQueryConfig,
+    ) -> Result<ArcPushRedirectionConfig> {
+        let builder = self
+            .open_sql::<SqlPushRedirectionConfigBuilder>(repo_config)
+            .await
+            .context(RepoFactoryError::PushRedirectConfig)?;
+
+        let push_redirection_config = builder.build(sql_query_config.clone());
+        Ok(Arc::new(push_redirection_config))
     }
 }
 

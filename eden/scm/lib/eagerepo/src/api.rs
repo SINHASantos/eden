@@ -23,7 +23,6 @@ use dag::protocol::RemoteIdConvertProtocol;
 use dag::Location;
 use dag::Set;
 use dag::Vertex;
-use dag::VertexName;
 use edenapi::configmodel;
 use edenapi::types::make_hash_lookup_request;
 use edenapi::types::AnyFileContentId;
@@ -88,6 +87,7 @@ use manifest_tree::Flag;
 use minibytes::Bytes;
 use mutationstore::MutationEntry;
 use nonblocking::non_blocking_result;
+use storemodel::types::AugmentedTreeWithDigest;
 use storemodel::SerializationFormat;
 use tracing::debug;
 use tracing::error;
@@ -267,61 +267,103 @@ impl SaplingRemoteApi for EagerRepo {
         self.refresh_for_api();
         let mut values = Vec::new();
         let attributes = attributes.unwrap_or_default();
-        for key in keys {
-            let data = self.get_sha1_blob_for_api(key.hgid, "trees")?;
-            let mut entry = TreeEntry {
-                key: key.clone(),
-                ..Default::default()
-            };
-
-            if attributes.manifest_blob {
-                // PERF: to_vec().into() converts minibytes::Bytes to bytes::Bytes.
-                entry.data = Some(extract_body(&data).to_vec().into());
-            }
-
-            if attributes.parents {
-                let (p1, p2) = extract_p1_p2(&data);
-                let parents = Parents::new(p1, p2);
-                entry.parents = Some(parents);
-            }
-
-            if attributes.child_metadata {
-                let mut children: Vec<Result<TreeChildEntry, SaplingRemoteApiServerError>> =
-                    Vec::new();
-
-                let tree_entry =
-                    manifest_tree::TreeEntry(extract_body(&data), SerializationFormat::Hg);
-                for child in tree_entry.elements() {
-                    let child = match child {
-                        Ok(child) => child,
-                        Err(err) => {
-                            children
-                                .push(Err(SaplingRemoteApiServerError::with_key(key.clone(), err)));
-                            continue;
+        if attributes.augmented_trees {
+            for key in keys {
+                match self
+                    .get_augmented_tree_blob_with_digest_for_api(key.hgid, "trees")
+                    .await
+                {
+                    Ok(tree) => {
+                        let augmented_tree_with_digest =
+                            AugmentedTreeWithDigest::try_deserialize(std::io::Cursor::new(tree))?;
+                        let mut converted_entry: TreeEntry =
+                            TreeEntry::try_from(augmented_tree_with_digest).map_err(|err| {
+                                SaplingRemoteApiServerError::with_key(key.clone(), err)
+                            })?;
+                        // Match the key in the response and in the request!
+                        // TreeEntry produced from the augmented tree format doesn't contain path for itself, only for the children.
+                        converted_entry.key = key;
+                        // Clean up fields that were not requested, since the augmented trees format contains
+                        // everything by default
+                        if !attributes.manifest_blob {
+                            converted_entry.with_data(None);
                         }
-                    };
-
-                    match child.flag {
-                        Flag::File(_) => {
-                            let file_with_parents =
-                                self.get_sha1_blob_for_api(child.hgid, "trees (aux)")?;
-                            let file_body = extract_body(&file_with_parents);
-
-                            let aux_data = FileAuxData::from_content(&file_body);
-                            children.push(Ok(TreeChildEntry::File(TreeChildFileEntry {
-                                key: Key::new(key.path.join(child.component.as_ref()), child.hgid),
-                                file_metadata: Some(FileMetadata::from(aux_data)),
-                            })));
+                        if !attributes.parents {
+                            converted_entry.with_parents(None);
                         }
-                        // The client currently ignores directory metadata, so don't bother.
-                        Flag::Directory => {}
+                        if !attributes.child_metadata {
+                            converted_entry.with_children(None);
+                        }
+                        values.push(Ok(Ok(converted_entry)));
                     }
+                    Err(e) => values.push(Err(e)),
+                }
+            }
+        } else {
+            for key in keys {
+                let data = self.get_sha1_blob_for_api(key.hgid, "trees")?;
+                let mut entry = TreeEntry {
+                    key: key.clone(),
+                    ..Default::default()
+                };
+
+                if attributes.manifest_blob {
+                    // PERF: to_vec().into() converts minibytes::Bytes to bytes::Bytes.
+                    entry.data = Some(extract_body(&data).to_vec().into());
                 }
 
-                entry.children = Some(children);
-            }
+                if attributes.parents {
+                    let (p1, p2) = extract_p1_p2(&data);
+                    let parents = Parents::new(p1, p2);
+                    entry.parents = Some(parents);
+                }
 
-            values.push(Ok(Ok(entry)));
+                if attributes.child_metadata {
+                    let mut children: Vec<Result<TreeChildEntry, SaplingRemoteApiServerError>> =
+                        Vec::new();
+
+                    let tree_entry =
+                        manifest_tree::TreeEntry(extract_body(&data), SerializationFormat::Hg);
+                    for child in tree_entry.elements() {
+                        let child = match child {
+                            Ok(child) => child,
+                            Err(err) => {
+                                children.push(Err(SaplingRemoteApiServerError::with_key(
+                                    key.clone(),
+                                    err,
+                                )));
+                                continue;
+                            }
+                        };
+
+                        match child.flag {
+                            Flag::File(_) => {
+                                let file_with_parents =
+                                    self.get_sha1_blob_for_api(child.hgid, "trees (aux)")?;
+                                let file_body_without_parents = extract_body(&file_with_parents);
+                                let (file_body, _copy_from) =
+                                    hgstore::split_hg_file_metadata(&file_body_without_parents);
+
+                                let aux_data = FileAuxData::from_content(&file_body);
+                                children.push(Ok(TreeChildEntry::File(TreeChildFileEntry {
+                                    key: Key::new(
+                                        RepoPathBuf::from_string(child.component.to_string())
+                                            .map_err(anyhow::Error::from)?,
+                                        child.hgid,
+                                    ),
+                                    file_metadata: Some(FileMetadata::from(aux_data)),
+                                })));
+                            }
+                            // The client currently ignores directory metadata, so don't bother.
+                            Flag::Directory => {}
+                        }
+                    }
+
+                    entry.children = Some(children);
+                }
+
+                values.push(Ok(Ok(entry)));
+            }
         }
         Ok(convert_to_response(values))
     }
@@ -893,6 +935,11 @@ impl SaplingRemoteApi for EagerRepo {
                 }
             }
 
+            // Eagerly compute augmented manifest data.
+            if let Err(err) = self.derive_augmented_tree_recursively(cs.manifestid) {
+                error!(?err, "error pre-deriving augmented tree data");
+            }
+
             let text = match changeset_to_text(cs) {
                 Ok(text) => text,
                 Err(err) => {
@@ -1077,11 +1124,12 @@ impl SaplingRemoteApi for EagerRepo {
         &self,
         commit: CommitId,
         suffixes: Vec<String>,
+        prefix: Option<Vec<String>>,
     ) -> Result<Response<SuffixQueryResponse>, SaplingRemoteApiError> {
         debug!("suffix_query");
         // TODO(T189729875) Make this react to commited files
         //let files = self.files();
-        let _ = commit;
+        let _ = (commit, prefix);
         let mut res = vec![];
         for suffix in suffixes {
             match suffix.clone().as_str() {
@@ -1286,6 +1334,47 @@ impl EagerRepo {
         Ok(())
     }
 
+    fn opt_augmented_tree_blob_with_digest_for_api(
+        &self,
+        id: HgId,
+        handler: &str,
+    ) -> edenapi::Result<Option<minibytes::Bytes>> {
+        // Emulate the HTTP errors.
+        match self.derive_augmented_tree_recursively(id) {
+            Ok(None) => {
+                trace!(" not found: {}", id.to_hex());
+                Ok(None)
+            }
+            Ok(Some(data)) => {
+                trace!(" found: {}, {} bytes", id.to_hex(), data.len());
+                Ok(Some(data))
+            }
+            Err(e) => Err(SaplingRemoteApiError::HttpError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: format!("{:?}", e),
+                headers: Default::default(),
+                url: self.url(handler),
+            }),
+        }
+    }
+
+    async fn get_augmented_tree_blob_with_digest_for_api(
+        &self,
+        id: HgId,
+        handler: &str,
+    ) -> edenapi::Result<minibytes::Bytes> {
+        // Emulate the HTTP errors.
+        match self.opt_augmented_tree_blob_with_digest_for_api(id, handler)? {
+            None => Err(SaplingRemoteApiError::HttpError {
+                status: StatusCode::NOT_FOUND,
+                message: format!("{} cannot be found", id.to_hex()),
+                headers: Default::default(),
+                url: self.url(handler),
+            }),
+            Some(data) => Ok(data),
+        }
+    }
+
     async fn flush_for_api(&self, handler: &str) -> edenapi::Result<()> {
         self.flush()
             .await
@@ -1420,9 +1509,7 @@ fn to_vec_vertex(ids: &[HgId]) -> Vec<Vertex> {
     ids.iter().map(|i| Vertex::copy_from(i.as_ref())).collect()
 }
 
-fn convert_clone_data(
-    clone_data: dag::CloneData<VertexName>,
-) -> edenapi::Result<dag::CloneData<HgId>> {
+fn convert_clone_data(clone_data: dag::CloneData<Vertex>) -> edenapi::Result<dag::CloneData<HgId>> {
     check_convert_to_hgid(clone_data.idmap.values())?;
     let clone_data = dag::CloneData {
         flat_segments: clone_data.flat_segments,

@@ -15,8 +15,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use blobrepo::save_bonsai_changesets;
 use blobstore::Loadable;
-use changeset_fetcher::ChangesetFetcherRef;
-use changesets::ChangesetsRef;
+use commit_graph::CommitGraphRef;
 use commit_transformation::create_directory_source_to_target_multi_mover;
 use commit_transformation::create_source_to_target_multi_mover;
 use commit_transformation::rewrite_as_squashed_commit;
@@ -378,7 +377,7 @@ impl<'a> SyncChangeset<'a> {
         scuba.log_with_msg("Started saving mutable renames", None);
         self.save_mutable_renames(
             ctx,
-            target_repo.inner_repo().changesets(),
+            target_repo.inner_repo().commit_graph(),
             self.mutable_renames,
             moved_commits.iter().map(|css| &css.mutable_renames),
         )
@@ -405,9 +404,8 @@ impl<'a> SyncChangeset<'a> {
 
         // Check that first parent is a target location
         let parents = repo
-            .inner_repo()
-            .changeset_fetcher()
-            .get_parents(ctx, actual_target_location)
+            .commit_graph()
+            .changeset_parents(ctx, actual_target_location)
             .await?;
         if parents.first() != Some(&expected_target_location) {
             return Err(MegarepoError::request(anyhow!(

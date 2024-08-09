@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use anyhow::anyhow;
+use anyhow::bail;
 use anyhow::Error;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -17,15 +18,18 @@ use cached_config::ConfigHandle;
 use cached_config::ConfigStore;
 use commitsync::RawCommitSyncAllVersions;
 use commitsync::RawCommitSyncConfigAllVersionsOneRepo;
+use context::CoreContext;
 use metaconfig_parser::Convert;
 use metaconfig_types::CommitSyncConfig;
 use metaconfig_types::CommitSyncConfigVersion;
 use metaconfig_types::CommonCommitSyncConfig;
 use mononoke_types::RepositoryId;
+use pushredirect::PushRedirectionConfig;
 use pushredirect_enable::MononokePushRedirectEnable;
 use pushredirect_enable::PushRedirectEnableState;
 use slog::debug;
 use slog::error;
+use slog::warn;
 use slog::Logger;
 use thiserror::Error;
 
@@ -61,14 +65,22 @@ pub trait LiveCommitSyncConfig: Send + Sync {
     ///
     /// NOTE: two subsequent calls may return different results
     ///       as this queries  config source
-    fn push_redirector_enabled_for_draft(&self, repo_id: RepositoryId) -> bool;
+    async fn push_redirector_enabled_for_draft(
+        &self,
+        ctx: &CoreContext,
+        repo_id: RepositoryId,
+    ) -> Result<bool>;
 
     /// Return whether push redirection is currently
     /// enabled for public commits in `repo_id`
     ///
     /// NOTE: two subsequent calls may return different results
     ///       as this queries  config source
-    fn push_redirector_enabled_for_public(&self, repo_id: RepositoryId) -> bool;
+    async fn push_redirector_enabled_for_public(
+        &self,
+        ctx: &CoreContext,
+        repo_id: RepositoryId,
+    ) -> Result<bool>;
 
     /// Return all historical versions of `CommitSyncConfig`
     /// structs for a given repository
@@ -119,6 +131,7 @@ pub trait LiveCommitSyncConfig: Send + Sync {
 pub struct CfgrLiveCommitSyncConfig {
     config_handle_for_all_versions: ConfigHandle<RawCommitSyncAllVersions>,
     config_handle_for_push_redirection: ConfigHandle<MononokePushRedirectEnable>,
+    push_redirect_config: Option<Arc<dyn PushRedirectionConfig>>,
 }
 
 impl CfgrLiveCommitSyncConfig {
@@ -137,15 +150,107 @@ impl CfgrLiveCommitSyncConfig {
         Ok(Self {
             config_handle_for_all_versions,
             config_handle_for_push_redirection,
+            push_redirect_config: None,
         })
     }
 
-    fn get_push_redirection_repo_state(
+    // This is temporary while we migrate every callsite.
+    pub fn new_with_xdb(
+        logger: &Logger,
+        config_store: &ConfigStore,
+        push_redirect_config: Arc<dyn PushRedirectionConfig>,
+    ) -> Result<Self, Error> {
+        debug!(logger, "Initializing CfgrLiveCommitSyncConfig");
+        let config_handle_for_push_redirection =
+            config_store.get_config_handle(CONFIGERATOR_PUSHREDIRECT_ENABLE.to_string())?;
+        debug!(logger, "Initialized PushRedirect configerator config");
+        let config_handle_for_all_versions =
+            config_store.get_config_handle(CONFIGERATOR_ALL_COMMIT_SYNC_CONFIGS.to_string())?;
+        debug!(
+            logger,
+            "Initialized all commit sync versions configerator config"
+        );
+        debug!(logger, "Done initializing CfgrLiveCommitSyncConfig");
+        Ok(Self {
+            config_handle_for_all_versions,
+            config_handle_for_push_redirection,
+            push_redirect_config: Some(push_redirect_config),
+        })
+    }
+
+    async fn get_push_redirection_repo_state(
         &self,
+        ctx: &CoreContext,
         repo_id: RepositoryId,
-    ) -> Option<PushRedirectEnableState> {
+    ) -> Result<PushRedirectEnableState> {
         let config = self.config_handle_for_push_redirection.get();
-        config.per_repo.get(&(repo_id.id() as i64)).cloned()
+        let state_from_cfgr = config.per_repo.get(&(repo_id.id() as i64)).cloned();
+        // we don't care about the difference between None and Some(false) hereA
+        let state_from_cfgr = state_from_cfgr.unwrap_or(PushRedirectEnableState {
+            draft_push: false,
+            public_push: false,
+        });
+
+        let (use_xdb, use_configerator) = if self.push_redirect_config.is_some() {
+            let use_xdb =
+                justknobs::eval("scm/mononoke:pushredirect_use_xdb", None, None).unwrap_or(false);
+            let use_configerator =
+                !justknobs::eval("scm/mononoke:pushredirect_disable_configerator", None, None)
+                    .unwrap_or(false);
+
+            (use_xdb, use_configerator)
+        } else {
+            (false, true)
+        };
+
+        if !use_xdb {
+            return Ok(state_from_cfgr);
+        }
+
+        let state_from_xdb = self
+            .push_redirect_config
+            .clone()
+            .expect("push_redirect_config should be available")
+            .get(ctx, repo_id)
+            .await;
+        // I would normally use a match block, but this will all be simplified and replaced with ? later
+        if let Err(e) = state_from_xdb {
+            warn!(
+                ctx.logger(),
+                "Failed to fetch push redirection config: {}", e
+            );
+            return if use_configerator {
+                Ok(state_from_cfgr)
+            } else {
+                Err(e)
+            };
+        }
+        let state_from_xdb = state_from_xdb.unwrap().map_or(
+            PushRedirectEnableState {
+                draft_push: false,
+                public_push: false,
+            },
+            |cfg| -> PushRedirectEnableState {
+                PushRedirectEnableState {
+                    draft_push: cfg.draft_push,
+                    public_push: cfg.public_push,
+                }
+            },
+        );
+
+        if use_configerator
+            && (state_from_cfgr.draft_push != state_from_xdb.draft_push
+                || state_from_cfgr.public_push != state_from_xdb.public_push)
+        {
+            bail!(
+                "Push redirect configs are inconsistent for repo {}: cfgr:{:?} vs xdb:{:?}",
+                repo_id,
+                state_from_cfgr,
+                state_from_xdb
+            )
+        } else {
+            Ok(state_from_xdb)
+        }
     }
 
     fn related_to_repo(
@@ -167,11 +272,15 @@ impl LiveCommitSyncConfig for CfgrLiveCommitSyncConfig {
     ///
     /// NOTE: two subsequent calls may return different results
     ///       as this queries  config source
-    fn push_redirector_enabled_for_draft(&self, repo_id: RepositoryId) -> bool {
-        match self.get_push_redirection_repo_state(repo_id) {
-            Some(config) => config.draft_push,
-            None => false,
-        }
+    async fn push_redirector_enabled_for_draft(
+        &self,
+        ctx: &CoreContext,
+        repo_id: RepositoryId,
+    ) -> Result<bool> {
+        Ok(self
+            .get_push_redirection_repo_state(ctx, repo_id)
+            .await?
+            .draft_push)
     }
 
     /// Return whether push redirection is currently
@@ -179,11 +288,15 @@ impl LiveCommitSyncConfig for CfgrLiveCommitSyncConfig {
     ///
     /// NOTE: two subsequent calls may return different results
     ///       as this queries  config source
-    fn push_redirector_enabled_for_public(&self, repo_id: RepositoryId) -> bool {
-        match self.get_push_redirection_repo_state(repo_id) {
-            Some(config) => config.public_push,
-            None => false,
-        }
+    async fn push_redirector_enabled_for_public(
+        &self,
+        ctx: &CoreContext,
+        repo_id: RepositoryId,
+    ) -> Result<bool> {
+        Ok(self
+            .get_push_redirection_repo_state(ctx, repo_id)
+            .await?
+            .public_push)
     }
 
     /// Return all historical versions of `CommitSyncConfig`
@@ -318,7 +431,7 @@ impl TestLiveCommitSyncConfigSource {
             .insert(config.version_name.clone(), config);
     }
 
-    pub fn set_draft_push_redirection_enabled(&self, repo_id: RepositoryId) {
+    pub fn set_draft_push_redirection_enabled(&self, _ctx: &CoreContext, repo_id: RepositoryId) {
         self.0
             .push_redirection_for_draft
             .lock()
@@ -326,7 +439,7 @@ impl TestLiveCommitSyncConfigSource {
             .insert(repo_id, true);
     }
 
-    pub fn set_public_push_redirection_enabled(&self, repo_id: RepositoryId) {
+    pub fn set_public_push_redirection_enabled(&self, _ctx: &CoreContext, repo_id: RepositoryId) {
         self.0
             .push_redirection_for_public
             .lock()
@@ -342,24 +455,32 @@ impl TestLiveCommitSyncConfigSource {
             .push(config);
     }
 
-    fn push_redirector_enabled_for_draft(&self, repo_id: RepositoryId) -> bool {
-        *self
+    async fn push_redirector_enabled_for_draft(
+        &self,
+        _ctx: &CoreContext,
+        repo_id: RepositoryId,
+    ) -> Result<bool> {
+        Ok(*self
             .0
             .push_redirection_for_draft
             .lock()
             .expect("poisoned lock")
             .get(&repo_id)
-            .unwrap_or(&false)
+            .unwrap_or(&false))
     }
 
-    fn push_redirector_enabled_for_public(&self, repo_id: RepositoryId) -> bool {
-        *self
+    async fn push_redirector_enabled_for_public(
+        &self,
+        _ctx: &CoreContext,
+        repo_id: RepositoryId,
+    ) -> Result<bool> {
+        Ok(*self
             .0
             .push_redirection_for_public
             .lock()
             .expect("poisoned lock")
             .get(&repo_id)
-            .unwrap_or(&false)
+            .unwrap_or(&false))
     }
 
     fn get_all_commit_sync_config_versions(
@@ -454,12 +575,24 @@ impl TestLiveCommitSyncConfig {
 
 #[async_trait]
 impl LiveCommitSyncConfig for TestLiveCommitSyncConfig {
-    fn push_redirector_enabled_for_draft(&self, repo_id: RepositoryId) -> bool {
-        self.source.push_redirector_enabled_for_draft(repo_id)
+    async fn push_redirector_enabled_for_draft(
+        &self,
+        ctx: &CoreContext,
+        repo_id: RepositoryId,
+    ) -> Result<bool> {
+        self.source
+            .push_redirector_enabled_for_draft(ctx, repo_id)
+            .await
     }
 
-    fn push_redirector_enabled_for_public(&self, repo_id: RepositoryId) -> bool {
-        self.source.push_redirector_enabled_for_public(repo_id)
+    async fn push_redirector_enabled_for_public(
+        &self,
+        ctx: &CoreContext,
+        repo_id: RepositoryId,
+    ) -> Result<bool> {
+        self.source
+            .push_redirector_enabled_for_public(ctx, repo_id)
+            .await
     }
 
     async fn get_all_commit_sync_config_versions(

@@ -16,15 +16,15 @@ import {genereatedFileCache} from './GeneratedFile';
 import {PullButton} from './PullButton';
 import {SettingsGearButton} from './SettingsTooltip';
 import {ShelvedChangesMenu} from './ShelvedChanges';
-import {DOCUMENTATION_DELAY, Tooltip} from './Tooltip';
 import {tracker} from './analytics';
-import {Button} from './components/Button';
 import {DebugToolsButton} from './debug/DebugToolsButton';
 import {t} from './i18n';
 import {maybeRemoveForgottenOperation, useClearAllOptimisticState} from './operationsState';
 import {haveCommitsLoadedYet, haveRemotePath, isFetchingCommits} from './serverAPIState';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
+import {DOCUMENTATION_DELAY, Tooltip} from 'isl-components/Tooltip';
 import {useAtomValue} from 'jotai';
-import {Icon} from 'shared/Icon';
 import {clearTrackedCache} from 'shared/LRU';
 
 import './TopBar.css';
@@ -59,7 +59,7 @@ export function TopBar() {
 
 function FetchingDataIndicator() {
   const isFetching = useAtomValue(isFetchingCommits);
-  return isFetching ? <Icon icon="loading" /> : null;
+  return <Icon icon={isFetching ? 'loading' : 'blank'} />;
 }
 
 function RefreshButton() {

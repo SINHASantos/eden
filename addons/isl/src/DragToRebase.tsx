@@ -7,15 +7,15 @@
 
 import type {CommitInfo} from './types';
 
-import {latestSuccessorUnlessExplicitlyObsolete} from './SuccessionTracker';
-import {Tooltip} from './Tooltip';
 import {t} from './i18n';
 import {readAtom, writeAtom} from './jotaiUtils';
 import {REBASE_PREVIEW_HASH_PREFIX, RebaseOperation} from './operations/RebaseOperation';
 import {operationBeingPreviewed} from './operationsState';
 import {CommitPreview, dagWithPreviews, uncommittedChangesWithPreviews} from './previews';
 import {latestDag} from './serverAPIState';
+import {latestSuccessorUnlessExplicitlyObsolete} from './successionUtils';
 import {succeedableRevset} from './types';
+import {Tooltip} from 'isl-components/Tooltip';
 import {useState, useCallback, useEffect} from 'react';
 
 function isDraggablePreview(previewType?: CommitPreview): boolean {

@@ -11,9 +11,9 @@ use std::collections::HashSet;
 use anyhow::anyhow;
 use anyhow::Result;
 use blobstore::Blobstore;
-use changesets::ChangesetInsert;
-use changesets::ChangesetsRef;
 use cloned::cloned;
+use commit_graph::CommitGraphRef;
+use commit_graph::CommitGraphWriterRef;
 use context::CoreContext;
 use futures::future::try_join;
 use futures::stream::FuturesUnordered;
@@ -23,7 +23,10 @@ use mononoke_types::BlobstoreValue;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
 use repo_blobstore::RepoBlobstoreRef;
+use repo_identity::RepoIdentityRef;
+use smallvec::ToSmallVec;
 use topo_sort::sort_topological;
+use vec1::Vec1;
 
 /// Upload bonsai changesets to the blobstore in parallel, and then store them
 /// in the changesets table.
@@ -31,10 +34,10 @@ use topo_sort::sort_topological;
 /// Parents of the changesets should already by saved in the repository.
 pub async fn save_changesets(
     ctx: &CoreContext,
-    repo: &(impl ChangesetsRef + RepoBlobstoreRef),
+    repo: &(impl CommitGraphRef + CommitGraphWriterRef + RepoBlobstoreRef + RepoIdentityRef),
     bonsai_changesets: Vec<BonsaiChangeset>,
 ) -> Result<()> {
-    let complete_changesets = repo.changesets();
+    let commit_graph = repo.commit_graph();
     let blobstore = repo.repo_blobstore();
 
     let mut parents_to_check: HashSet<ChangesetId> = HashSet::new();
@@ -49,15 +52,12 @@ pub async fn save_changesets(
     let parents_to_check = parents_to_check
         .into_iter()
         .map({
-            |p| {
-                cloned!(complete_changesets);
-                async move {
-                    let exists = complete_changesets.exists(ctx, p).await?;
-                    if exists {
-                        Ok(())
-                    } else {
-                        Err(anyhow!("Commit {} does not exist in the repo", p))
-                    }
+            |p| async move {
+                let exists = commit_graph.exists(ctx, p).await?;
+                if exists {
+                    Ok(())
+                } else {
+                    Err(anyhow!("Commit {} does not exist in the repo", p))
                 }
             }
         })
@@ -75,19 +75,6 @@ pub async fn save_changesets(
     for bcs in bonsai_changesets.values() {
         let parents: Vec<_> = bcs.parents().collect();
         bcs_parents.insert(bcs.get_changeset_id(), parents);
-    }
-
-    let topo_sorted_commits = sort_topological(&bcs_parents).expect("loop in commit chain!");
-    let mut bonsai_complete_futs = vec![];
-    for bcs_id in topo_sorted_commits {
-        if let Some(bcs) = bonsai_changesets.get(&bcs_id) {
-            let bcs_id = bcs.get_changeset_id();
-            let completion_record = ChangesetInsert {
-                cs_id: bcs_id,
-                parents: bcs.parents().collect(),
-            };
-            bonsai_complete_futs.push(complete_changesets.add(ctx, completion_record));
-        }
     }
 
     // Order of inserting bonsai changesets objects doesn't matter, so we can join them
@@ -112,8 +99,17 @@ pub async fn save_changesets(
 
     try_join(bonsai_objects, parents_to_check).await?;
 
-    for bonsai_complete in bonsai_complete_futs {
-        bonsai_complete.await?;
+    let topo_sorted_commits = sort_topological(&bcs_parents).expect("loop in commit chain!");
+    let entries = topo_sorted_commits
+        .into_iter()
+        .filter_map(|bcs_id| {
+            bcs_parents
+                .get(&bcs_id)
+                .map(|parents| (bcs_id, parents.to_smallvec()))
+        })
+        .collect::<Vec<_>>();
+    if let Ok(entries) = Vec1::try_from(entries) {
+        repo.commit_graph_writer().add_many(ctx, entries).await?;
     }
 
     Ok(())

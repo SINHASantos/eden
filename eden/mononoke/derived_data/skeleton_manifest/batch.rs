@@ -138,9 +138,9 @@ pub async fn new_batch_derivation(
 mod test {
     use bonsai_hg_mapping::BonsaiHgMapping;
     use bookmarks::Bookmarks;
-    use changesets::Changesets;
     use commit_graph::CommitGraph;
     use commit_graph::CommitGraphRef;
+    use commit_graph::CommitGraphWriter;
     use fbinit::FacebookInit;
     use filestore::FilestoreConfig;
     use fixtures::Linear;
@@ -148,6 +148,7 @@ mod test {
     use repo_blobstore::RepoBlobstore;
     use repo_derived_data::RepoDerivedData;
     use repo_derived_data::RepoDerivedDataRef;
+    use repo_identity::RepoIdentity;
     use test_repo_factory::TestRepoFactory;
     use tests_utils::bookmark;
     use tests_utils::drawdag::create_from_dag;
@@ -163,15 +164,17 @@ mod test {
         #[facet]
         bookmarks: dyn Bookmarks,
         #[facet]
-        changesets: dyn Changesets,
-        #[facet]
         commit_graph: CommitGraph,
+        #[facet]
+        commit_graph_writer: dyn CommitGraphWriter,
         #[facet]
         repo_derived_data: RepoDerivedData,
         #[facet]
         filestore_config: FilestoreConfig,
         #[facet]
         repo_blobstore: RepoBlobstore,
+        #[facet]
+        repo_identity: RepoIdentity,
     }
 
     #[fbinit::test]

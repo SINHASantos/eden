@@ -15,17 +15,19 @@ use blake3::Hasher as Blake3Hasher;
 use minibytes::Bytes;
 
 use crate::Blake3;
+use crate::CasDigest;
 use crate::FileType;
 use crate::HgId;
 use crate::Id20;
 use crate::RepoPathBuf;
+use crate::Sha1;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AugmentedFileNode {
     pub file_type: FileType,
     pub filenode: HgId,
     pub content_blake3: Blake3,
-    pub content_sha1: Id20,
+    pub content_sha1: Sha1,
     pub total_size: u64,
     pub file_header_metadata: Option<Bytes>,
 }
@@ -38,13 +40,13 @@ pub struct AugmentedDirectoryNode {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum AugmentedTreeChildEntry {
+pub enum AugmentedTreeEntry {
     FileNode(AugmentedFileNode),
     DirectoryNode(AugmentedDirectoryNode),
 }
 
-#[derive(Debug, Clone)]
-pub struct AugmentedTreeEntry {
+#[derive(Debug, Clone, PartialEq)]
+pub struct AugmentedTree {
     pub hg_node_id: HgId,
     // The computed_hg_node_id can be used for sha1 hash validation of
     // a sapling tree blob. This is only for the old root trees where
@@ -52,19 +54,19 @@ pub struct AugmentedTreeEntry {
     pub computed_hg_node_id: Option<HgId>,
     pub p1: Option<HgId>,
     pub p2: Option<HgId>,
-    pub subentries: Vec<(RepoPathBuf, AugmentedTreeChildEntry)>,
+    pub entries: Vec<(RepoPathBuf, AugmentedTreeEntry)>,
 }
 
-impl AugmentedTreeEntry {
+impl AugmentedTree {
     pub fn sapling_tree_blob_size(&self) -> usize {
         let mut size: usize = 0;
-        for (path, subentry) in self.subentries.iter() {
+        for (path, subentry) in self.entries.iter() {
             size += path.len() + 2;
             match subentry {
-                AugmentedTreeChildEntry::DirectoryNode(_) => {
+                AugmentedTreeEntry::DirectoryNode(_) => {
                     size += HgId::hex_len() + 1;
                 }
-                AugmentedTreeChildEntry::FileNode(_) => {
+                AugmentedTreeEntry::FileNode(_) => {
                     size += HgId::hex_len();
                 }
             };
@@ -73,15 +75,15 @@ impl AugmentedTreeEntry {
     }
 
     pub fn write_sapling_tree_blob(&self, mut w: impl Write) -> Result<()> {
-        for (path, subentry) in self.subentries.iter() {
+        for (path, subentry) in self.entries.iter() {
             w.write_all(path.as_ref())?;
             w.write_all(b"\0")?;
             match subentry {
-                AugmentedTreeChildEntry::DirectoryNode(directory) => {
-                    w.write_all(b"t")?;
+                AugmentedTreeEntry::DirectoryNode(directory) => {
                     w.write_all(directory.treenode.to_hex().as_bytes())?;
+                    w.write_all(b"t")?;
                 }
-                AugmentedTreeChildEntry::FileNode(file) => {
+                AugmentedTreeEntry::FileNode(file) => {
                     w.write_all(file.filenode.to_hex().as_bytes())?;
                 }
             };
@@ -122,10 +124,10 @@ impl AugmentedTreeEntry {
             size += 1;
         }
         size += 1;
-        for (path, subentry) in self.subentries.iter() {
+        for (path, subentry) in self.entries.iter() {
             size += path.len() + 1;
             match subentry {
-                AugmentedTreeChildEntry::FileNode(f) => {
+                AugmentedTreeEntry::FileNode(f) => {
                     size += HgId::hex_len() + Blake3::hex_len() + 3;
                     size += f.total_size.to_string().len() + 1;
                     size += Id20::hex_len();
@@ -137,7 +139,7 @@ impl AugmentedTreeEntry {
                         size += 1;
                     };
                 }
-                AugmentedTreeChildEntry::DirectoryNode(d) => {
+                AugmentedTreeEntry::DirectoryNode(d) => {
                     size += HgId::hex_len() + Blake3::hex_len() + 3;
                     size += d.augmented_manifest_size.to_string().len();
                 }
@@ -147,7 +149,7 @@ impl AugmentedTreeEntry {
         size
     }
 
-    /// Serialize the AugmentedTreeEntry to a blob.
+    /// Serialize the AugmentedTree to a blob.
     pub fn try_serialize(&self, mut w: impl Write) -> Result<()> {
         w.write_all(b"v1 ")?;
         w.write_all(self.hg_node_id.to_hex().as_ref())?;
@@ -170,11 +172,11 @@ impl AugmentedTreeEntry {
             w.write_all(b"-")?;
         };
         w.write_all(b"\n")?;
-        for (path, subentry) in self.subentries.iter() {
+        for (path, subentry) in self.entries.iter() {
             w.write_all(path.as_ref())?;
             w.write_all(b"\0")?;
             match subentry {
-                AugmentedTreeChildEntry::FileNode(file) => {
+                AugmentedTreeEntry::FileNode(file) => {
                     w.write_all(file.filenode.to_hex().as_ref())?;
                     w.write_all(b"r")?;
                     w.write_all(b" ")?;
@@ -190,7 +192,7 @@ impl AugmentedTreeEntry {
                         w.write_all(b"-")?;
                     };
                 }
-                AugmentedTreeChildEntry::DirectoryNode(directory) => {
+                AugmentedTreeEntry::DirectoryNode(directory) => {
                     w.write_all(directory.treenode.to_hex().as_ref())?;
                     w.write_all(b"t")?;
                     w.write_all(b" ")?;
@@ -204,7 +206,7 @@ impl AugmentedTreeEntry {
         Ok(())
     }
 
-    /// Constructs an AugmentedTreeEntry from serialised blob in the format used by Mononoke to store the Augmented Trees in CAS.
+    /// Constructs an AugmentedTree from serialised blob in the format used by Mononoke to store the Augmented Trees in CAS.
     pub fn try_deserialize(mut reader: impl BufRead) -> anyhow::Result<Self, Error> {
         let mut line = String::new();
         reader.read_line(&mut line)?;
@@ -256,7 +258,7 @@ impl AugmentedTreeEntry {
             computed_hg_node_id,
             p1,
             p2,
-            subentries: reader
+            entries: reader
                 .lines()
                 .map(|line| {
                     let line = line?;
@@ -297,7 +299,7 @@ impl AugmentedTreeEntry {
                                 ))?
                                 .trim();
 
-                            let sha1 = Id20::from_hex(sha1.as_ref())?;
+                            let sha1 = Sha1::from_hex(sha1.as_ref())?;
 
                             let file_header_metadata = parts
                             .next()
@@ -314,7 +316,7 @@ impl AugmentedTreeEntry {
 
                             Ok((
                                 path,
-                                AugmentedTreeChildEntry::FileNode(AugmentedFileNode {
+                                AugmentedTreeEntry::FileNode(AugmentedFileNode {
                                     file_type: FileType::Regular,
                                     filenode: hgid,
                                     content_blake3: blake3,
@@ -326,7 +328,7 @@ impl AugmentedTreeEntry {
                         }
                         't' => Ok((
                             path,
-                            AugmentedTreeChildEntry::DirectoryNode(AugmentedDirectoryNode {
+                            AugmentedTreeEntry::DirectoryNode(AugmentedDirectoryNode {
                                 treenode: hgid,
                                 augmented_manifest_id: blake3,
                                 augmented_manifest_size: size,
@@ -335,23 +337,23 @@ impl AugmentedTreeEntry {
                         _ => Err(anyhow!("augmented tree: invalid flag in a child entry")),
                     }
                 })
-                .collect::<anyhow::Result<Vec<(RepoPathBuf, AugmentedTreeChildEntry)>, Error>>()?,
+                .collect::<anyhow::Result<Vec<(RepoPathBuf, AugmentedTreeEntry)>, Error>>()?,
         })
     }
 
-    pub fn compute_content_addressed_digest(self) -> anyhow::Result<(Blake3, u64)> {
-        let mut calculator = AugmentedManifestDigestCalculator::new();
+    pub fn compute_content_addressed_digest(&self) -> anyhow::Result<CasDigest> {
+        let mut calculator = AugmentedTreeDigestCalculator::new();
         self.try_serialize(&mut calculator)?;
         calculator.finalize()
     }
 }
 
-struct AugmentedManifestDigestCalculator {
+struct AugmentedTreeDigestCalculator {
     hasher: Blake3Hasher,
     size: u64,
 }
 
-impl AugmentedManifestDigestCalculator {
+impl AugmentedTreeDigestCalculator {
     fn new() -> Self {
         #[cfg(fbcode_build)]
         let key = blake3_constants::BLAKE3_HASH_KEY;
@@ -363,13 +365,16 @@ impl AugmentedManifestDigestCalculator {
         }
     }
 
-    fn finalize(self) -> anyhow::Result<(Blake3, u64)> {
+    fn finalize(self) -> anyhow::Result<CasDigest> {
         let hash = Blake3::from_slice(self.hasher.finalize().as_bytes())?;
-        Ok((hash, self.size))
+        Ok(CasDigest {
+            hash,
+            size: self.size,
+        })
     }
 }
 
-impl Write for AugmentedManifestDigestCalculator {
+impl Write for AugmentedTreeDigestCalculator {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.hasher.update(buf);
         self.size += buf.len() as u64;
@@ -378,6 +383,65 @@ impl Write for AugmentedManifestDigestCalculator {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+// The type for storing AugmentedTreeEntries together with its digest.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AugmentedTreeWithDigest {
+    pub augmented_manifest_id: Blake3,
+    pub augmented_manifest_size: u64,
+    pub augmented_tree: AugmentedTree,
+}
+
+impl AugmentedTreeWithDigest {
+    pub fn serialized_tree_blob_size(&self) -> usize {
+        self.augmented_tree.augmented_tree_blob_size()
+            + Blake3::hex_len()
+            + self.augmented_manifest_size.to_string().len()
+            + 2
+    }
+
+    pub fn try_serialize(&self, mut w: impl Write) -> Result<()> {
+        // Prepend the augmented manifest id and size header to the blob.
+        w.write_all(self.augmented_manifest_id.to_hex().as_bytes())?;
+        w.write_all(b" ")?;
+        w.write_all(self.augmented_manifest_size.to_string().as_ref())?;
+        w.write_all(b"\n")?;
+        self.augmented_tree.try_serialize(&mut w)
+    }
+
+    pub fn try_deserialize(mut reader: impl BufRead) -> anyhow::Result<Self, Error> {
+        let CasDigest { hash, size } = Self::try_deserialize_digest(&mut reader)?;
+        let augmented_tree = AugmentedTree::try_deserialize(reader)?;
+        anyhow::Ok(Self {
+            augmented_manifest_id: hash,
+            augmented_tree,
+            augmented_manifest_size: size,
+        })
+    }
+
+    /// Deserializes just the header of an AugmentedTreeWithDigest.
+    pub fn try_deserialize_digest<R: BufRead>(reader: &mut R) -> anyhow::Result<CasDigest> {
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        let mut header = line.split(' ');
+        let augmented_manifest_id = Blake3::from_hex(
+            header
+                .next()
+                .ok_or(anyhow!("augmented tree: missing augmented_manifest_id"))?
+                .trim()
+                .as_ref(),
+        )?;
+        let augmented_manifest_size = header
+            .next()
+            .ok_or(anyhow!("augmented tree: missing augmented_manifest_size"))?
+            .trim()
+            .parse::<u64>()?;
+        Ok(CasDigest {
+            hash: augmented_manifest_id,
+            size: augmented_manifest_size,
+        })
     }
 }
 
@@ -397,9 +461,9 @@ mod tests {
             "dir_2\x001111111111111111111111111111111111111111t 1111111111111111111111111111111111111111111111111111111111111111 10000\n"
         ));
         let augmented_tree_entry =
-            AugmentedTreeEntry::try_deserialize(&mut reader).expect("parsing failed");
+            AugmentedTree::try_deserialize(&mut reader).expect("parsing failed");
 
-        assert_eq!(augmented_tree_entry.subentries.len(), 4);
+        assert_eq!(augmented_tree_entry.entries.len(), 4);
         let mut buf: Vec<u8> = Vec::with_capacity(1024);
         augmented_tree_entry
             .write_sapling_tree_blob(&mut buf)
@@ -409,8 +473,8 @@ mod tests {
             Ok(concat!(
                 "a.rs\x004444444444444444444444444444444444444444\n",
                 "b.rs\x002222222222222222222222222222222222222222\n",
-                "dir_1\x00t3333333333333333333333333333333333333333\n",
-                "dir_2\x00t1111111111111111111111111111111111111111\n"
+                "dir_1\x003333333333333333333333333333333333333333t\n",
+                "dir_2\x001111111111111111111111111111111111111111t\n"
             ))
         );
         // validate that the size calculation is correct
@@ -434,9 +498,9 @@ mod tests {
             "row_level_policy\x000238567d1c15525d8b2f2d366bd4aa306e20d8dft 3291f1c1ae09629423da93672b2fc52f009ab372a68d57844fef6d7c523d4527 937\n"
         ));
         let augmented_tree_entry =
-            AugmentedTreeEntry::try_deserialize(&mut reader).expect("parsing failed");
+            AugmentedTree::try_deserialize(&mut reader).expect("parsing failed");
 
-        assert_eq!(augmented_tree_entry.subentries.len(), 10);
+        assert_eq!(augmented_tree_entry.entries.len(), 10);
         assert_eq!(
             augmented_tree_entry.hg_node_id,
             HgId::from_hex(b"2d6429cc6d9576d412493d30c700c58a4ac38fbe").unwrap()
@@ -445,35 +509,35 @@ mod tests {
             augmented_tree_entry.p1,
             Some(HgId::from_hex(b"5d09d8b81f6c097d294cb081389428baa9ef96f4").unwrap())
         );
-        let first_child = augmented_tree_entry.subentries.first().unwrap();
+        let first_child = augmented_tree_entry.entries.first().unwrap();
         assert_eq!(
             first_child.0,
             RepoPathBuf::from_utf8(r"AssetWithZoneReclassifications.php".into()).unwrap()
         );
-        assert_matches!(first_child.1, AugmentedTreeChildEntry::FileNode(_));
+        assert_matches!(first_child.1, AugmentedTreeEntry::FileNode(_));
         assert_matches!(
             augmented_tree_entry
-                .subentries
+                .entries
                 .get(2)
                 .expect("index 2 out of range")
                 .1,
-            AugmentedTreeChildEntry::FileNode(_)
+            AugmentedTreeEntry::FileNode(_)
         );
         assert_matches!(
             augmented_tree_entry
-                .subentries
+                .entries
                 .get(3)
                 .expect("index 3 out of range")
                 .1,
-            AugmentedTreeChildEntry::DirectoryNode(_)
+            AugmentedTreeEntry::DirectoryNode(_)
         );
         assert_eq!(
             augmented_tree_entry
-                .subentries
+                .entries
                 .get(3)
                 .expect("index 3 out of range")
                 .1,
-            AugmentedTreeChildEntry::DirectoryNode(AugmentedDirectoryNode {
+            AugmentedTreeEntry::DirectoryNode(AugmentedDirectoryNode {
                 treenode: HgId::from_hex(b"9f0e8ffab4c1e1adfdea446d3c91b3c8ad525685").unwrap(),
                 augmented_manifest_id: Blake3::from_hex(
                     b"8be9967f8ce1a6c8799f372acb81f57208a7eee78a6e60b6fa6426785fee31d6"
@@ -493,13 +557,13 @@ mod tests {
                 "AssetWithZoneReclassifications.php\x002f09c0be8738b7256452133d790cc39f9da885b8\n",
                 "ZoneAssetReclassificationsAnnotation.php\x00a7006d0256d90b83b8e8834e3a8d74a57f669364\n",
                 "ZonePolicySetGenerator.php\x0032c4117a356ddd5a284dd55866e4c609e4002c99\n",
-                "__tests__\x00t9f0e8ffab4c1e1adfdea446d3c91b3c8ad525685\n",
-                "bounded_policies\x00te057d09012b275e5aa8f3d31ecb334ea7bd0e2df\n",
-                "config\x00tef0295d493a767db31bd2ad6e3c118a5ec2dc094\n",
-                "enforcement\x00t519f107814932a6aaedf68e82a673710461c1a16\n",
-                "integration\x00t19ff1a891b88dad37743bb22fe29709b15ac195d\n",
-                "reclassifications\x00tf1e2432047947bb339f2d6a2608eca729703bb65\n",
-                "row_level_policy\x00t0238567d1c15525d8b2f2d366bd4aa306e20d8df\n"
+                "__tests__\x009f0e8ffab4c1e1adfdea446d3c91b3c8ad525685t\n",
+                "bounded_policies\x00e057d09012b275e5aa8f3d31ecb334ea7bd0e2dft\n",
+                "config\x00ef0295d493a767db31bd2ad6e3c118a5ec2dc094t\n",
+                "enforcement\x00519f107814932a6aaedf68e82a673710461c1a16t\n",
+                "integration\x0019ff1a891b88dad37743bb22fe29709b15ac195dt\n",
+                "reclassifications\x00f1e2432047947bb339f2d6a2608eca729703bb65t\n",
+                "row_level_policy\x000238567d1c15525d8b2f2d366bd4aa306e20d8dft\n"
             ))
         );
         assert_eq!(buf.len(), augmented_tree_entry.sapling_tree_blob_size());
@@ -522,7 +586,7 @@ mod tests {
         );
         let mut reader = std::io::Cursor::new(tree);
         let augmented_tree_entry =
-            AugmentedTreeEntry::try_deserialize(&mut reader).expect("parsing failed");
+            AugmentedTree::try_deserialize(&mut reader).expect("parsing failed");
 
         let mut buf: Vec<u8> = Vec::with_capacity(1024);
         augmented_tree_entry
@@ -543,9 +607,9 @@ mod tests {
             "dir_2\x001111111111111111111111111111111111111111t 1111111111111111111111111111111111111111111111111111111111111111 10000\n"
         ));
         let augmented_tree_entry =
-            AugmentedTreeEntry::try_deserialize(&mut reader).expect("parsing failed");
+            AugmentedTree::try_deserialize(&mut reader).expect("parsing failed");
 
-        assert_eq!(augmented_tree_entry.subentries.len(), 4);
+        assert_eq!(augmented_tree_entry.entries.len(), 4);
         assert_eq!(
             augmented_tree_entry.computed_hg_node_id,
             Some(HgId::from_hex(b"4444444444444444444444444444444444444444").expect("bad hgid"))
@@ -567,13 +631,13 @@ mod tests {
             "dir_2\x001111111111111111111111111111111111111111t 1111111111111111111111111111111111111111111111111111111111111111 10000\n"
         ));
         let augmented_tree_entry =
-            AugmentedTreeEntry::try_deserialize(&mut reader).expect("parsing failed");
+            AugmentedTree::try_deserialize(&mut reader).expect("parsing failed");
 
-        assert_eq!(augmented_tree_entry.subentries.len(), 4);
+        assert_eq!(augmented_tree_entry.entries.len(), 4);
 
         assert_eq!(
-            augmented_tree_entry.subentries.first().unwrap().1,
-            AugmentedTreeChildEntry::FileNode(AugmentedFileNode {
+            augmented_tree_entry.entries.first().unwrap().1,
+            AugmentedTreeEntry::FileNode(AugmentedFileNode {
                 file_type: FileType::Regular,
                 filenode: HgId::from_hex(b"4444444444444444444444444444444444444444")
                     .expect("bad hgid"),
@@ -581,7 +645,7 @@ mod tests {
                     b"4444444444444444444444444444444444444444444444444444444444444444"
                 )
                 .expect("bad blake3"),
-                content_sha1: Id20::from_hex(b"4444444444444444444444444444444444444444")
+                content_sha1: Sha1::from_hex(b"4444444444444444444444444444444444444444")
                     .expect("bad id20"),
                 total_size: 10,
                 file_header_metadata: Some(Bytes::from(
@@ -607,8 +671,8 @@ mod tests {
             "dir_2\x001111111111111111111111111111111111111111t 1111111111111111111111111111111111111111111111111111111111111111 10000\n"
         ));
         let augmented_tree_entry =
-            AugmentedTreeEntry::try_deserialize(&mut reader).expect("parsing failed");
-        let (hash, size) = augmented_tree_entry
+            AugmentedTree::try_deserialize(&mut reader).expect("parsing failed");
+        let CasDigest { hash, size } = augmented_tree_entry
             .compute_content_addressed_digest()
             .expect("digest calculation failed");
         assert_eq!(
@@ -618,5 +682,49 @@ mod tests {
                 681
             )
         );
+    }
+
+    #[test]
+    fn test_augmented_tree_with_digest_parsing_roundtrip() {
+        let mut reader = std::io::Cursor::new(concat!(
+            "v1 1111111111111111111111111111111111111111 - 2222222222222222222222222222222222222222 3333333333333333333333333333333333333333\n",
+            "a.rs\x004444444444444444444444444444444444444444r 4444444444444444444444444444444444444444444444444444444444444444 10 4444444444444444444444444444444444444444 -\n",
+            "b.rs\x002222222222222222222222222222222222222222r 2222222222222222222222222222222222222222222222222222222222222222 1000 2121212121212121212121212121212121212121 -\n",
+            "dir_1\x003333333333333333333333333333333333333333t 3333333333333333333333333333333333333333333333333333333333333333 10\n",
+            "dir_2\x001111111111111111111111111111111111111111t 1111111111111111111111111111111111111111111111111111111111111111 10000\n"
+        ));
+
+        // Parse initial augmented tree entry.
+        let augmented_tree_entry =
+            AugmentedTree::try_deserialize(&mut reader).expect("parsing failed");
+
+        // Calculate digest
+        let CasDigest { hash, size } = augmented_tree_entry
+            .compute_content_addressed_digest()
+            .expect("digest calculation failed");
+
+        // Create augmented tree entry with digest.
+        let augmented_tree_with_digest = AugmentedTreeWithDigest {
+            augmented_manifest_id: hash,
+            augmented_manifest_size: size,
+            augmented_tree: augmented_tree_entry,
+        };
+
+        // Serialize and deserialize, check the stucts are identical.
+        let mut buf: Vec<u8> = Vec::with_capacity(1024);
+        augmented_tree_with_digest
+            .try_serialize(&mut buf)
+            .expect("writing failed");
+
+        // Check the size of serialized tree blob is correct.
+        assert_eq!(
+            buf.len(),
+            augmented_tree_with_digest.serialized_tree_blob_size()
+        );
+
+        let reader1 = std::io::Cursor::new(buf);
+        let augmented_tree_with_digest2 =
+            AugmentedTreeWithDigest::try_deserialize(reader1).expect("parsing failed");
+        assert_eq!(augmented_tree_with_digest, augmented_tree_with_digest2);
     }
 }

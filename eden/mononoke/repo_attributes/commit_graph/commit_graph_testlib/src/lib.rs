@@ -14,7 +14,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use cloned::cloned;
+use commit_graph::BaseCommitGraphWriter;
 use commit_graph::CommitGraph;
+use commit_graph::CommitGraphWriter;
 use commit_graph_types::storage::CommitGraphStorage;
 use commit_graph_types::storage::Prefetch;
 use context::CoreContext;
@@ -27,6 +29,7 @@ use maplit::hashmap;
 use maplit::hashset;
 use mononoke_types::ChangesetIdPrefix;
 use mononoke_types::ChangesetIdsResolvedFromPrefix;
+use mononoke_types::Generation;
 use mononoke_types::RepositoryId;
 use smallvec::smallvec;
 use vec1::vec1;
@@ -58,6 +61,7 @@ macro_rules! impl_commit_graph_tests {
             test_find_by_prefix,
             test_add_recursive,
             test_add_recursive_many_changesets,
+            test_add_many_changesets,
             test_ancestors_frontier_with,
             test_range_stream,
             test_common_base,
@@ -73,6 +77,7 @@ macro_rules! impl_commit_graph_tests {
             test_process_topologically,
             test_minimize_frontier,
             test_ancestors_within_distance,
+            test_linear_ancestors_stream,
         );
     };
 }
@@ -129,6 +134,48 @@ pub async fn test_storage_store_and_fetch(
     );
     assert_eq!(
         graph
+            .many_changeset_generations(
+                &ctx,
+                &[
+                    name_cs_id("A"),
+                    name_cs_id("C"),
+                    name_cs_id("F"),
+                    name_cs_id("G")
+                ]
+            )
+            .await?,
+        hashmap! {
+            name_cs_id("A") => Generation::new(1),
+            name_cs_id("C") => Generation::new(3),
+            name_cs_id("F") => Generation::new(3),
+            name_cs_id("G") => Generation::new(5),
+        }
+    );
+    assert_eq!(
+        graph.changeset_linear_depth(&ctx, name_cs_id("G")).await?,
+        4
+    );
+    assert_eq!(
+        graph
+            .many_changeset_linear_depths(
+                &ctx,
+                &[
+                    name_cs_id("A"),
+                    name_cs_id("C"),
+                    name_cs_id("F"),
+                    name_cs_id("G")
+                ]
+            )
+            .await?,
+        hashmap! {
+            name_cs_id("A") => 0,
+            name_cs_id("C") => 2,
+            name_cs_id("F") => 2,
+            name_cs_id("G") => 4,
+        }
+    );
+    assert_eq!(
+        graph
             .changeset_parents(&ctx, name_cs_id("A"))
             .await?
             .as_slice(),
@@ -147,6 +194,16 @@ pub async fn test_storage_store_and_fetch(
             .await?
             .as_slice(),
         &[name_cs_id("D"), name_cs_id("F")]
+    );
+    assert_eq!(
+        graph
+            .many_changeset_parents(&ctx, &[name_cs_id("A"), name_cs_id("E"), name_cs_id("G")])
+            .await?,
+        hashmap! {
+            name_cs_id("A") => smallvec![],
+            name_cs_id("E") => smallvec![name_cs_id("A")],
+            name_cs_id("G") => smallvec![name_cs_id("D"), name_cs_id("F")],
+        },
     );
 
     // Check some underlying storage details.
@@ -436,11 +493,25 @@ pub async fn test_p1_linear_tree(
     let graph = from_dag(
         &ctx,
         r"
-         A-B-C-D-G-H---J-K
-            \   /   \ /
-             E-F     I
-
-         L-M-N-O-P-Q-R-S-T-U
+         K         V
+         |         |
+         J         U
+         |         |
+         I         T
+         |\        |
+         | \       S
+         F  |      |
+         |\ |  L   R
+         | \|  |   |
+         E  H /    Q
+         |  |/     |
+         D  G      P
+         |  |      |
+         C /       O
+         |/        |
+         B         N
+         |         |
+         A         M
          ",
         storage.clone(),
     )
@@ -451,26 +522,30 @@ pub async fn test_p1_linear_tree(
     assert_p1_linear_skew_ancestor(&storage, &ctx, "B", Some("A")).await?;
     assert_p1_linear_skew_ancestor(&storage, &ctx, "C", Some("B")).await?;
     assert_p1_linear_skew_ancestor(&storage, &ctx, "D", Some("A")).await?;
-    assert_p1_linear_skew_ancestor(&storage, &ctx, "E", Some("B")).await?;
-    assert_p1_linear_skew_ancestor(&storage, &ctx, "F", Some("A")).await?;
-    assert_p1_linear_skew_ancestor(&storage, &ctx, "G", Some("D")).await?;
-    assert_p1_linear_skew_ancestor(&storage, &ctx, "H", Some("G")).await?;
+    assert_p1_linear_skew_ancestor(&storage, &ctx, "E", Some("D")).await?;
+    assert_p1_linear_skew_ancestor(&storage, &ctx, "F", Some("E")).await?;
+    assert_p1_linear_skew_ancestor(&storage, &ctx, "G", Some("B")).await?;
+    assert_p1_linear_skew_ancestor(&storage, &ctx, "H", Some("A")).await?;
     assert_p1_linear_skew_ancestor(&storage, &ctx, "I", Some("D")).await?;
-    assert_p1_linear_skew_ancestor(&storage, &ctx, "J", Some("D")).await?;
-    assert_p1_linear_skew_ancestor(&storage, &ctx, "K", Some("A")).await?;
+    assert_p1_linear_skew_ancestor(&storage, &ctx, "J", Some("A")).await?;
+    assert_p1_linear_skew_ancestor(&storage, &ctx, "K", Some("J")).await?;
 
-    assert_p1_linear_level_ancestor(&graph, &ctx, "S", 4, Some("P")).await?;
-    assert_p1_linear_level_ancestor(&graph, &ctx, "U", 7, Some("S")).await?;
-    assert_p1_linear_level_ancestor(&graph, &ctx, "T", 7, Some("S")).await?;
-    assert_p1_linear_level_ancestor(&graph, &ctx, "O", 2, Some("N")).await?;
-    assert_p1_linear_level_ancestor(&graph, &ctx, "N", 3, None).await?;
-    assert_p1_linear_level_ancestor(&graph, &ctx, "K", 2, Some("C")).await?;
+    assert_p1_linear_level_ancestor(&graph, &ctx, "S", 3, Some("P")).await?;
+    assert_p1_linear_level_ancestor(&graph, &ctx, "U", 6, Some("S")).await?;
+    assert_p1_linear_level_ancestor(&graph, &ctx, "T", 6, Some("S")).await?;
+    assert_p1_linear_level_ancestor(&graph, &ctx, "O", 1, Some("N")).await?;
+    assert_p1_linear_level_ancestor(&graph, &ctx, "N", 2, None).await?;
+    assert_p1_linear_level_ancestor(&graph, &ctx, "K", 1, Some("B")).await?;
+    assert_p1_linear_level_ancestor(&graph, &ctx, "H", 2, Some("G")).await?;
+    assert_p1_linear_level_ancestor(&graph, &ctx, "J", 3, Some("D")).await?;
 
-    assert_p1_linear_lowest_common_ancestor(&graph, &ctx, "D", "F", Some("B")).await?;
-    assert_p1_linear_lowest_common_ancestor(&graph, &ctx, "K", "I", Some("H")).await?;
-    assert_p1_linear_lowest_common_ancestor(&graph, &ctx, "D", "C", Some("C")).await?;
-    assert_p1_linear_lowest_common_ancestor(&graph, &ctx, "N", "K", None).await?;
-    assert_p1_linear_lowest_common_ancestor(&graph, &ctx, "A", "I", Some("A")).await?;
+    assert_p1_linear_lowest_common_ancestor(&graph, &ctx, "F", "D", Some("D")).await?;
+    assert_p1_linear_lowest_common_ancestor(&graph, &ctx, "E", "H", Some("B")).await?;
+    assert_p1_linear_lowest_common_ancestor(&graph, &ctx, "K", "I", Some("I")).await?;
+    assert_p1_linear_lowest_common_ancestor(&graph, &ctx, "I", "H", Some("B")).await?;
+    assert_p1_linear_lowest_common_ancestor(&graph, &ctx, "L", "H", Some("G")).await?;
+    assert_p1_linear_lowest_common_ancestor(&graph, &ctx, "L", "F", Some("B")).await?;
+    assert_p1_linear_lowest_common_ancestor(&graph, &ctx, "F", "R", None).await?;
 
     Ok(())
 }
@@ -745,8 +820,10 @@ pub async fn test_add_recursive(
     );
 
     let graph = CommitGraph::new(storage.clone());
+    let graph_writer = BaseCommitGraphWriter::new(graph.clone());
+
     assert_eq!(
-        graph
+        graph_writer
             .add_recursive(
                 &ctx,
                 reference_graph.clone(),
@@ -756,7 +833,7 @@ pub async fn test_add_recursive(
         9
     );
     assert_eq!(
-        graph
+        graph_writer
             .add_recursive(
                 &ctx,
                 reference_graph,
@@ -821,8 +898,10 @@ pub async fn test_add_recursive_many_changesets(
     );
 
     let graph = CommitGraph::new(storage.clone());
+    let graph_writer = BaseCommitGraphWriter::new(graph.clone());
+
     assert_eq!(
-        graph
+        graph_writer
             .add_recursive(
                 &ctx,
                 reference_graph.clone(),
@@ -861,7 +940,7 @@ pub async fn test_add_recursive_many_changesets(
     );
 
     assert_eq!(
-        graph
+        graph_writer
             .add_recursive(
                 &ctx,
                 reference_graph.clone(),
@@ -873,6 +952,225 @@ pub async fn test_add_recursive_many_changesets(
             .await?,
         2
     );
+    Ok(())
+}
+
+pub async fn test_add_many_changesets(
+    ctx: CoreContext,
+    storage: Arc<dyn CommitGraphStorageTest>,
+) -> Result<()> {
+    //  Reference graph:
+    //  r"
+    //      A-B-C-D-G-H-I
+    //       \     /
+    //        E---F---J
+    //  "
+
+    let graph = CommitGraph::new(storage.clone());
+    let graph_writer = BaseCommitGraphWriter::new(graph.clone());
+
+    assert_eq!(
+        graph_writer
+            .add_many(
+                &ctx,
+                vec1![
+                    (name_cs_id("A"), smallvec![]),
+                    (name_cs_id("B"), smallvec![name_cs_id("A")]),
+                    (name_cs_id("E"), smallvec![name_cs_id("A")]),
+                    (name_cs_id("C"), smallvec![name_cs_id("B")]),
+                ],
+            )
+            .await?,
+        4
+    );
+    storage.flush();
+
+    assert_eq!(
+        graph
+            .changeset_parents(&ctx, name_cs_id("A"))
+            .await?
+            .as_slice(),
+        &[]
+    );
+    assert_eq!(
+        graph
+            .changeset_parents(&ctx, name_cs_id("B"))
+            .await?
+            .as_slice(),
+        &[name_cs_id("A")]
+    );
+    assert_eq!(
+        graph
+            .changeset_parents(&ctx, name_cs_id("C"))
+            .await?
+            .as_slice(),
+        &[name_cs_id("B")]
+    );
+
+    // D is not yet inserted.
+    assert!(
+        graph
+            .changeset_parents(&ctx, name_cs_id("D"))
+            .await
+            .is_err(),
+    );
+
+    // If the provided changesets are not in topological order we will
+    // return an error.
+    assert!(
+        graph_writer
+            .add_many(
+                &ctx,
+                vec1![
+                    (name_cs_id("G"), smallvec![name_cs_id("D"), name_cs_id("F")]),
+                    (name_cs_id("D"), smallvec![name_cs_id("C")]),
+                    (name_cs_id("F"), smallvec![name_cs_id("E")]),
+                ],
+            )
+            .await
+            .is_err()
+    );
+
+    assert_eq!(
+        graph_writer
+            .add_many(
+                &ctx,
+                vec1![
+                    (name_cs_id("D"), smallvec![name_cs_id("C")]),
+                    (name_cs_id("F"), smallvec![name_cs_id("E")]),
+                    (name_cs_id("G"), smallvec![name_cs_id("D"), name_cs_id("F")]),
+                ],
+            )
+            .await?,
+        3
+    );
+    storage.flush();
+
+    assert_eq!(
+        graph
+            .changeset_parents(&ctx, name_cs_id("D"))
+            .await?
+            .as_slice(),
+        &[name_cs_id("C")]
+    );
+    assert_eq!(
+        graph
+            .changeset_parents(&ctx, name_cs_id("F"))
+            .await?
+            .as_slice(),
+        &[name_cs_id("E")]
+    );
+    assert_eq!(
+        graph
+            .changeset_parents(&ctx, name_cs_id("G"))
+            .await?
+            .as_slice(),
+        &[name_cs_id("D"), name_cs_id("F")]
+    );
+
+    // Re-inserting changesets is a no-op.
+    graph_writer
+        .add_many(
+            &ctx,
+            vec1![
+                (name_cs_id("D"), smallvec![name_cs_id("C")]),
+                (name_cs_id("F"), smallvec![name_cs_id("E")]),
+                (name_cs_id("G"), smallvec![name_cs_id("D"), name_cs_id("F")]),
+            ],
+        )
+        .await?;
+    storage.flush();
+
+    assert_eq!(
+        graph
+            .changeset_parents(&ctx, name_cs_id("D"))
+            .await?
+            .as_slice(),
+        &[name_cs_id("C")]
+    );
+    assert_eq!(
+        graph
+            .changeset_parents(&ctx, name_cs_id("F"))
+            .await?
+            .as_slice(),
+        &[name_cs_id("E")]
+    );
+    assert_eq!(
+        graph
+            .changeset_parents(&ctx, name_cs_id("G"))
+            .await?
+            .as_slice(),
+        &[name_cs_id("D"), name_cs_id("F")]
+    );
+
+    assert_eq!(
+        graph_writer
+            .add_many(
+                &ctx,
+                vec1![
+                    (name_cs_id("H"), smallvec![name_cs_id("G")]),
+                    (name_cs_id("J"), smallvec![name_cs_id("F")]),
+                    (name_cs_id("I"), smallvec![name_cs_id("H")]),
+                ],
+            )
+            .await?,
+        3
+    );
+    storage.flush();
+
+    assert_eq!(
+        graph
+            .changeset_parents(&ctx, name_cs_id("H"))
+            .await?
+            .as_slice(),
+        &[name_cs_id("G")]
+    );
+    assert_eq!(
+        graph
+            .changeset_parents(&ctx, name_cs_id("I"))
+            .await?
+            .as_slice(),
+        &[name_cs_id("H")]
+    );
+    assert_eq!(
+        graph
+            .changeset_parents(&ctx, name_cs_id("J"))
+            .await?
+            .as_slice(),
+        &[name_cs_id("F")]
+    );
+
+    assert!(
+        graph
+            .is_ancestor(&ctx, name_cs_id("A"), name_cs_id("J"))
+            .await?
+    );
+    assert!(
+        !graph
+            .is_ancestor(&ctx, name_cs_id("J"), name_cs_id("A"))
+            .await?
+    );
+    assert!(
+        !graph
+            .is_ancestor(&ctx, name_cs_id("D"), name_cs_id("F"))
+            .await?
+    );
+    assert!(
+        !graph
+            .is_ancestor(&ctx, name_cs_id("F"), name_cs_id("D"))
+            .await?
+    );
+    assert!(
+        graph
+            .is_ancestor(&ctx, name_cs_id("F"), name_cs_id("H"))
+            .await?
+    );
+    assert!(
+        !graph
+            .is_ancestor(&ctx, name_cs_id("H"), name_cs_id("F"))
+            .await?
+    );
+
     Ok(())
 }
 
@@ -1717,6 +2015,122 @@ pub async fn test_ancestors_within_distance(
     )
     .await?;
     assert_ancestors_within_distance(&ctx, &graph, vec![], 100, vec![]).await?;
+
+    Ok(())
+}
+
+pub async fn test_linear_ancestors_stream(
+    ctx: CoreContext,
+    storage: Arc<dyn CommitGraphStorageTest>,
+) -> Result<()> {
+    let graph = from_dag(
+        &ctx,
+        r"
+        P     O
+        |     |
+        N     |
+        |\    |
+        | \   M
+        |  \  |
+        J   \ |   L
+        |    \|  /
+        |     K /
+        |  Q  |/
+        | /   I
+        |/ G  |
+        E  |  H
+        |  F /
+        D  |/ 
+        |  |
+        C /
+        |/
+        B
+        |
+        A
+        ",
+        storage.clone(),
+    )
+    .await?;
+    storage.flush();
+
+    assert_linear_ancestors_stream(
+        &ctx,
+        &graph,
+        "P",
+        None,
+        None,
+        None,
+        vec!["P", "N", "J", "E", "D", "C", "B", "A"],
+    )
+    .await?;
+
+    assert_linear_ancestors_stream(
+        &ctx,
+        &graph,
+        "P",
+        Some("L"),
+        None,
+        None,
+        vec!["P", "N", "J", "E", "D", "C"],
+    )
+    .await?;
+
+    assert_linear_ancestors_stream(
+        &ctx,
+        &graph,
+        "P",
+        Some("O"),
+        None,
+        None,
+        vec!["P", "N", "J", "E", "D", "C"],
+    )
+    .await?;
+
+    assert_linear_ancestors_stream(
+        &ctx,
+        &graph,
+        "P",
+        Some("Q"),
+        None,
+        None,
+        vec!["P", "N", "J"],
+    )
+    .await?;
+
+    assert_linear_ancestors_stream(
+        &ctx,
+        &graph,
+        "P",
+        None,
+        Some("E"),
+        None,
+        vec!["P", "N", "J", "E"],
+    )
+    .await?;
+
+    assert_linear_ancestors_stream(
+        &ctx,
+        &graph,
+        "P",
+        Some("Q"),
+        Some("E"),
+        None,
+        vec!["P", "N", "J"],
+    )
+    .await?;
+
+    assert_linear_ancestors_stream(&ctx, &graph, "P", None, Some("F"), None, vec![]).await?;
+
+    assert_linear_ancestors_stream(
+        &ctx,
+        &graph,
+        "P",
+        Some("L"),
+        None,
+        Some(2),
+        vec!["J", "E", "D", "C"],
+    )
+    .await?;
 
     Ok(())
 }

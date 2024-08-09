@@ -46,6 +46,7 @@ struct DeriveRequest {
   3: binary changeset_id;
   4: string config_name;
   5: DerivationType derivation_type;
+  6: optional i64 bubble_id;
 } (rust.exhaustive)
 
 struct DeriveResponse {
@@ -71,7 +72,7 @@ union DerivedData {
   11: DerivedDataDeletedManifestV2 deleted_manifest_v2;
   12: DerivedDataBasenameSuffixSkeletonManifest basename_suffix_skeleton_manifest;
   13: DerivedDataCommitHandle commit_handle;
-  14: DerivedDataGitDeltaManifest git_delta_manifest;
+  // 14: deleted git_delta_manifest
   15: DerivedDataTestManifest test_manifest;
   16: DerivedDataTestShardedManifest test_sharded_manifest;
   17: DerivedDataBssmV3 bssm_v3;
@@ -154,10 +155,6 @@ union DerivedDataCommitHandle {
   1: git_types_thrift.MappedGitCommitId mapped_commit_id;
 }
 
-union DerivedDataGitDeltaManifest {
-  1: git_types_thrift.GitDeltaManifestId root_git_delta_manifest_id;
-}
-
 union DerivedDataHgAugmentedManifest {
   1: mercurial_thrift.HgNodeHash root_hg_augmented_manifest_id;
 }
@@ -192,6 +189,11 @@ struct DisabledDerivation {
   3: string repo_name;
 } (rust.exhaustive)
 
+struct TypeDisabledForEphemeralBubbles {
+  1: string type_name;
+  2: i32 repo_id;
+} (rust.exhaustive)
+
 struct DisabledFilenodes {} (rust.exhaustive)
 
 union RequestErrorReason {
@@ -201,6 +203,7 @@ union RequestErrorReason {
   4: UnknownDerivedDataConfig unknown_derived_data_config;
   5: UnknownDerivationType unknown_derivation_type;
   6: DisabledDerivation disabled_derivation;
+  7: TypeDisabledForEphemeralBubbles type_disabled_for_ephemeral_bubbles;
 }
 
 safe permanent client exception RequestError {

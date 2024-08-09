@@ -5,14 +5,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import {Banner, BannerKind} from '../Banner';
 import {Column} from '../ComponentUtils';
 import {Internal} from '../Internal';
-import {Tooltip} from '../Tooltip';
 import {tracker} from '../analytics';
 import {codeReviewProvider, diffSummary} from '../codeReview/CodeReviewInfo';
-import {Button} from '../components/Button';
-import {Divider} from '../components/Divider';
 import GatedComponent from '../components/GatedComponent';
 import {T, t} from '../i18n';
 import {localStorageBackedAtom} from '../jotaiUtils';
@@ -30,8 +26,13 @@ import {
 import {SplitButton} from '../stackEdit/ui/SplitButton';
 import {type CommitInfo} from '../types';
 import {commitMode} from './CommitInfoState';
+import {Banner, BannerKind} from 'isl-components/Banner';
+import {Button} from 'isl-components/Button';
+import {ButtonGroup} from 'isl-components/ButtonGroup';
+import {Divider} from 'isl-components/Divider';
+import {Icon} from 'isl-components/Icon';
+import {Tooltip} from 'isl-components/Tooltip';
 import {useAtom, useAtomValue} from 'jotai';
-import {Icon} from 'shared/Icon';
 
 export const splitSuggestionEnabled = localStorageBackedAtom<boolean>(
   'isl.split-suggestion-enabled',
@@ -86,10 +87,10 @@ function SuggestionBanner({
         icon={<Icon size="M" icon="lightbulb" color="blue" />}
         alwaysShowButtons
         buttons={
-          <>
+          <ButtonGroup>
             {buttons}
             <DismissSuggestionButton />
-          </>
+          </ButtonGroup>
         }>
         <Tooltip title={tooltip}>
           <Column alignStart style={{gap: 0}}>
@@ -116,7 +117,7 @@ function NewCommitSuggestion() {
         <b>
           <T>Consider unselecting some of these changes</T>
         </b>
-        <T>Small Diffs lead to less SEVs & quicker review times</T>
+        <T>Small Diffs lead to quicker review times</T>
       </SuggestionBanner>
     );
   }
@@ -138,7 +139,7 @@ function AmendSuggestion() {
         <b>
           <T>Consider unselecting some of these changes</T>
         </b>
-        <T>Small Diffs lead to less SEVs & quicker review times</T>
+        <T>Small Diffs lead to quicker review times</T>
       </SuggestionBanner>
     );
   }
@@ -163,7 +164,7 @@ function SplitSuggestionImpl({commit}: {commit: CommitInfo}) {
         <b>
           <T>Consider splitting up this commit</T>
         </b>
-        <T>Small Diffs lead to less SEVs & quicker review times</T>
+        <T>Small Diffs lead to quicker review times</T>
       </SuggestionBanner>
     );
   }
@@ -178,9 +179,6 @@ function SplitSuggestionImpl({commit}: {commit: CommitInfo}) {
   } else {
     return <AmendSuggestion />;
   }
-
-  // no need to show any suggestion
-  return null;
 }
 
 export default function SplitSuggestion({commit}: {commit: CommitInfo}) {

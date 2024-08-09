@@ -12,9 +12,7 @@ import type {ReactNode} from 'react';
 import {useShowConfirmSubmitStack} from '../ConfirmSubmitStack';
 import {Internal} from '../Internal';
 import {Link} from '../Link';
-import {Tooltip} from '../Tooltip';
 import {clipboardCopyLink, clipboardCopyText} from '../clipboard';
-import {Button} from '../components/Button';
 import {T, t} from '../i18n';
 import {CircleEllipsisIcon} from '../icons/CircleEllipsisIcon';
 import {CircleExclamationIcon} from '../icons/CircleExclamationIcon';
@@ -28,9 +26,11 @@ import {DiffCommentsDetails} from './DiffComments';
 import {openerUrlForDiffUrl} from './github/GitHubUrlOpener';
 import {SyncStatus, syncStatusAtom} from './syncStatus';
 import * as stylex from '@stylexjs/stylex';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
+import {Tooltip} from 'isl-components/Tooltip';
 import {useAtomValue} from 'jotai';
 import {Component, Suspense, useState} from 'react';
-import {Icon} from 'shared/Icon';
 
 import './DiffBadge.css';
 

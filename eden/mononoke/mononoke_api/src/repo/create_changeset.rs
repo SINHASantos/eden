@@ -11,11 +11,13 @@ use std::collections::HashSet;
 
 use anyhow::anyhow;
 use blobstore::Loadable;
+use bonsai_globalrev_mapping::BonsaiGlobalrevMappingRef;
 use borrowed::borrowed;
 use bytes::Bytes;
-use changesets::ChangesetsRef;
 use chrono::DateTime;
 use chrono::FixedOffset;
+use commit_graph::CommitGraphRef;
+use commit_graph::CommitGraphWriterRef;
 use context::CoreContext;
 use ephemeral_blobstore::Bubble;
 use filestore::FetchKey;
@@ -38,6 +40,7 @@ use mononoke_types::BonsaiChangesetMut;
 use mononoke_types::ChangesetId;
 use mononoke_types::DateTime as MononokeDateTime;
 use mononoke_types::FileChange;
+use mononoke_types::GitLfs;
 use mononoke_types::MPathElement;
 use mononoke_types::NonRootMPath;
 use repo_authorization::RepoWriteOperation;
@@ -173,19 +176,117 @@ pub enum CreateChange {
 }
 
 #[derive(Clone)]
-pub enum CreateChangeFile {
+pub enum CreateChangeGitLfs {
+    FullContent,
+    GitLfsPointer {
+        non_canonical_pointer: Option<CreateChangeFileContents>,
+    },
+}
+
+fn try_into_git_lfs(
+    create_change_git_lfs: Option<CreateChangeGitLfs>,
+) -> Result<GitLfs, MononokeError> {
+    let git_lfs = match create_change_git_lfs {
+        None => GitLfs::full_content(),
+        Some(CreateChangeGitLfs::FullContent) => GitLfs::full_content(),
+        Some(CreateChangeGitLfs::GitLfsPointer {
+            non_canonical_pointer:
+                Some(CreateChangeFileContents::Existing {
+                    file_id,
+                    maybe_size: _size,
+                }),
+        }) => GitLfs::non_canonical_pointer(file_id),
+        Some(CreateChangeGitLfs::GitLfsPointer {
+            non_canonical_pointer: None,
+        }) => GitLfs::canonical_pointer(),
+        _ => return Err(anyhow!("Programming error: create change must be resolved first").into()),
+    };
+    Ok(git_lfs)
+}
+
+#[derive(Clone)]
+pub struct CreateChangeFile {
+    pub contents: CreateChangeFileContents,
+    pub file_type: FileType,
+    // If missing then server decides whether to use git lfs or not
+    pub git_lfs: Option<CreateChangeGitLfs>,
+}
+
+#[derive(Clone)]
+pub enum CreateChangeFileContents {
     // Upload content from bytes
     New {
         bytes: Bytes,
-        file_type: FileType,
     },
     // Use already uploaded content
     Existing {
         file_id: FileId,
-        file_type: FileType,
         // If not present, will be fetched from the blobstore
         maybe_size: Option<u64>,
     },
+}
+
+impl CreateChangeFileContents {
+    async fn resolve(
+        &mut self,
+        ctx: &CoreContext,
+        filestore_config: FilestoreConfig,
+        repo_blobstore: RepoBlobstore,
+    ) -> Result<(), MononokeError> {
+        match self {
+            CreateChangeFileContents::New { bytes } => {
+                let meta = filestore::store(
+                    &repo_blobstore,
+                    filestore_config,
+                    ctx,
+                    &StoreRequest::new(bytes.len() as u64),
+                    stream::once(async move { Ok(bytes.clone()) }),
+                )
+                .await?;
+                *self = CreateChangeFileContents::Existing {
+                    file_id: meta.content_id,
+                    maybe_size: Some(meta.total_size),
+                };
+            }
+            CreateChangeFileContents::Existing {
+                file_id,
+                maybe_size,
+                ..
+            } => {
+                if maybe_size.is_none() {
+                    let size = filestore::get_metadata(
+                        &repo_blobstore,
+                        ctx,
+                        &FetchKey::Canonical(*file_id),
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        MononokeError::InvalidRequest(format!(
+                            "File id '{}' is not available in this repo",
+                            file_id
+                        ))
+                    })?
+                    .total_size;
+                    *maybe_size = Some(size);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl CreateChangeFile {
+    // constructor that makes tests more ergonomic
+    pub fn new_regular(contents: &'static str) -> Self {
+        CreateChangeFile {
+            contents: CreateChangeFileContents::New {
+                bytes: Bytes::from(contents),
+            },
+            file_type: FileType::Regular,
+            git_lfs: None,
+        }
+    }
 }
 
 // Enum for recording whether a path is not changed, changed or deleted.
@@ -226,56 +327,31 @@ impl CreateChange {
             CreateChange::Untracked(file) => file,
             CreateChange::UntrackedDeletion | CreateChange::Deletion => return Ok(()),
         };
-        match file {
-            CreateChangeFile::New { bytes, file_type } => {
-                let meta = filestore::store(
-                    &repo_blobstore,
-                    filestore_config,
-                    ctx,
-                    &StoreRequest::new(bytes.len() as u64),
-                    stream::once(async move { Ok(bytes.clone()) }),
-                )
+        if let Some(CreateChangeGitLfs::GitLfsPointer {
+            non_canonical_pointer: Some(non_canonical_pointer),
+        }) = &mut file.git_lfs
+        {
+            non_canonical_pointer
+                .resolve(ctx, filestore_config, repo_blobstore.clone())
                 .await?;
-                let file_type = *file_type;
-                *file = CreateChangeFile::Existing {
-                    file_id: meta.content_id,
-                    file_type,
-                    maybe_size: Some(meta.total_size),
-                };
-            }
-            CreateChangeFile::Existing {
-                file_id,
-                maybe_size,
-                ..
-            } => {
-                if maybe_size.is_none() {
-                    let size = filestore::get_metadata(
-                        &repo_blobstore,
-                        ctx,
-                        &FetchKey::Canonical(*file_id),
-                    )
-                    .await?
-                    .ok_or_else(|| {
-                        MononokeError::InvalidRequest(format!(
-                            "File id '{}' is not available in this repo",
-                            file_id
-                        ))
-                    })?
-                    .total_size;
-                    *maybe_size = Some(size);
-                }
-            }
         }
+        file.contents
+            .resolve(ctx, filestore_config, repo_blobstore)
+            .await?;
         Ok(())
     }
 
     pub fn into_file_change(self, parent_ids: &[ChangesetId]) -> Result<FileChange, MononokeError> {
         match self {
             CreateChange::Tracked(
-                CreateChangeFile::Existing {
-                    file_id,
+                CreateChangeFile {
+                    contents:
+                        CreateChangeFileContents::Existing {
+                            file_id,
+                            maybe_size: Some(size),
+                        },
                     file_type,
-                    maybe_size: Some(size),
+                    git_lfs,
                 },
                 copy_info,
             ) => Ok(FileChange::tracked(
@@ -285,13 +361,22 @@ impl CreateChange {
                 copy_info
                     .map(|copy_info| copy_info.into_file_change(parent_ids))
                     .transpose()?,
+                try_into_git_lfs(git_lfs)?,
             )),
-            CreateChange::Untracked(CreateChangeFile::Existing {
-                file_id,
+            CreateChange::Untracked(CreateChangeFile {
+                contents:
+                    CreateChangeFileContents::Existing {
+                        file_id,
+                        maybe_size: Some(size),
+                    },
                 file_type,
-                maybe_size: Some(size),
+                git_lfs: None,
             }) => Ok(FileChange::untracked(file_id, file_type, size)),
             CreateChange::UntrackedDeletion => Ok(FileChange::UntrackedDeletion),
+            CreateChange::Untracked(CreateChangeFile {
+                git_lfs: Some(_git_lfs),
+                ..
+            }) => Err(anyhow!("Error: git_lfs not supported for untracked changes").into()),
             CreateChange::Deletion => Ok(FileChange::Deletion),
             _ => Err(anyhow!("Programming error: create change must be resolved first").into()),
         }
@@ -564,7 +649,14 @@ impl RepoContext {
     pub(crate) async fn save_changesets(
         &self,
         changesets: Vec<BonsaiChangeset>,
-        repo: &(impl ChangesetsRef + RepoBlobstoreRef + RepoIdentityRef + RepoConfigRef),
+        repo: &(
+             impl BonsaiGlobalrevMappingRef
+             + CommitGraphRef
+             + CommitGraphWriterRef
+             + RepoBlobstoreRef
+             + RepoIdentityRef
+             + RepoConfigRef
+         ),
         bubble: Option<&Bubble>,
     ) -> Result<(), MononokeError> {
         let bubble_id = bubble.map(|x| x.bubble_id());
@@ -605,7 +697,7 @@ impl RepoContext {
         // If some, this changeset is a snapshot. Currently unsupported to upload a
         // normal commit to a bubble, though can be easily added.
         bubble: Option<&Bubble>,
-    ) -> Result<ChangesetContext, MononokeError> {
+    ) -> Result<(SortedVectorMap<String, Vec<u8>>, ChangesetContext), MononokeError> {
         let changesets = self
             .create_changeset_stack(parents, vec![info], vec![changes], bubble)
             .await?;
@@ -632,7 +724,7 @@ impl RepoContext {
         // If some, this changeset is a snapshot. Currently unsupported to upload a
         // normal commit to a bubble, though can be easily added.
         bubble: Option<&Bubble>,
-    ) -> Result<Vec<ChangesetContext>, MononokeError> {
+    ) -> Result<Vec<(SortedVectorMap<String, Vec<u8>>, ChangesetContext)>, MononokeError> {
         self.start_write()?;
         self.authorization_context()
             .require_repo_write(
@@ -915,7 +1007,7 @@ impl RepoContext {
         for (info, file_changes) in info_stack.into_iter().zip(file_changes_stack.into_iter()) {
             let author_date = MononokeDateTime::new(info.author_date);
             let committer_date = info.committer_date.map(MononokeDateTime::new);
-            let hg_extra = info.extra.into();
+            let hg_extra = SortedVectorMap::<_, _>::from(info.extra);
             let git_extra_headers = info.git_extra_headers.map(SortedVectorMap::from);
             let file_changes = file_changes
                 .into_iter()
@@ -932,7 +1024,7 @@ impl RepoContext {
                 committer: info.committer,
                 committer_date,
                 message: info.message,
-                hg_extra,
+                hg_extra: hg_extra.clone(),
                 git_extra_headers,
                 git_tree_hash: None,
                 file_changes,
@@ -950,7 +1042,7 @@ impl RepoContext {
             let new_changeset_id = new_changeset.get_changeset_id();
             parents = vec![new_changeset_id];
             new_changesets.push(new_changeset);
-            new_changeset_ids.push(new_changeset_id);
+            new_changeset_ids.push((hg_extra, new_changeset_id));
         }
 
         if let Some(bubble) = &bubble {
@@ -967,7 +1059,7 @@ impl RepoContext {
 
         Ok(new_changeset_ids
             .into_iter()
-            .map(|new_changeset_id| ChangesetContext::new(self.clone(), new_changeset_id))
+            .map(|(hg_extras, id)| (hg_extras, ChangesetContext::new(self.clone(), id)))
             .collect())
     }
 }

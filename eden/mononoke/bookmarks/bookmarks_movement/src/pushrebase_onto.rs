@@ -129,7 +129,7 @@ impl<'op> PushrebaseOntoBookmarkOp<'op> {
             .require_bookmark_modify(ctx, repo, self.bookmark)
             .await?;
 
-        check_bookmark_sync_config(repo, self.bookmark, kind)?;
+        check_bookmark_sync_config(ctx, repo, self.bookmark, kind).await?;
 
         if repo.repo_config().pushrebase.block_merges {
             let any_merges = self
@@ -162,14 +162,14 @@ impl<'op> PushrebaseOntoBookmarkOp<'op> {
                 self.cross_repo_push_source,
             )
             .await?;
-
         let mut pushrebase_hooks = get_pushrebase_hooks(
             ctx,
             repo,
             self.bookmark,
             &repo.repo_config().pushrebase,
             None,
-        )?;
+        )
+        .await?;
 
         // For pushrebase, we check the repo lock once at the beginning of the
         // pushrebase operation, and then once more as part of the pushrebase

@@ -25,6 +25,20 @@ Unknown file w/ different content - conflict:
   (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)
   [255]
 
+Checking out to diff without file where file removed locally
+  $ newclientrepo
+  $ drawdag <<EOS
+  > B  # B/file = foo
+  > |
+  > A
+  > EOS
+  $ hg go $B -qC
+  $ hg rm file
+  $ hg go $A
+  abort: 1 conflicting file changes:
+   file
+  (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)
+  [255]
 
 Respect merge marker file:
   $ newclientrepo
@@ -41,16 +55,14 @@ Respect merge marker file:
   [1]
 
   $ hg go $B
-  abort: goto --merge in progress
-  (use 'hg goto --continue' to continue or
-       'hg goto --clean' to abort - WARNING: will destroy uncommitted changes)
+  abort: outstanding merge conflicts
+  (use 'hg resolve --list' to list, 'hg resolve --mark FILE' to mark resolved)
   [255]
 
 Run it again to make sure we didn't clear out state file:
   $ hg go $B
-  abort: goto --merge in progress
-  (use 'hg goto --continue' to continue or
-       'hg goto --clean' to abort - WARNING: will destroy uncommitted changes)
+  abort: outstanding merge conflicts
+  (use 'hg resolve --list' to list, 'hg resolve --mark FILE' to mark resolved)
   [255]
 
   $ hg go --continue
@@ -172,11 +184,14 @@ Various invalid arg combos:
   [255]
 
   $ echo untracked > bar
+  $ hg rm B
   $ hg st
   M foo
+  R B
   ? bar
   $ hg go $A
-  abort: 2 conflicting file changes:
+  abort: * conflicting file changes: (glob)
+   B
    bar
    foo
   (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)
@@ -188,6 +203,9 @@ Various invalid arg combos:
   foo (no-eol)
   $ cat bar
   bar (no-eol)
+  $ cat B
+  cat: B: $ENOENT$
+  [1]
 
 --clean gets you out of merge state:
   $ newclientrepo

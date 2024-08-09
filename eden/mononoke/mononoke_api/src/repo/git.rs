@@ -5,8 +5,6 @@
  * GNU General Public License version 2.
  */
 
-use std::collections::HashMap;
-
 use anyhow::Context;
 use blobstore::Blobstore;
 use bonsai_git_mapping::BonsaiGitMappingEntry;
@@ -19,7 +17,9 @@ use bytes::Bytes;
 use chrono::DateTime;
 use chrono::FixedOffset;
 use commit_graph::CommitGraphRef;
+use commit_graph::CommitGraphWriterRef;
 use context::CoreContext;
+use filestore::FilestoreConfigRef;
 use git_symbolic_refs::GitSymbolicRefsRef;
 use git_types::GitError;
 use gix_hash::ObjectId;
@@ -42,6 +42,7 @@ use repo_blobstore::RepoBlobstoreRef;
 use repo_derived_data::RepoDerivedDataArc;
 use repo_derived_data::RepoDerivedDataRef;
 use repo_identity::RepoIdentityRef;
+use sorted_vector_map::SortedVectorMap;
 
 use crate::changeset::ChangesetContext;
 use crate::errors::MononokeError;
@@ -63,23 +64,21 @@ impl RepoContext {
     pub async fn set_git_mapping_from_changeset(
         &self,
         changeset_ctx: &ChangesetContext,
+        hg_extras: &SortedVectorMap<String, Vec<u8>>,
     ) -> Result<(), MononokeError> {
-        let mut extras: HashMap<_, _> = changeset_ctx.hg_extras().await?.into_iter().collect();
-
         //TODO(simonfar): Once we support deriving git commits, do derivation here
         // If there's no hggit extras, then give back the derived hash.
         // If there's a hggit extra, and it matches the derived commit, accept even if you
         // don't have permission
-
-        if extras.get(HGGIT_MARKER_EXTRA).map(Vec::as_slice) == Some(HGGIT_MARKER_VALUE) {
-            if let Some(hggit_sha1) = extras.remove(HGGIT_COMMIT_ID_EXTRA) {
+        if hg_extras.get(HGGIT_MARKER_EXTRA).map(Vec::as_slice) == Some(HGGIT_MARKER_VALUE) {
+            if let Some(hggit_sha1) = hg_extras.get(HGGIT_COMMIT_ID_EXTRA) {
                 // We can't derive right now, so always do the permission check for
                 // overriding in the case of mismatch.
                 self.authorization_context()
                     .require_override_git_mapping(self.ctx(), self.inner_repo())
                     .await?;
 
-                let hggit_sha1 = String::from_utf8_lossy(&hggit_sha1).parse()?;
+                let hggit_sha1 = String::from_utf8_lossy(hggit_sha1).parse()?;
                 let entry = BonsaiGitMappingEntry::new(hggit_sha1, changeset_ctx.id());
                 let mapping = self.inner_repo().bonsai_git_mapping();
                 mapping
@@ -204,7 +203,7 @@ where
 /// Free function for creating Mononoke counterpart of Git tree object
 pub async fn create_git_tree(
     ctx: &CoreContext,
-    repo: &(impl changesets::ChangesetsRef + repo_blobstore::RepoBlobstoreRef),
+    repo: &(impl CommitGraphRef + CommitGraphWriterRef + RepoBlobstoreRef + RepoIdentityRef),
     git_tree_hash: &gix_hash::oid,
 ) -> anyhow::Result<(), GitError> {
     let blobstore_key = format!(
@@ -252,7 +251,13 @@ pub async fn create_git_tree(
 /// Bookmarks of category `Branch` are never annotated.
 pub async fn create_annotated_tag(
     ctx: &CoreContext,
-    repo: &(impl changesets::ChangesetsRef + repo_blobstore::RepoBlobstoreRef + BonsaiTagMappingRef),
+    repo: &(
+         impl CommitGraphRef
+         + CommitGraphWriterRef
+         + RepoBlobstoreRef
+         + BonsaiTagMappingRef
+         + RepoIdentityRef
+     ),
     tag_hash: Option<ObjectId>,
     name: String,
     author: Option<String>,
@@ -310,9 +315,11 @@ pub trait Repo = RepoIdentityRef
     + BonsaiGitMappingRef
     + BonsaiTagMappingRef
     + RepoDerivedDataRef
+    + FilestoreConfigRef
     + GitSymbolicRefsRef
     + BookmarksCacheRef
     + CommitGraphRef
+    + CommitGraphWriterRef
     + RepoConfigRef
     + Send
     + Sync;

@@ -5,7 +5,9 @@
  * GNU General Public License version 2.
  */
 
+use bytes::Bytes;
 use digest::Digest;
+use gix_object::Object;
 use mononoke_types::hash::RichGitSha1;
 use sha1::Sha1;
 
@@ -48,5 +50,21 @@ impl ObjectKind {
         let hash: [u8; 20] = sha1.finalize().into();
 
         RichGitSha1::from_byte_array(hash, self.as_str(), size)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ObjectContent {
+    pub parsed: Object,
+    pub raw: Bytes,
+}
+
+impl ObjectContent {
+    pub fn is_tree(&self) -> bool {
+        self.parsed.as_tree().is_some()
+    }
+
+    pub fn is_blob(&self) -> bool {
+        self.parsed.as_blob().is_some()
     }
 }

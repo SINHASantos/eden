@@ -11,7 +11,6 @@ use std::fmt;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::sync::Arc;
-use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -34,6 +33,7 @@ use bonsai_hg_mapping::BonsaiHgMappingRef;
 use bonsai_svnrev_mapping::BonsaiSvnrevMapping;
 use bonsai_svnrev_mapping::BonsaiSvnrevMappingRef;
 use bonsai_tag_mapping::BonsaiTagMapping;
+use bonsai_tag_mapping::BonsaiTagMappingArc;
 use bookmarks::BookmarkCategory;
 use bookmarks::BookmarkKey;
 use bookmarks::BookmarkKind;
@@ -54,20 +54,22 @@ use bytes::Bytes;
 use cacheblob::InProcessLease;
 use cacheblob::LeaseOps;
 use changeset_info::ChangesetInfo;
-use changesets::Changesets;
-use changesets::ChangesetsArc;
-use changesets::ChangesetsRef;
 use commit_cloud::CommitCloud;
+use commit_graph::ArcCommitGraph;
 use commit_graph::CommitGraph;
+use commit_graph::CommitGraphArc;
 use commit_graph::CommitGraphRef;
+use commit_graph::CommitGraphWriter;
 use context::CoreContext;
+use cross_repo_sync::get_all_submodule_deps;
 use cross_repo_sync::get_small_and_large_repos;
 use cross_repo_sync::CandidateSelectionHint;
 use cross_repo_sync::CommitSyncContext;
 use cross_repo_sync::CommitSyncRepos;
 use cross_repo_sync::CommitSyncer;
-use cross_repo_sync::SubmoduleDeps;
+use cross_repo_sync::RepoProvider;
 use cross_repo_sync::Target;
+use dag_types::Location;
 use derived_data_manager::BonsaiDerivable;
 use derived_data_manager::DerivableType;
 use ephemeral_blobstore::ArcRepoEphemeralStore;
@@ -90,6 +92,8 @@ use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
 use futures::try_join;
 use futures::Future;
+use git_push_redirect::GitPushRedirectConfig;
+use git_push_redirect::TestGitPushRedirectConfig;
 use git_symbolic_refs::GitSymbolicRefs;
 use git_types::MappedGitCommitId;
 use hook_manager::manager::HookManager;
@@ -99,7 +103,6 @@ use live_commit_sync_config::LiveCommitSyncConfig;
 use mercurial_derivation::MappedHgChangesetId;
 use mercurial_mutation::HgMutationStore;
 use mercurial_types::Globalrev;
-use mercurial_types::NonRootMPath;
 use metaconfig_types::HookManagerParams;
 use metaconfig_types::InfinitepushNamespace;
 use metaconfig_types::InfinitepushParams;
@@ -145,16 +148,11 @@ use repo_sparse_profiles::ArcRepoSparseProfiles;
 use repo_sparse_profiles::RepoSparseProfiles;
 use repo_sparse_profiles::RepoSparseProfilesArc;
 use repo_stats_logger::RepoStatsLogger;
-use segmented_changelog::CloneData;
-use segmented_changelog::DisabledSegmentedChangelog;
-use segmented_changelog::Location;
-use segmented_changelog::SegmentedChangelog;
-use segmented_changelog::SegmentedChangelogRef;
 use slog::debug;
 use slog::error;
-use slog::warn;
 use sql_construct::SqlConstruct;
 use sql_ext::facebook::MysqlOptions;
+use sql_query_config::SqlQueryConfig;
 use stats::prelude::*;
 use streaming_clone::StreamingClone;
 use streaming_clone::StreamingCloneBuilder;
@@ -221,7 +219,6 @@ pub struct Repo {
         dyn BonsaiHgMapping,
         dyn BookmarkUpdateLog,
         dyn Bookmarks,
-        dyn Changesets,
         dyn Phases,
         dyn PushrebaseMutationMapping,
         dyn HgMutationStore,
@@ -229,7 +226,6 @@ pub struct Repo {
         dyn RepoPermissionChecker,
         dyn RepoLock,
         RepoConfig,
-        dyn SegmentedChangelog,
         RepoEphemeralStore,
         MutableRenames,
         RepoCrossRepo,
@@ -237,9 +233,12 @@ pub struct Repo {
         RepoSparseProfiles,
         StreamingClone,
         CommitGraph,
+        dyn CommitGraphWriter,
         dyn GitSymbolicRefs,
+        dyn GitPushRedirectConfig,
         dyn Filenodes,
-        CommitCloud
+        CommitCloud,
+        SqlQueryConfig,
     )]
     pub inner: InnerRepo,
 
@@ -302,7 +301,9 @@ async fn maybe_push_redirector(
         Some(base) => base,
     };
     let live_commit_sync_config = repo.live_commit_sync_config();
-    let enabled = live_commit_sync_config.push_redirector_enabled_for_public(repo.repoid());
+    let enabled = live_commit_sync_config
+        .push_redirector_enabled_for_public(ctx, repo.repoid())
+        .await?;
     if enabled {
         let large_repo_id = base.common_commit_sync_config.large_repo_id;
         let large_repo = repos.get_by_id(large_repo_id.id()).ok_or_else(|| {
@@ -328,7 +329,7 @@ async fn maybe_push_redirector(
 }
 
 impl RepoContextBuilder {
-    pub(crate) async fn new(
+    pub async fn new(
         ctx: CoreContext,
         repo: Arc<Repo>,
         repos: Arc<MononokeRepos<Repo>>,
@@ -473,6 +474,7 @@ impl Repo {
             &blob_repo.repo_derived_data_arc(),
             &blob_repo.bookmarks_arc(),
             &blob_repo.repo_blobstore_arc(),
+            &blob_repo.bonsai_tag_mapping_arc(),
         );
         let repo_cross_repo = Arc::new(RepoCrossRepo::new(
             synced_commit_mapping,
@@ -488,11 +490,9 @@ impl Repo {
             &blob_repo.bookmark_update_log_arc(),
             &mutable_counters,
         )?;
-
         let inner = InnerRepo {
             blob_repo,
             repo_config: Arc::new(config.clone()),
-            segmented_changelog: Arc::new(DisabledSegmentedChangelog::new()),
             ephemeral_store: Arc::new(RepoEphemeralStore::disabled(repo_id)),
             mutable_renames: Arc::new(MutableRenames::new_test(
                 repo_id,
@@ -504,6 +504,8 @@ impl Repo {
             streaming_clone: Arc::new(
                 StreamingCloneBuilder::with_sqlite_in_memory()?.build(repo_id, repo_blobstore),
             ),
+            sql_query_config: Arc::new(SqlQueryConfig { caching: None }),
+            git_push_redirect_config: Arc::new(TestGitPushRedirectConfig::new()),
         };
 
         let mut warm_bookmarks_cache_builder = WarmBookmarksCacheBuilder::new(
@@ -521,7 +523,6 @@ impl Repo {
         let filestore_config = Arc::new(FilestoreConfig::no_chunking_filestore());
 
         let repo_stats_logger = Arc::new(RepoStatsLogger::noop());
-
         Ok(Self {
             name: name.clone(),
             inner,
@@ -847,6 +848,10 @@ impl RepoContext {
         self.repo.as_ref()
     }
 
+    pub fn repo_arc(&self) -> Arc<Repo> {
+        self.repo.clone()
+    }
+
     /// The underlying `InnerRepo`.
     pub fn inner_repo(&self) -> &InnerRepo {
         self.repo.inner_repo()
@@ -865,11 +870,6 @@ impl RepoContext {
     /// The ephemeral store for the referenced repository
     pub fn repo_ephemeral_store_arc(&self) -> ArcRepoEphemeralStore {
         self.repo.repo_ephemeral_store_arc()
-    }
-
-    /// The segmeneted changelog for the referenced repository.
-    pub fn segmented_changelog(&self) -> &dyn SegmentedChangelog {
-        self.repo.segmented_changelog()
     }
 
     /// The commit sync mapping for the referenced repository
@@ -944,14 +944,17 @@ impl RepoContext {
             .await?)
     }
 
-    // pub(crate) for testing
-    pub(crate) async fn changesets(
+    async fn commit_graph_for_bubble(
         &self,
         bubble_id: Option<BubbleId>,
-    ) -> Result<Arc<dyn Changesets>, MononokeError> {
+    ) -> Result<ArcCommitGraph, MononokeError> {
         Ok(match bubble_id {
-            Some(id) => Arc::new(self.open_bubble(id).await?.changesets(self.blob_repo())),
-            None => self.blob_repo().changesets_arc(),
+            Some(id) => Arc::new(
+                self.open_bubble(id)
+                    .await?
+                    .repo_commit_graph(self.blob_repo()),
+            ),
+            None => self.blob_repo().commit_graph_arc(),
         })
     }
 
@@ -976,7 +979,7 @@ impl RepoContext {
             },
         };
         Ok(self
-            .changesets(bubble_id)
+            .commit_graph_for_bubble(bubble_id)
             .await?
             .exists(&self.ctx, changeset_id)
             .await?)
@@ -1070,8 +1073,8 @@ impl RepoContext {
             ),
             ChangesetPrefixSpecifier::Bonsai(prefix) => ChangesetSpecifierPrefixResolution::from(
                 self.blob_repo()
-                    .changesets()
-                    .get_many_by_prefix(&self.ctx, prefix, MAX_LIMIT_AMBIGUOUS_IDS)
+                    .commit_graph()
+                    .find_by_prefix(&self.ctx, prefix, MAX_LIMIT_AMBIGUOUS_IDS)
                     .await?,
             ),
             ChangesetPrefixSpecifier::GitSha1(prefix) => ChangesetSpecifierPrefixResolution::from(
@@ -1106,11 +1109,8 @@ impl RepoContext {
     }
 
     /// Create changeset context from known existing changeset id.
-    pub async fn changeset_from_existing_id(
-        &self,
-        cs_id: ChangesetId,
-    ) -> Result<ChangesetContext, MononokeError> {
-        Ok(ChangesetContext::new(self.clone(), cs_id))
+    pub fn changeset_from_existing_id(&self, cs_id: ChangesetId) -> ChangesetContext {
+        ChangesetContext::new(self.clone(), cs_id)
     }
 
     pub async fn difference_of_unions_of_ancestors<'a>(
@@ -1253,12 +1253,11 @@ impl RepoContext {
         changesets: Vec<ChangesetId>,
     ) -> Result<HashMap<ChangesetId, Vec<ChangesetId>>, MononokeError> {
         let parents = self
-            .blob_repo()
-            .changesets()
-            .get_many(&self.ctx, changesets)
+            .commit_graph()
+            .many_changeset_parents(&self.ctx, &changesets)
             .await?
             .into_iter()
-            .map(|entry| (entry.cs_id, entry.parents))
+            .map(|(cs_id, parents)| (cs_id, parents.to_vec()))
             .collect();
         Ok(parents)
     }
@@ -1378,7 +1377,7 @@ impl RepoContext {
                     BookmarkCategory::ALL,
                     BookmarkKind::ALL,
                     &pagination,
-                    limit.unwrap_or(std::u64::MAX),
+                    limit.unwrap_or(u64::MAX),
                 )
                 .try_filter_map(move |(bookmark, cs_id)| async move {
                     if bookmark.kind() == &BookmarkKind::Scratch {
@@ -1447,12 +1446,11 @@ impl RepoContext {
         while !queue.is_empty() {
             // get the unique parents for all changesets in the queue & skip visited & update visited
             let parents: Vec<_> = self
-                .blob_repo()
-                .changesets()
-                .get_many(&self.ctx, queue.clone())
+                .commit_graph()
+                .many_changeset_parents(&self.ctx, &queue)
                 .await?
-                .into_iter()
-                .flat_map(|cs_entry| cs_entry.parents)
+                .into_values()
+                .flatten()
                 .filter(|cs_id| !visited.contains(cs_id))
                 .unique()
                 .collect();
@@ -1654,7 +1652,28 @@ impl RepoContext {
         let (_small_repo, _large_repo) =
             get_small_and_large_repos(self.repo.as_ref(), other.repo.as_ref(), &common_config)?;
 
-        let submodule_deps = self.get_final_submodule_deps(other).await?;
+        let live_commit_sync_config = self.repo.live_commit_sync_config();
+        let repo_provider: RepoProvider<'a, Repo> = Arc::new(move |repo_id| {
+            Box::pin({
+                let repos = self.repos.clone();
+
+                async move {
+                    let repo = repos
+                        .get_by_id(repo_id.id())
+                        .ok_or_else(|| anyhow!("Submodule dependency repo with id {repo_id} not available through RepoContext"))?;
+                    Ok(repo)
+                }
+            })
+        });
+
+        let submodule_deps = get_all_submodule_deps(
+            &self.ctx,
+            self.repo.clone(),
+            other.repo.clone(),
+            repo_provider,
+            live_commit_sync_config,
+        )
+        .await?;
 
         let commit_sync_repos = CommitSyncRepos::new(
             self.repo().clone(),
@@ -1701,130 +1720,6 @@ impl RepoContext {
                 EquivalentWorkingCopyAncestor(cs_id, _) | RewrittenAs(cs_id, _) => Some(cs_id),
             });
         Ok(maybe_cs_id.map(|cs_id| ChangesetContext::new(other.clone(), cs_id)))
-    }
-
-    /// Syncing commits from/to repos that have git submodule actions set to
-    /// expand requires loading the repo of the submodules it dependsnon.
-    ///
-    /// This will read the commit sync config and will load the repos of all the
-    /// submodules that the given repo ever depended on.
-    ///
-    /// TODO(T184633369): stop getting all dependencies from history and
-    /// use only the most recent on. Maybe read the most recent commits and use
-    /// their versions?
-    async fn get_all_possible_repo_submodule_deps(
-        &self,
-    ) -> Result<SubmoduleDeps<Repo>, MononokeError> {
-        let ctx = &self.ctx;
-        let repo = self.repo.as_ref();
-        let live_commit_sync_config = repo.live_commit_sync_config();
-
-        let source_repo_id = repo.repo_identity().id();
-
-        let source_repo_sync_configs = live_commit_sync_config
-            .get_all_commit_sync_config_versions(source_repo_id)
-            .await?;
-
-        let repo_deps_ids = source_repo_sync_configs
-            .into_values()
-            .filter_map(|mut cfg| {
-                cfg.small_repos
-                    .remove(&source_repo_id)
-                    .map(|small_repo_cfg| small_repo_cfg.submodule_config.submodule_dependencies)
-            })
-            .flatten()
-            .collect::<HashMap<_, _>>();
-
-        let submodule_deps_to_load = repo_deps_ids.len();
-
-        if submodule_deps_to_load == 0 {
-            // For repos without any submodule dependencies, we shouldn't expect any
-            // submodule expansion to be called, so return that submodule deps
-            // are not needed instead of returning an empty hash map.
-            return Ok(SubmoduleDeps::NotNeeded);
-        };
-
-        let repo_deps: HashMap<NonRootMPath, Arc<Repo>> = repo_deps_ids
-            .into_iter()
-            .filter_map(|(submodule_path, sm_repo_id)| {
-                let mb_sm_repo = self.repos.get_by_id(sm_repo_id.id());
-                match mb_sm_repo {
-                    Some(sm_repo) => Some((submodule_path, sm_repo)),
-                    None => {
-                        // We don't want to fail the entire request if a submodule
-                        // is not found **here**, because not all operations
-                        // that run this code path might actually need the submodule
-                        // deps and repos could be missing due to repo sharding.
-                        // But let's at least log a warning if this happen.
-                        warn!(
-                            ctx.logger(),
-                            "Failed to load submodule dependency at path {} with id {}",
-                            submodule_path.clone(),
-                            sm_repo_id.id()
-                        );
-
-                        ctx.scuba().clone().log_with_msg(
-                            "Failed to load submodule dependency in RepoContextBuilder",
-                            format!(
-                                "Submodule path: {}. Submodule repo id: {}",
-                                submodule_path.clone(),
-                                sm_repo_id.id()
-                            ),
-                        );
-                        None
-                    }
-                }
-            })
-            .collect();
-
-        if repo_deps.len() < submodule_deps_to_load {
-            warn!(
-                ctx.logger(),
-                "Submodule dependencies failed to load. {} were loaded instead of the required {}",
-                repo_deps.len(),
-                submodule_deps_to_load
-            );
-
-            ctx.scuba().clone().log_with_msg(
-                "Submodule dependencies failed to load",
-                format!(
-                    "{} were loaded instead of the required {}",
-                    repo_deps.len(),
-                    submodule_deps_to_load
-                ),
-            );
-            return Ok(SubmoduleDeps::NotAvailable);
-        }
-
-        Ok(SubmoduleDeps::ForSync(repo_deps))
-    }
-
-    /// Only the small repo should have submodule dependencies in the commit sync
-    /// config, but when `xrepo_commit_lookup`, we don't know if the small repo
-    /// is the source (forward sync) or target (backsync).
-    /// So just get the submodule dependencies from both repos
-    async fn get_final_submodule_deps<'a>(
-        &'a self,
-        target_repo_ctx: &'a Self,
-    ) -> Result<SubmoduleDeps<Repo>, MononokeError> {
-        let source_submodule_deps = self.get_all_possible_repo_submodule_deps().await?;
-        let target_submodule_deps = target_repo_ctx
-            .get_all_possible_repo_submodule_deps()
-            .await?;
-
-        match (
-            source_submodule_deps.dep_map(),
-            target_submodule_deps.dep_map(),
-        ) {
-            (Some(dep_map), None) => Ok(SubmoduleDeps::ForSync(dep_map.clone())),
-            (None, Some(dep_map)) => Ok(SubmoduleDeps::ForSync(dep_map.clone())),
-            (Some(source_deps_map), Some(target_deps_map)) => {
-                let mut deps_map = source_deps_map.clone();
-                deps_map.extend(target_deps_map.clone());
-                Ok(SubmoduleDeps::ForSync(deps_map))
-            }
-            (None, None) => Ok(SubmoduleDeps::NotAvailable),
-        }
     }
 
     /// Start a write to the repo.
@@ -1874,32 +1769,10 @@ impl RepoContext {
         location: Location<ChangesetId>,
         count: u64,
     ) -> Result<Vec<ChangesetId>, MononokeError> {
-        let use_commit_graph = justknobs::eval(
-            "scm/mononoke:commit_graph_location_to_hash",
-            None,
-            Some(self.name()),
-        )
-        .unwrap_or_default();
-
-        let ancestors = match use_commit_graph {
-            true => {
-                self.commit_graph()
-                    .locations_to_changeset_ids(
-                        self.ctx(),
-                        location.descendant,
-                        location.distance,
-                        count,
-                    )
-                    .await?
-            }
-            false => {
-                let segmented_changelog = self.repo.segmented_changelog();
-                segmented_changelog
-                    .location_to_many_changeset_ids(&self.ctx, location, count)
-                    .await
-                    .map_err(MononokeError::from)?
-            }
-        };
+        let ancestors = self
+            .commit_graph()
+            .locations_to_changeset_ids(self.ctx(), location.descendant, location.distance, count)
+            .await?;
 
         Ok(ancestors)
     }
@@ -1913,77 +1786,23 @@ impl RepoContext {
         cs_ids: Vec<ChangesetId>,
     ) -> Result<HashMap<ChangesetId, Result<Location<ChangesetId>, MononokeError>>, MononokeError>
     {
-        let use_commit_graph = justknobs::eval(
-            "scm/mononoke:commit_graph_hash_to_location",
-            None,
-            Some(self.name()),
-        )
-        .unwrap_or_default();
-
-        match use_commit_graph {
-            true => Ok(self
-                .commit_graph()
-                .changeset_ids_to_locations(self.ctx(), master_heads, cs_ids)
-                .await
-                .map(|ok| {
-                    ok.into_iter()
-                        .map(|(k, v)| {
-                            (
-                                k,
-                                Ok(Location {
-                                    descendant: v.cs_id,
-                                    distance: v.distance,
-                                }),
-                            )
-                        })
-                        .collect::<HashMap<ChangesetId, Result<_, MononokeError>>>()
-                })
-                .map_err(MononokeError::from)?),
-            false => Ok(self
-                .repo()
-                .segmented_changelog()
-                .many_changeset_ids_to_locations(&self.ctx, master_heads, cs_ids)
-                .await
-                .map(|ok| {
-                    ok.into_iter()
-                        .map(|(k, v)| (k, v.map_err(Into::into)))
-                        .collect::<HashMap<ChangesetId, Result<_, MononokeError>>>()
-                })
-                .map_err(MononokeError::from)?),
-        }
-    }
-
-    pub async fn segmented_changelog_clone_data(
-        &self,
-    ) -> Result<(CloneData<ChangesetId>, HashMap<ChangesetId, HgChangesetId>), MononokeError> {
-        let segmented_changelog = self.repo.segmented_changelog();
-        let clone_data = segmented_changelog
-            .clone_data(&self.ctx)
+        self.commit_graph()
+            .changeset_ids_to_locations(self.ctx(), master_heads, cs_ids)
             .await
-            .map_err(MononokeError::from)?;
-        Ok(clone_data)
-    }
-
-    pub async fn segmented_changelog_disabled(&self) -> Result<bool, MononokeError> {
-        let segmented_changelog = self.repo.segmented_changelog();
-        let disabled = segmented_changelog
-            .disabled(&self.ctx)
-            .await
-            .map_err(MononokeError::from)?;
-        Ok(disabled)
-    }
-
-    pub async fn segmented_changelog_pull_data(
-        &self,
-        common: Vec<ChangesetId>,
-        missing: Vec<ChangesetId>,
-    ) -> Result<CloneData<ChangesetId>, MononokeError> {
-        let segmented_changelog = self.repo.segmented_changelog();
-        let pull_data = segmented_changelog
-            .pull_data(&self.ctx, common, missing)
-            .await
-            .map_err(MononokeError::from)?;
-        Ok(pull_data)
+            .map(|ok| {
+                ok.into_iter()
+                    .map(|(k, v)| {
+                        (
+                            k,
+                            Ok(Location {
+                                descendant: v.cs_id,
+                                distance: v.distance,
+                            }),
+                        )
+                    })
+                    .collect::<HashMap<ChangesetId, Result<_, MononokeError>>>()
+            })
+            .map_err(MononokeError::from)
     }
 
     pub async fn derive_bulk(
@@ -1991,7 +1810,8 @@ impl RepoContext {
         ctx: &CoreContext,
         csids: Vec<ChangesetId>,
         derivable_types: &[DerivableType],
-    ) -> Result<Duration, MononokeError> {
+        override_batch_size: Option<u64>,
+    ) -> Result<(), MononokeError> {
         // We don't need to expose rederivation to users of the repo api
         // That's a lower level concept that clients like the derived data backfiller
         // can get straight from the derived data manager
@@ -2000,7 +1820,13 @@ impl RepoContext {
             .repo
             .repo_derived_data()
             .manager()
-            .derive_bulk(ctx, csids, rederivation, derivable_types)
+            .derive_bulk(
+                ctx,
+                &csids,
+                rederivation,
+                derivable_types,
+                override_batch_size,
+            )
             .await?)
     }
 

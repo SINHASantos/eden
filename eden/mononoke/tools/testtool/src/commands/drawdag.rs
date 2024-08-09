@@ -138,7 +138,9 @@ async fn derive<D: BonsaiDerivable>(
     csids: &[ChangesetId],
 ) -> Result<()> {
     let mgr = repo.repo_derived_data().manager();
-    mgr.derive_exactly_batch::<D>(ctx, csids.to_vec(), None)
+    let rederivation = None;
+    let override_batch_size = None;
+    mgr.derive_heads::<D>(ctx, csids, override_batch_size, rederivation)
         .await
         .with_context(|| format!("Failed to derive {}", D::NAME))?;
     Ok(())
@@ -154,7 +156,7 @@ async fn derive_all(ctx: &CoreContext, repo: &BlobRepo, csids: &[ChangesetId]) -
         .collect::<Vec<_>>();
     repo.repo_derived_data()
         .manager()
-        .derive_bulk(ctx, csids.to_vec(), None, derived_data_types.as_slice())
+        .derive_bulk(ctx, csids, None, derived_data_types.as_slice(), None)
         .await?;
     Ok(())
 }

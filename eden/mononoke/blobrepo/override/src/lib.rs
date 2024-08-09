@@ -12,8 +12,6 @@ use blobrepo::BlobRepoInner;
 use blobstore::Blobstore;
 use bonsai_hg_mapping::ArcBonsaiHgMapping;
 use cacheblob::LeaseOps;
-use changeset_fetcher::SimpleChangesetFetcher;
-use changesets::ArcChangesets;
 use commit_graph::ArcCommitGraph;
 use filenodes::ArcFilenodes;
 use repo_blobstore::RepoBlobstore;
@@ -74,30 +72,6 @@ impl DangerousOverride<Arc<dyn Blobstore>> for BlobRepoInner {
         let repo_blobstore = Arc::new(blobstore);
         Self {
             repo_blobstore,
-            repo_derived_data,
-            ..self.clone()
-        }
-    }
-}
-
-impl DangerousOverride<ArcChangesets> for BlobRepoInner {
-    fn dangerous_override<F>(&self, modify: F) -> Self
-    where
-        F: FnOnce(ArcChangesets) -> ArcChangesets,
-    {
-        let changesets = modify(self.changesets.clone());
-        let changeset_fetcher = Arc::new(SimpleChangesetFetcher::new(
-            changesets.clone(),
-            self.repo_identity.id(),
-        ));
-        let repo_derived_data = Arc::new(
-            self.repo_derived_data
-                .with_replaced_changesets(changesets.clone()),
-        );
-
-        Self {
-            changesets,
-            changeset_fetcher,
             repo_derived_data,
             ..self.clone()
         }

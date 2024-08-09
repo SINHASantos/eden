@@ -15,12 +15,12 @@ use blobstore::Blobstore;
 use blobstore::Storable;
 use cloned::cloned;
 use context::CoreContext;
-use derived_data::impl_bonsai_derived_via_manager;
 use derived_data_manager::dependencies;
 use derived_data_manager::BonsaiDerivable;
 use derived_data_manager::DerivableType;
 use derived_data_manager::DerivationContext;
 use derived_data_service_if as thrift;
+use filestore::FilestoreConfig;
 use futures::future::ready;
 use futures::stream::FuturesUnordered;
 use futures::stream::TryStreamExt;
@@ -28,10 +28,12 @@ use manifest::derive_manifest;
 use manifest::flatten_subentries;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
+use mononoke_types::GitLfs;
 use mononoke_types::NonRootMPath;
 
 use crate::errors::MononokeGitError;
 use crate::fetch_non_blob_git_object;
+use crate::git_lfs::generate_and_store_git_lfs_pointer;
 use crate::upload_non_blob_git_object;
 use crate::BlobHandle;
 use crate::Tree;
@@ -61,8 +63,9 @@ impl BonsaiDerivable for TreeHandle {
             bail!("Can't derive TreeHandle for snapshot")
         }
         let blobstore = derivation_ctx.blobstore().clone();
+        let filestore_config = derivation_ctx.filestore_config();
         let cs_id = bonsai.get_changeset_id();
-        let changes = get_file_changes(&blobstore, ctx, bonsai).await?;
+        let changes = get_file_changes(&blobstore, filestore_config, ctx, bonsai).await?;
         // Check whether the git commit for this bonsai commit is already known.
         // If so, then the raw git tree will also exist, as it would have been uploaded
         // alongside the commit. If not, then the raw tree git may not already exist and
@@ -119,8 +122,6 @@ impl BonsaiDerivable for TreeHandle {
         ))
     }
 }
-
-impl_bonsai_derived_via_manager!(TreeHandle);
 
 async fn derive_git_manifest<B: Blobstore + Clone + 'static>(
     ctx: &CoreContext,
@@ -205,8 +206,9 @@ async fn derive_git_manifest<B: Blobstore + Clone + 'static>(
     }
 }
 
-pub async fn get_file_changes<B: Blobstore + Clone>(
+pub async fn get_file_changes<B: Blobstore + Clone + 'static>(
     blobstore: &B,
+    filestore_config: FilestoreConfig,
     ctx: &CoreContext,
     bcs: BonsaiChangeset,
 ) -> Result<Vec<(NonRootMPath, Option<BlobHandle>)>, Error> {
@@ -215,10 +217,48 @@ pub async fn get_file_changes<B: Blobstore + Clone>(
         .into_iter()
         .map(|(mpath, file_change)| async move {
             match file_change.simplify() {
-                Some(basic_file_change) => Ok((
-                    mpath,
-                    Some(BlobHandle::new(ctx, blobstore, basic_file_change).await?),
-                )),
+                Some(basic_file_change) => match basic_file_change.git_lfs() {
+                    // File is not LFS file
+                    GitLfs::FullContent => Ok((
+                        mpath,
+                        Some(BlobHandle::new(ctx, blobstore, basic_file_change).await?),
+                    )),
+                    // No pointer content provided: we're generatic spec conformant canonical
+                    // pointer
+                    GitLfs::GitLfsPointer {
+                        non_canonical_pointer: None,
+                    } => {
+                        let oid = generate_and_store_git_lfs_pointer(
+                            blobstore,
+                            filestore_config,
+                            ctx,
+                            basic_file_change,
+                        )
+                        .await?;
+                        Ok((
+                            mpath,
+                            Some(BlobHandle::from_oid_and_file_type(
+                                oid,
+                                basic_file_change.file_type(),
+                            )),
+                        ))
+                    }
+                    // Non canonical LFS pointer provided - let's use it as is
+                    GitLfs::GitLfsPointer {
+                        non_canonical_pointer: Some(non_canonical_pointer),
+                    } => Ok((
+                        mpath,
+                        Some(
+                            BlobHandle::from_content_id_and_file_type(
+                                ctx,
+                                blobstore,
+                                non_canonical_pointer,
+                                basic_file_change.file_type(),
+                            )
+                            .await?,
+                        ),
+                    )),
+                },
                 None => Ok((mpath, None)),
             }
         })
@@ -237,12 +277,10 @@ mod test {
     use anyhow::format_err;
     use bookmarks::BookmarkKey;
     use bookmarks::BookmarksRef;
-    use derived_data::BonsaiDerived;
     use fbinit::FacebookInit;
     use filestore::Alias;
     use filestore::FetchKey;
     use fixtures::TestRepoFixture;
-    use futures_util::stream::TryStreamExt;
     use git2::Oid;
     use git2::Repository;
     use manifest::ManifestOps;
@@ -266,7 +304,10 @@ mod test {
             .await?
             .ok_or_else(|| format_err!("no master"))?;
 
-        let tree = TreeHandle::derive(&ctx, &repo, bcs_id).await?;
+        let tree = repo
+            .repo_derived_data()
+            .derive::<TreeHandle>(&ctx, bcs_id)
+            .await?;
 
         let leaves = tree
             .list_leaf_entries(ctx.clone(), repo.repo_blobstore_arc())

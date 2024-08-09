@@ -121,6 +121,7 @@ class FilteredBackingStore
   FRIEND_TEST(FakeSubstringFilteredBackingStoreTest, getBlob);
   FRIEND_TEST(FakeSubstringFilteredBackingStoreTest, getTree);
   FRIEND_TEST(FakeSubstringFilteredBackingStoreTest, getRootTree);
+  FRIEND_TEST(FakeSubstringFilteredBackingStoreTest, getGlobFiles);
 
   ImmediateFuture<GetRootTreeResult> getRootTree(
       const RootId& rootId,
@@ -132,6 +133,10 @@ class FilteredBackingStore
       const ObjectFetchContextPtr& context) override;
 
   folly::SemiFuture<GetTreeResult> getTree(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) override;
+
+  folly::SemiFuture<GetTreeMetaResult> getTreeMetadata(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
 

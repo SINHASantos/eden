@@ -5,6 +5,8 @@
  * GNU General Public License version 2.
  */
 
+use std::collections::HashMap;
+
 use clientinfo::ClientRequestInfo;
 use mercurial_types::HgChangesetId;
 use serde::Deserialize;
@@ -17,6 +19,7 @@ use crate::sql::ops::Insert;
 use crate::sql::ops::SqlCommitCloud;
 use crate::sql::remote_bookmarks_ops::DeleteArgs;
 use crate::CommitCloudContext;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceRemoteBookmark {
     pub name: String,
@@ -24,11 +27,23 @@ pub struct WorkspaceRemoteBookmark {
     pub remote: String,
 }
 
+pub type RemoteBookmarksMap = HashMap<HgChangesetId, Vec<RemoteBookmark>>;
+
+impl From<RemoteBookmark> for WorkspaceRemoteBookmark {
+    fn from(bookmark: RemoteBookmark) -> Self {
+        Self {
+            name: bookmark.name,
+            commit: bookmark.node.unwrap_or_default().into(),
+            remote: bookmark.remote,
+        }
+    }
+}
+
 pub async fn update_remote_bookmarks(
     sql_commit_cloud: &SqlCommitCloud,
     mut txn: Transaction,
     cri: Option<&ClientRequestInfo>,
-    ctx: CommitCloudContext,
+    ctx: &CommitCloudContext,
     updated_remote_bookmarks: Option<Vec<RemoteBookmark>>,
     removed_remote_bookmarks: Option<Vec<RemoteBookmark>>,
 ) -> anyhow::Result<Transaction> {
@@ -39,7 +54,7 @@ pub async fn update_remote_bookmarks(
         let removed_commits = removed_remote_bookmarks
             .unwrap()
             .into_iter()
-            .map(|b| b.remote + &b.name)
+            .map(|b| b.full_name())
             .collect::<Vec<_>>();
         let delete_args = DeleteArgs {
             removed_bookmarks: removed_commits,

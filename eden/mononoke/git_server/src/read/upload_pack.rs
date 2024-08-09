@@ -10,6 +10,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use anyhow::Error;
 use async_stream::try_stream;
+use bonsai_git_mapping::BonsaiGitMappingRef;
 use bonsai_git_mapping::BonsaisOrGitShas;
 use bytes::Bytes;
 use futures::future::try_join4;
@@ -19,15 +20,12 @@ use gix_hash::ObjectId;
 use gotham::mime;
 use gotham::state::FromState;
 use gotham::state::State;
-use gotham_ext::body_ext::BodyExt;
 use gotham_ext::error::HttpError;
 use gotham_ext::response::BytesBody;
-use gotham_ext::response::EmptyBody;
 use gotham_ext::response::ResponseStream;
 use gotham_ext::response::ResponseTryStreamExt;
 use gotham_ext::response::StreamBody;
 use gotham_ext::response::TryIntoResponse;
-use http::HeaderMap;
 use hyper::Body;
 use hyper::Response;
 use mononoke_types::ChangesetId;
@@ -56,13 +54,13 @@ use crate::command::Command;
 use crate::command::FetchArgs;
 use crate::command::LsRefsArgs;
 use crate::command::RequestCommand;
-use crate::model::GitMethod;
 use crate::model::GitMethodInfo;
-use crate::model::GitMethodVariant;
 use crate::model::RepositoryParams;
 use crate::model::RepositoryRequestContext;
 use crate::model::ResponseType;
 use crate::model::Service;
+use crate::util::empty_body;
+use crate::util::get_body;
 
 /// The header for the packfile section of the response
 const PACKFILE_HEADER: &[u8] = b"packfile";
@@ -94,7 +92,7 @@ async fn pack_header() -> Result<Bytes, Error> {
 }
 
 fn concurrency(context: &RepositoryRequestContext) -> PackfileConcurrency {
-    match &context.repo.repo_config.git_concurrency {
+    match &context.repo.inner_repo().repo_config.git_concurrency {
         Some(concurrency) => PackfileConcurrency::new(
             concurrency.trees_and_blobs,
             concurrency.commits,
@@ -118,7 +116,7 @@ async fn acknowledgements(
     let git_shas = BonsaisOrGitShas::from_object_ids(args.haves.iter())?;
     let entries = context
         .repo
-        .bonsai_git_mapping
+        .bonsai_git_mapping()
         .get(&context.ctx, git_shas)
         .await
         .with_context(|| {
@@ -313,57 +311,18 @@ impl Iterator for FetchResponseHeaders {
     }
 }
 
-async fn get_body(state: &mut State) -> Result<Bytes, HttpError> {
-    Body::take_from(state)
-        .try_concat_body(&HeaderMap::new())
-        .map_err(HttpError::e500)?
-        .await
-        .map_err(HttpError::e500)
-}
-
-fn git_method_info(command: &Command, repo: String) -> GitMethodInfo {
-    let (method, variants) = match command {
-        Command::LsRefs(_) => (GitMethod::LsRefs, vec![GitMethodVariant::Standard]),
-        Command::Fetch(ref fetch_args) => {
-            let method = if fetch_args.haves.is_empty() && fetch_args.done {
-                GitMethod::Clone
-            } else {
-                GitMethod::Pull
-            };
-            let mut variants = vec![];
-            if fetch_args.is_shallow() {
-                variants.push(GitMethodVariant::Shallow);
-            }
-            if fetch_args.is_filter() {
-                variants.push(GitMethodVariant::Filter);
-            }
-            if variants.is_empty() {
-                variants.push(GitMethodVariant::Standard);
-            }
-            (method, variants)
-        }
-    };
-    GitMethodInfo {
-        method,
-        variants,
-        repo,
-    }
-}
-
 pub async fn upload_pack(state: &mut State) -> Result<Response<Body>, HttpError> {
     let body_bytes = get_body(state).await?;
     // We got a flush line packet to keep the connection alive. Just return Ok.
     if body_bytes == packetline::FLUSH_LINE {
-        return EmptyBody::new()
-            .try_into_response(state)
-            .map_err(HttpError::e500);
+        return empty_body(state);
     }
     let request_command =
         RequestCommand::parse_from_packetline(&body_bytes).map_err(HttpError::e400)?;
     let repo_name = RepositoryParams::borrow_from(state).repo_name();
     let request_context = RepositoryRequestContext::instantiate(
         state,
-        git_method_info(&request_command.command, repo_name),
+        GitMethodInfo::from_command(&request_command.command, repo_name),
     )
     .await?;
     state.put(Service::GitUploadPack);
@@ -379,6 +338,9 @@ pub async fn upload_pack(state: &mut State) -> Result<Response<Body>, HttpError>
             let output = output.map_err(HttpError::e500)?.try_into_response(state);
             output.map_err(HttpError::e500)
         }
+        Command::Push(_) => Err(HttpError::e500(anyhow::anyhow!(
+            "Push command directed to incorrect upload-pack handler"
+        ))),
     }
 }
 

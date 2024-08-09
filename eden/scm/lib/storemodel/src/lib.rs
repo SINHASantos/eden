@@ -27,6 +27,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use edenapi_trait::SaplingRemoteApi;
 pub use edenapi_types::FileAuxData;
+pub use edenapi_types::TreeAuxData;
 pub use futures;
 use metalog::MetaLog;
 pub use minibytes;
@@ -294,6 +295,19 @@ pub trait TreeEntry: Send + 'static {
     fn file_aux_iter(&self) -> anyhow::Result<BoxIterator<anyhow::Result<(HgId, FileAuxData)>>> {
         Ok(Box::new(std::iter::empty()))
     }
+
+    /// Iterate through the child tree aux data if they are available.
+    /// For performance reasons, the iteration is on `HgId`.
+    fn tree_aux_data_iter(
+        &self,
+    ) -> anyhow::Result<BoxIterator<anyhow::Result<(HgId, TreeAuxData)>>> {
+        Ok(Box::new(std::iter::empty()))
+    }
+
+    /// Get the tree aux data data of the tree.
+    fn aux_data(&self) -> anyhow::Result<Option<TreeAuxData>> {
+        Ok(None)
+    }
 }
 
 /// The `TreeStore` is an abstraction layer for the tree manifest that decouples how or where the
@@ -350,11 +364,69 @@ pub trait TreeStore: KeyStore {
         Ok(Box::new(iter))
     }
 
+    /// List metadata of the given trees.
+    /// Contact remote server on demand. Might block.
+    ///
+    /// Ignores fetch_mode in the default implementation
+    /// Currently mainly used by EdenFS.
+    fn get_tree_aux_data_iter(
+        &self,
+        keys: Vec<Key>,
+        _fetch_mode: FetchMode,
+    ) -> anyhow::Result<BoxIterator<anyhow::Result<(Key, TreeAuxData)>>> {
+        let iter = keys
+            .into_iter()
+            .map(|k| match self.get_local_tree_aux_data(&k.path, k.hgid) {
+                Err(e) => Err(e),
+                Ok(None) => Err(anyhow::format_err!(
+                    "{}@{}: not found locally",
+                    k.path,
+                    k.hgid
+                )),
+                Ok(Some(data)) => Ok((k, data)),
+            });
+        Ok(Box::new(iter))
+    }
+
     fn as_key_store(&self) -> &dyn KeyStore
     where
         Self: Sized,
     {
         self
+    }
+
+    /// Get tree aux data for a single tree.
+    /// Returns `None` if the information is unavailable locally.
+    fn get_local_tree_aux_data(
+        &self,
+        path: &RepoPath,
+        id: HgId,
+    ) -> anyhow::Result<Option<TreeAuxData>> {
+        match self.get_local_tree(path, id)? {
+            None => Ok(None),
+            Some(e) => e.aux_data(),
+        }
+    }
+
+    /// Get tree aux data for the given tree.
+    /// Contact remote server on demand. Might block.
+    /// When fetching data for many trees, use `get_tree_aux_data_iter`
+    /// instead of calling this in a loop.
+    fn get_tree_aux_data(
+        &self,
+        path: &RepoPath,
+        id: HgId,
+        fetch_mode: FetchMode,
+    ) -> anyhow::Result<TreeAuxData> {
+        let key = Key::new(path.to_owned(), id);
+        match self
+            .get_tree_aux_data_iter(vec![key.clone()], fetch_mode)?
+            .next()
+        {
+            None => Err(anyhow::format_err!("{}@{}: not found remotely", path, id)),
+            Some(Err(e)) => Err(e),
+            Some(Ok((_k, aux))) => Ok(aux),
+        }
     }
 }
 

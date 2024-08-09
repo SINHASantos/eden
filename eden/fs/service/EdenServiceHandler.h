@@ -46,6 +46,8 @@ class UsageService;
 
 extern const char* const kServiceName;
 
+const int EXPENSIVE_GLOB_FILES_DURATION = 5;
+
 struct ThriftRequestTraceEvent : TraceEventBase {
   enum Type : unsigned char {
     START,
@@ -458,13 +460,17 @@ class EdenServiceHandler : virtual public StreamingEdenServiceSvIf,
       const EdenMount& edenMount,
       const std::vector<std::string>& paths,
       EntryAttributeFlags reqBitmask,
+      AttributesRequestScope reqScope,
       SyncBehavior sync,
-      const ObjectFetchContextPtr& fetchContext);
+      const ObjectFetchContextPtr& fetchContext,
+      bool getEntryAttributesForPath);
   ImmediateFuture<EntryAttributes> getEntryAttributesForPath(
       const EdenMount& edenMount,
       EntryAttributeFlags reqBitmask,
+      AttributesRequestScope reqScope,
       std::string_view path,
-      const ObjectFetchContextPtr& fetchContext);
+      const ObjectFetchContextPtr& fetchContext,
+      bool getEntryAttributesForPath);
 
   folly::Synchronized<std::unordered_map<uint64_t, ThriftRequestTraceEvent>>
       outstandingThriftRequests_;

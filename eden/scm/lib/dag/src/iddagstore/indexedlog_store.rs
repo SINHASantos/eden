@@ -30,6 +30,7 @@ use super::IdDagStore;
 use crate::errors::bug;
 use crate::id::Group;
 use crate::id::Id;
+use crate::idset::Span;
 use crate::ops::Persist;
 use crate::ops::StorageVersion;
 use crate::ops::TryClone;
@@ -37,7 +38,6 @@ use crate::segment::describe_segment_bytes;
 use crate::segment::hex;
 use crate::segment::Segment;
 use crate::segment::SegmentFlags;
-use crate::spanset::Span;
 use crate::IdSet;
 use crate::Level;
 use crate::Result;
@@ -238,6 +238,7 @@ impl IdDagStore for IndexedLogStore {
             .lookup_range(Self::INDEX_LEVEL_HEAD, &low[..]..&high[..])?;
         for entry in iter {
             let (_, entries) = entry?;
+            #[allow(clippy::never_loop)]
             for entry in entries {
                 let entry = entry?;
                 let seg = self.segment_from_slice(entry);
@@ -483,14 +484,14 @@ impl Persist for IndexedLogStore {
         // Take a filesystem lock. The file name 'lock' is taken by indexedlog
         // running on Windows, so we choose another file name here.
         let lock_file = {
-            let mut path = self.path.clone();
-            path.push("wlock");
-            File::open(&path).or_else(|_| {
-                fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&path)
-            })?
+            let path = self.path.join("wlock");
+            // Some NFS implementation reports `EBADF` for `flock()` unless the file is opened
+            // with `O_RDWR`.
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(&path)?
         };
         lock_file.lock_exclusive()?;
         Ok(lock_file)
@@ -841,6 +842,10 @@ fn index_parent_key(parent_id: Id, child_id: Id) -> [u8; 17] {
 mod tests {
     use super::*;
     use crate::iddagstore::tests::dump_store_state;
+    use crate::tests::dbg;
+    use crate::tests::dbg_iter;
+    use crate::tests::nid;
+    use crate::tests::vid;
 
     #[test]
     fn test_merge_persisted_segments() -> Result<()> {
@@ -1007,7 +1012,7 @@ mod tests {
         }
 
         let all = iddag.all_ids_in_groups(&Group::ALL).unwrap();
-        assert_eq!(format!("{:?}", &all), "0..=20 N5..=N15");
+        assert_eq!(dbg(&all), "0..=20 N5..=N15");
 
         let state = dump_store_state(&iddag, &all);
         assert_eq!(state, "\nLv0: RH0-20[], N5-N15[10]\nP->C: 10->N5");
@@ -1158,14 +1163,6 @@ mod tests {
         data
     }
 
-    fn nid(id: u64) -> Id {
-        Group::NON_MASTER.min_id() + id
-    }
-
-    fn vid(id: u64) -> Id {
-        Group::VIRTUAL.min_id() + id
-    }
-
     #[test]
     fn test_describe() -> Result<()> {
         let tmp = tempfile::tempdir()?;
@@ -1202,14 +1199,5 @@ mod tests {
         );
 
         Ok(())
-    }
-
-    fn dbg_iter<'a, T: std::fmt::Debug>(iter: Box<dyn Iterator<Item = Result<T>> + 'a>) -> String {
-        let v = iter.map(|s| s.unwrap()).collect::<Vec<_>>();
-        dbg(v)
-    }
-
-    fn dbg<T: std::fmt::Debug>(t: T) -> String {
-        format!("{:?}", t)
     }
 }

@@ -13,7 +13,6 @@ use std::process::Stdio;
 
 use anyhow::anyhow;
 use anyhow::bail;
-use anyhow::format_err;
 use anyhow::Context;
 use anyhow::Error;
 use anyhow::Result;
@@ -31,7 +30,6 @@ use gix_object::bstr::BString;
 use gix_object::tree;
 use gix_object::Commit;
 use gix_object::Tag;
-use gix_object::Tree;
 use manifest::bonsai_diff;
 use manifest::find_intersection_of_diffs;
 use manifest::BonsaiDiffFileChange;
@@ -43,7 +41,6 @@ use mononoke_types::ChangesetId;
 use mononoke_types::DateTime;
 use mononoke_types::FileType;
 use mononoke_types::MPathElement;
-use mononoke_types::NonRootMPath;
 use slog::debug;
 use slog::Logger;
 use smallvec::SmallVec;
@@ -54,6 +51,7 @@ use tokio::io::BufReader;
 use tokio::process::Child;
 use tokio::process::Command;
 
+use crate::git_reader::GitReader;
 use crate::git_reader::GitRepoReader;
 use crate::gitlfs::GitImportLfs;
 
@@ -91,19 +89,11 @@ impl<const SUBMODULES: bool> Manifest for GitManifest<SUBMODULES> {
     }
 }
 
-async fn read_tree(reader: &GitRepoReader, oid: &gix_hash::oid) -> Result<Tree, Error> {
-    let object = reader.get_object(oid).await?;
-    object
-        .parsed
-        .try_into_tree()
-        .map_err(|_| format_err!("{} is not a tree", oid))
-}
-
-async fn load_git_tree<const SUBMODULES: bool>(
+async fn load_git_tree<const SUBMODULES: bool, Reader: GitReader>(
     oid: &gix_hash::oid,
-    reader: &GitRepoReader,
+    reader: &Reader,
 ) -> Result<GitManifest<SUBMODULES>, Error> {
-    let tree = read_tree(reader, oid).await?;
+    let tree = reader.read_tree(oid).await?;
 
     let elements = tree
         .entries
@@ -153,15 +143,18 @@ async fn load_git_tree<const SUBMODULES: bool>(
 }
 
 #[async_trait]
-impl<const SUBMODULES: bool> StoreLoadable<GitRepoReader> for GitTree<SUBMODULES> {
+impl<const SUBMODULES: bool, Reader> StoreLoadable<Reader> for GitTree<SUBMODULES>
+where
+    Reader: GitReader,
+{
     type Value = GitManifest<SUBMODULES>;
 
     async fn load<'a>(
         &'a self,
         _ctx: &'a CoreContext,
-        reader: &'a GitRepoReader,
+        reader: &'a Reader,
     ) -> Result<Self::Value, LoadableError> {
-        load_git_tree::<SUBMODULES>(&self.0, reader)
+        load_git_tree::<SUBMODULES, Reader>(&self.0, reader)
             .await
             .map_err(LoadableError::from)
     }
@@ -311,11 +304,11 @@ pub struct TagMetadata {
 }
 
 impl TagMetadata {
-    pub async fn new(
+    pub async fn new<Reader: GitReader>(
         ctx: &CoreContext,
         oid: ObjectId,
         maybe_tag_name: Option<String>,
-        reader: &GitRepoReader,
+        reader: &Reader,
     ) -> Result<Self, Error> {
         let Tag {
             name,
@@ -324,7 +317,7 @@ impl TagMetadata {
             message,
             mut pgp_signature,
             ..
-        } = read_tag(reader, &oid).await?;
+        } = reader.read_tag(&oid).await?;
 
         let author_date = tagger
             .take()
@@ -370,36 +363,6 @@ pub struct ExtractedCommit {
     pub tree_oid: ObjectId,
     pub parent_tree_oids: HashSet<ObjectId>,
     pub original_commit: Bytes,
-}
-
-pub(crate) async fn read_tag(reader: &GitRepoReader, oid: &gix_hash::oid) -> Result<Tag, Error> {
-    let object = reader.get_object(oid).await?;
-    object
-        .parsed
-        .try_into_tag()
-        .map_err(|_| format_err!("{} is not a tag", oid))
-}
-
-pub(crate) async fn read_commit(
-    reader: &GitRepoReader,
-    oid: &gix_hash::oid,
-) -> Result<Commit, Error> {
-    let object = reader.get_object(oid).await?;
-    object
-        .parsed
-        .try_into_commit()
-        .map_err(|_| format_err!("{} is not a commit", oid))
-}
-
-pub(crate) async fn read_raw_object(
-    reader: &GitRepoReader,
-    oid: &gix_hash::oid,
-) -> Result<Bytes, Error> {
-    reader
-        .get_object(oid)
-        .await
-        .map(|obj| obj.raw)
-        .with_context(|| format!("Error while fetching Git object for ID {}", oid))
 }
 
 fn format_signature(sig: gix_actor::SignatureRef) -> String {
@@ -471,10 +434,10 @@ fn decode_message(
 }
 
 impl ExtractedCommit {
-    pub async fn new(
+    pub async fn new<Reader: GitReader>(
         ctx: &CoreContext,
         oid: ObjectId,
-        reader: &GitRepoReader,
+        reader: &Reader,
     ) -> Result<Self, Error> {
         let Commit {
             tree,
@@ -485,13 +448,13 @@ impl ExtractedCommit {
             message,
             extra_headers,
             ..
-        } = read_commit(reader, &oid).await?;
+        } = reader.read_commit(&oid).await?;
 
         let tree_oid = tree;
         let parent_tree_oids = {
             let mut trees = HashSet::new();
             for parent in &parents {
-                let commit = read_commit(reader, parent).await?;
+                let commit = reader.read_commit(parent).await?;
                 trees.insert(commit.tree);
             }
             trees
@@ -512,7 +475,7 @@ impl ExtractedCommit {
                 )
             })
             .collect();
-        let original_commit = read_raw_object(reader, &oid).await?;
+        let original_commit = reader.read_raw_object(&oid).await?;
         Result::<_, Error>::Ok(ExtractedCommit {
             original_commit,
             metadata: CommitMetadata {
@@ -532,10 +495,10 @@ impl ExtractedCommit {
 
     /// Generic version of `diff` based on whether submodules are
     /// included or not.
-    fn diff_for_submodules<const SUBMODULES: bool>(
+    fn diff_for_submodules<const SUBMODULES: bool, Reader: GitReader>(
         &self,
         ctx: &CoreContext,
-        reader: &GitRepoReader,
+        reader: &Reader,
     ) -> impl Stream<Item = Result<BonsaiDiffFileChange<GitLeaf>, Error>> {
         let tree = GitTree::<SUBMODULES>(self.tree_oid);
         let parent_trees = self
@@ -549,26 +512,27 @@ impl ExtractedCommit {
 
     /// Compare the commit against its parents and return all bonsai changes
     /// that it includes.
-    pub fn diff(
+    pub fn diff<Reader: GitReader>(
         &self,
         ctx: &CoreContext,
-        reader: &GitRepoReader,
+        reader: &Reader,
         submodules: bool,
     ) -> impl Stream<Item = Result<BonsaiDiffFileChange<GitLeaf>, Error>> {
         if submodules {
-            self.diff_for_submodules::<true>(ctx, reader).left_stream()
+            self.diff_for_submodules::<true, Reader>(ctx, reader)
+                .left_stream()
         } else {
-            self.diff_for_submodules::<false>(ctx, reader)
+            self.diff_for_submodules::<false, Reader>(ctx, reader)
                 .right_stream()
         }
     }
 
     /// Compare the tree for the commit against its parents and return all the trees and subtrees
     /// that have changed w.r.t its parents
-    pub fn changed_trees(
+    pub fn changed_trees<Reader: GitReader>(
         &self,
         ctx: &CoreContext,
-        reader: &GitRepoReader,
+        reader: &Reader,
     ) -> impl Stream<Item = Result<GitTree<true>, Error>> {
         // When doing manifest diff over trees, submodules enabled or disabled doesn't matter
         let tree = GitTree::<true>(self.tree_oid);
@@ -637,101 +601,6 @@ impl BackfillDerivation {
             BackfillDerivation::No => Vec::new(),
         }
     }
-}
-
-#[async_trait]
-pub trait GitUploader: Clone + Send + Sync + 'static {
-    /// The type of a file change to be uploaded
-    type Change: Clone + Send + Sync + 'static;
-
-    /// The type of a changeset returned by generate_changeset
-    type IntermediateChangeset: Send + Sync;
-
-    /// Returns a change representing a deletion
-    fn deleted() -> Self::Change;
-
-    /// Preload a number of commits, allowing us to batch the
-    /// lookups in the bonsai_git_mapping table, largely reducing
-    /// the I/O load
-    async fn preload_uploaded_commits(
-        &self,
-        ctx: &CoreContext,
-        oids: &[gix_hash::ObjectId],
-    ) -> Result<Vec<(gix_hash::ObjectId, ChangesetId)>, Error>;
-
-    /// Looks to see if we can elide importing a commit
-    /// If you can give us the ChangesetId for a given git object,
-    /// then we assume that it's already imported and skip it
-    async fn check_commit_uploaded(
-        &self,
-        ctx: &CoreContext,
-        oid: &gix_hash::oid,
-    ) -> Result<Option<ChangesetId>, Error>;
-
-    /// Upload a single file to the repo
-    async fn upload_file(
-        &self,
-        ctx: &CoreContext,
-        lfs: &GitImportLfs,
-        path: &NonRootMPath,
-        ty: FileType,
-        oid: ObjectId,
-        git_bytes: Bytes,
-    ) -> Result<Self::Change, Error>;
-
-    /// Upload a single git object to the repo blobstore of the mercurial mirror.
-    /// Use this method for uploading non-blob git objects (e.g. tree, commit, etc)
-    async fn upload_object(
-        &self,
-        ctx: &CoreContext,
-        oid: ObjectId,
-        git_bytes: Bytes,
-    ) -> Result<(), Error>;
-
-    /// Upload a single packfile item corresponding to a git base object, i.e. commit,
-    /// tree, blob or tag
-    async fn upload_packfile_base_item(
-        &self,
-        ctx: &CoreContext,
-        oid: ObjectId,
-        git_bytes: Bytes,
-    ) -> Result<(), Error>;
-
-    /// Generate a single Bonsai changeset ID for corresponding Git commit
-    /// This should delay saving the changeset if possible
-    /// but may save it if required.
-    ///
-    /// You are guaranteed that all parents of the given changeset
-    /// have been generated by this point.
-    async fn generate_changeset_for_commit(
-        &self,
-        ctx: &CoreContext,
-        bonsai_parents: Vec<ChangesetId>,
-        metadata: CommitMetadata,
-        changes: SortedVectorMap<NonRootMPath, Self::Change>,
-        dry_run: bool,
-    ) -> Result<(Self::IntermediateChangeset, ChangesetId), Error>;
-
-    /// Generate a single Bonsai changeset ID for corresponding Git
-    /// annotated tag.
-    async fn generate_changeset_for_annotated_tag(
-        &self,
-        ctx: &CoreContext,
-        target_changeset_id: ChangesetId,
-        tag: TagMetadata,
-    ) -> Result<ChangesetId, Error>;
-
-    /// Finalize a batch of generated changesets. The supplied batch is
-    /// topologically sorted so that parents are all present before children
-    /// If you did not finalize the changeset in generate_changeset,
-    /// you must do so here.
-    async fn finalize_batch(
-        &self,
-        ctx: &CoreContext,
-        dry_run: bool,
-        backfill_derivation: BackfillDerivation,
-        changesets: Vec<(Self::IntermediateChangeset, hash::GitSha1)>,
-    ) -> Result<(), Error>;
 }
 
 #[cfg(test)]

@@ -92,18 +92,11 @@ impl MononokeMegarepoConfigsOptions {
 /// An API for Megarepo Configs
 #[async_trait]
 pub trait MononokeMegarepoConfigs: Send + Sync {
-    /// Get all the versions for a given Target
-    async fn get_target_config_versions(
+    /// Get a SyncTargetConfig by its version
+    async fn get_config_by_version(
         &self,
         ctx: CoreContext,
         repo_config: Arc<RepoConfig>,
-        target: Target,
-    ) -> Result<Vec<SyncConfigVersion>, MegarepoError>;
-
-    /// Get a SyncTargetConfig by its version
-    fn get_config_by_version(
-        &self,
-        ctx: CoreContext,
         target: Target,
         version: SyncConfigVersion,
     ) -> Result<SyncTargetConfig, MegarepoError>;

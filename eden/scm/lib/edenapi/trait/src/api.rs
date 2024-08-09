@@ -54,6 +54,7 @@ use edenapi_types::UploadTokensResponse;
 use edenapi_types::UploadTreeEntry;
 use edenapi_types::UploadTreeResponse;
 use edenapi_types::WorkspaceDataResponse;
+use edenapi_types::WorkspacesDataResponse;
 use minibytes::Bytes;
 use types::HgId;
 use types::Key;
@@ -382,6 +383,16 @@ pub trait SaplingRemoteApi: Send + Sync + 'static {
         Err(SaplingRemoteApiError::NotSupported)
     }
 
+    /// Retrieves workspaces that match a prefix in from commit cloud
+    async fn cloud_workspaces(
+        &self,
+        prefix: String,
+        reponame: String,
+    ) -> Result<WorkspacesDataResponse, SaplingRemoteApiError> {
+        let _ = (prefix, reponame);
+        Err(SaplingRemoteApiError::NotSupported)
+    }
+
     async fn cloud_references(
         &self,
         data: GetReferencesParams,
@@ -403,8 +414,9 @@ pub trait SaplingRemoteApi: Send + Sync + 'static {
         &self,
         commit: CommitId,
         suffixes: Vec<String>,
+        prefixes: Option<Vec<String>>,
     ) -> Result<Response<SuffixQueryResponse>, SaplingRemoteApiError> {
-        let _ = (commit, suffixes);
+        let _ = (commit, suffixes, prefixes);
         Err(SaplingRemoteApiError::NotSupported)
     }
 }

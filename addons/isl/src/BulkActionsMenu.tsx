@@ -8,13 +8,13 @@
 import {CleanupAllButton} from './Cleanup';
 import {DropdownFields} from './DropdownFields';
 import {useCommandEvent} from './ISLShortcuts';
-import {Kbd} from './Kbd';
 import {SelectAllButton} from './SelectAllCommits';
 import {SuggestedRebaseButton} from './SuggestedRebase';
-import {Tooltip} from './Tooltip';
-import {Button} from './components/Button';
 import {T} from './i18n';
-import {Icon} from 'shared/Icon';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
+import {Kbd} from 'isl-components/Kbd';
+import {Tooltip} from 'isl-components/Tooltip';
 import {KeyCode, Modifier} from 'shared/KeyboardShortcuts';
 
 import './BulkActionsMenu.css';

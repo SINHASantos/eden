@@ -130,7 +130,6 @@ blackbox=
 chistedit=
 clindex=
 conflictinfo=
-copytrace=
 debugnetwork=
 dialect=
 directaccess=
@@ -585,10 +584,6 @@ show=True
 default-destination-dir=$HOME
 nativecheckout=True
 nativepull=True
-
-[commands]
-naked-default.in-repo=hg
-naked-default.no-repo=help
 
 [scale]
 largeworkingcopy=True

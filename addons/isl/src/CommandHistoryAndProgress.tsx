@@ -10,10 +10,7 @@ import type {ValidatedRepoInfo} from './types';
 import type {ReactNode} from 'react';
 
 import {Delayed} from './Delayed';
-import {Subtle} from './Subtle';
-import {Tooltip} from './Tooltip';
 import {codeReviewProvider} from './codeReview/CodeReviewInfo';
-import {Button} from './components/Button';
 import {T, t} from './i18n';
 import {
   EXIT_CODE_FORGET,
@@ -25,8 +22,11 @@ import {repositoryInfo} from './serverAPIState';
 import {processTerminalLines} from './terminalOutput';
 import {CommandRunner} from './types';
 import {short} from './utils';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
+import {Subtle} from 'isl-components/Subtle';
+import {Tooltip} from 'isl-components/Tooltip';
 import {useAtomValue} from 'jotai';
-import {Icon} from 'shared/Icon';
 import './CommandHistoryAndProgress.css';
 import {notEmpty, truncate} from 'shared/utils';
 
@@ -67,6 +67,8 @@ function OperationDescription(props: {
                   return undefined;
                 case 'repo-relative-file':
                   return arg.path;
+                case 'repo-relative-file-list':
+                  return truncate(arg.paths.join(' '), 200);
                 case 'exact-revset':
                 case 'succeedable-revset':
                 case 'optimistic-revset':
@@ -76,9 +78,7 @@ function OperationDescription(props: {
                     // revset could also be a remote bookmark, so only do this if it looks like a hash
                     /^[a-z0-9]{40}$/.test(arg.revset)
                     ? short(arg.revset)
-                    : arg.revset.length > 80
-                    ? arg.revset.slice(0, 80) + '...'
-                    : arg.revset;
+                    : truncate(arg.revset, 80);
               }
             }
             if (/\s/.test(arg)) {

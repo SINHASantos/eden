@@ -15,12 +15,11 @@ use bonsai_svnrev_mapping::BonsaiSvnrevMapping;
 use bonsai_tag_mapping::BonsaiTagMapping;
 use bookmarks::BookmarkUpdateLog;
 use bookmarks::Bookmarks;
-use changeset_fetcher::ChangesetFetcher;
-use changeset_fetcher::SimpleChangesetFetcher;
-use changesets::Changesets;
-use changesets::ChangesetsRef;
 use commit_cloud::CommitCloud;
 use commit_graph::CommitGraph;
+use commit_graph::CommitGraphRef;
+use commit_graph::CommitGraphWriter;
+use commit_graph::CommitGraphWriterRef;
 use context::CoreContext;
 use ephemeral_blobstore::Bubble;
 use filenodes::Filenodes;
@@ -40,6 +39,7 @@ use repo_identity::RepoIdentity;
 use repo_identity::RepoIdentityRef;
 use repo_lock::RepoLock;
 use repo_permission_checker::RepoPermissionChecker;
+use sql_commit_graph_storage::CommitGraphBulkFetcher;
 
 // NOTE: this structure and its fields are public to enable `DangerousOverride` functionality
 #[facet::container]
@@ -58,13 +58,10 @@ pub struct BlobRepoInner {
     pub repo_blobstore: RepoBlobstore,
 
     #[facet]
-    pub changesets: dyn Changesets,
-
-    #[facet]
-    pub changeset_fetcher: dyn ChangesetFetcher,
-
-    #[facet]
     pub commit_graph: CommitGraph,
+
+    #[facet]
+    pub commit_graph_writer: dyn CommitGraphWriter,
 
     #[facet]
     pub bonsai_hg_mapping: dyn BonsaiHgMapping,
@@ -122,6 +119,9 @@ pub struct BlobRepoInner {
 
     #[facet]
     pub commit_cloud: CommitCloud,
+
+    #[facet]
+    pub commit_graph_bulk_fetcher: CommitGraphBulkFetcher,
 }
 
 #[facet::container]
@@ -130,9 +130,8 @@ pub struct BlobRepo {
     #[delegate(
         RepoIdentity,
         RepoBlobstore,
-        dyn Changesets,
-        dyn ChangesetFetcher,
         CommitGraph,
+        dyn CommitGraphWriter,
         dyn BonsaiHgMapping,
         dyn BonsaiGitMapping,
         dyn BonsaiTagMapping,
@@ -152,7 +151,8 @@ pub struct BlobRepo {
         dyn RepoPermissionChecker,
         dyn RepoLock,
         RepoBookmarkAttrs,
-        CommitCloud
+        CommitCloud,
+        CommitGraphBulkFetcher,
     )]
     inner: Arc<BlobRepoInner>,
 }
@@ -172,21 +172,10 @@ impl BlobRepo {
 
     pub fn with_bubble(&self, bubble: Bubble) -> Self {
         let blobstore = bubble.wrap_repo_blobstore(self.repo_blobstore().clone());
-        let changesets = Arc::new(bubble.changesets(self));
-        let commit_graph = Arc::new(bubble.commit_graph(self));
-        let changeset_fetcher =
-            SimpleChangesetFetcher::new(changesets.clone(), self.repo_identity().id());
-        let new_manager = self
-            .inner
-            .repo_derived_data
-            .manager()
-            .clone()
-            .for_bubble(bubble, self);
-        let repo_derived_data = self.inner.repo_derived_data.with_manager(new_manager);
+        let commit_graph = Arc::new(bubble.repo_commit_graph(self));
+        let repo_derived_data = self.inner.repo_derived_data.for_bubble(bubble);
         let mut inner = (*self.inner).clone();
         inner.repo_derived_data = Arc::new(repo_derived_data);
-        inner.changesets = changesets;
-        inner.changeset_fetcher = Arc::new(changeset_fetcher);
         inner.repo_blobstore = Arc::new(blobstore);
         inner.commit_graph = commit_graph;
         Self {
@@ -214,7 +203,7 @@ impl AsBlobRepo for BlobRepo {
 pub async fn save_bonsai_changesets(
     bonsai_changesets: Vec<BonsaiChangeset>,
     ctx: CoreContext,
-    container: &(impl ChangesetsRef + RepoBlobstoreRef),
+    container: &(impl CommitGraphRef + CommitGraphWriterRef + RepoBlobstoreRef + RepoIdentityRef),
 ) -> Result<(), Error> {
     changesets_creation::save_changesets(&ctx, container, bonsai_changesets).await
 }

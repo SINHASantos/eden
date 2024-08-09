@@ -15,6 +15,7 @@ use blobstore::Loadable;
 use context::CoreContext;
 use fbinit::FacebookInit;
 use git_types::MappedGitCommitId;
+use mononoke_types::BonsaiChangeset;
 use mononoke_types::NonRootMPath;
 use repo_blobstore::RepoBlobstoreRef;
 use repo_derived_data::RepoDerivedDataRef;
@@ -40,7 +41,7 @@ async fn test_changing_submodule_expansion_validation_passes_when_working_copy_m
     let SubmoduleSyncTestData {
         large_repo_info: (large_repo, large_repo_master),
         commit_syncer,
-        repo_a_info: (repo_a, _repo_a_cs_map),
+        small_repo_info: (small_repo, _small_repo_cs_map),
         live_commit_sync_config,
         ..
     } = build_submodule_sync_test_data(
@@ -60,22 +61,22 @@ async fn test_changing_submodule_expansion_validation_passes_when_working_copy_m
     let cs_id = CreateCommitContext::new(&ctx, &large_repo, vec![large_repo_master])
         .set_message(MESSAGE)
         .add_file(
-            "repo_a/submodules/.x-repo-submodule-repo_b",
+            "small_repo/submodules/.x-repo-submodule-repo_b",
             b_a_git_hash.to_string(),
         )
         // Delete the file added in commit B_B, to achieve working copy
         // equivalence with B_A
-        .delete_file("repo_a/submodules/repo_b/B_B")
+        .delete_file("small_repo/submodules/repo_b/B_B")
         .commit()
         .await
-        .context("Failed to create commit modifying repo_a directory")?;
+        .context("Failed to create commit modifying small_repo directory")?;
     let bonsai = cs_id.load(&ctx, large_repo.repo_blobstore()).await?;
 
     let validation_res = test_submodule_expansion_validation_in_large_repo_bonsai(
         ctx,
         bonsai,
         large_repo,
-        repo_a,
+        small_repo,
         commit_syncer,
         live_commit_sync_config,
     )
@@ -102,7 +103,7 @@ async fn test_changing_submodule_expansion_without_metadata_file_fails_validatio
     let SubmoduleSyncTestData {
         large_repo_info: (large_repo, large_repo_master),
         commit_syncer,
-        repo_a_info: (repo_a, _repo_a_cs_map),
+        small_repo_info: (small_repo, _small_repo_cs_map),
         live_commit_sync_config,
         ..
     } = build_submodule_sync_test_data(
@@ -117,26 +118,36 @@ async fn test_changing_submodule_expansion_without_metadata_file_fails_validatio
     let cs_id = CreateCommitContext::new(&ctx, &large_repo, vec![large_repo_master])
         .set_message(MESSAGE)
         .add_file(
-            "repo_a/submodules/repo_b/B_B",
-            "Changing file in repo_a directory",
+            "small_repo/submodules/repo_b/B_B",
+            "Changing file in small_repo directory",
         )
         .commit()
         .await
-        .context("Failed to create commit modifying repo_a directory")?;
+        .context("Failed to create commit modifying small_repo directory")?;
     let bonsai = cs_id.load(&ctx, large_repo.repo_blobstore()).await?;
 
     let validation_res = test_submodule_expansion_validation_in_large_repo_bonsai(
         ctx,
         bonsai,
         large_repo,
-        repo_a,
+        small_repo,
         commit_syncer,
         live_commit_sync_config,
     )
     .await;
 
-    let expected_err_msg = "Expansion of submodule submodules/repo_b changed without updating its metadata file repo_a/submodules/.x-repo-submodule-repo_b";
-    assert!(validation_res.is_err_and(|e| { e.to_string().contains(expected_err_msg) }));
+    let expected_err_msg = concat!(
+        "Expansion of submodule submodules/repo_b changed without updating ",
+        "its metadata file small_repo/submodules/.x-repo-submodule-repo_b"
+    );
+
+    assert_validation_error(
+        validation_res,
+        vec![
+            "Validation of submodule submodules/repo_b failed",
+            expected_err_msg,
+        ],
+    );
 
     Ok(())
 }
@@ -155,7 +166,7 @@ async fn test_changing_submodule_metadata_pointer_without_expansion_fails_valida
     let SubmoduleSyncTestData {
         large_repo_info: (large_repo, large_repo_master),
         commit_syncer,
-        repo_a_info: (repo_a, _repo_a_cs_map),
+        small_repo_info: (small_repo, _small_repo_cs_map),
         live_commit_sync_config,
         ..
     } = build_submodule_sync_test_data(
@@ -175,26 +186,33 @@ async fn test_changing_submodule_metadata_pointer_without_expansion_fails_valida
     let cs_id = CreateCommitContext::new(&ctx, &large_repo, vec![large_repo_master])
         .set_message(MESSAGE)
         .add_file(
-            "repo_a/submodules/.x-repo-submodule-repo_b",
+            "small_repo/submodules/.x-repo-submodule-repo_b",
             b_a_git_hash.to_string(),
         )
         .commit()
         .await
-        .context("Failed to create commit modifying repo_a directory")?;
+        .context("Failed to create commit modifying small_repo directory")?;
     let bonsai = cs_id.load(&ctx, large_repo.repo_blobstore()).await?;
 
     let validation_res = test_submodule_expansion_validation_in_large_repo_bonsai(
         ctx,
         bonsai,
         large_repo,
-        repo_a,
+        small_repo,
         commit_syncer,
         live_commit_sync_config,
     )
     .await;
 
-    let expected_err_msg = "Files present in the expansion are unaccounted for";
-    assert!(validation_res.is_err_and(|e| { e.to_string().contains(expected_err_msg) }));
+    let expected_err_msg = "Files present in expansion are unaccounted for";
+
+    assert_validation_error(
+        validation_res,
+        vec![
+            "Validation of submodule submodules/repo_b failed",
+            expected_err_msg,
+        ],
+    );
 
     Ok(())
 }
@@ -213,7 +231,7 @@ async fn test_changing_submodule_metadata_pointer_to_git_commit_from_another_rep
     let SubmoduleSyncTestData {
         large_repo_info: (large_repo, large_repo_master),
         commit_syncer,
-        repo_a_info: (repo_a, _repo_a_cs_map),
+        small_repo_info: (small_repo, _small_repo_cs_map),
         live_commit_sync_config,
         ..
     } = build_submodule_sync_test_data(
@@ -234,27 +252,38 @@ async fn test_changing_submodule_metadata_pointer_to_git_commit_from_another_rep
     let cs_id = CreateCommitContext::new(&ctx, &large_repo, vec![large_repo_master])
         .set_message(MESSAGE)
         .add_file(
-            "repo_a/submodules/.x-repo-submodule-repo_b",
+            "small_repo/submodules/.x-repo-submodule-repo_b",
             c_a_git_hash.to_string(),
         )
         .commit()
         .await
-        .context("Failed to create commit modifying repo_a directory")?;
+        .context("Failed to create commit modifying small_repo directory")?;
     let bonsai = cs_id.load(&ctx, large_repo.repo_blobstore()).await?;
 
     let validation_res = test_submodule_expansion_validation_in_large_repo_bonsai(
         ctx,
         bonsai,
         large_repo,
-        repo_a,
+        small_repo,
         commit_syncer,
         live_commit_sync_config,
     )
     .await;
     println!("Validation result: {0:#?}", &validation_res);
 
-    let expected_err_msg = "Failed to get changeset id from git submodule commit hash 76ba5635bc159cfa5ac555d95974116bc94473f0 in repo repo_b";
-    assert!(validation_res.is_err_and(|e| { e.to_string().contains(expected_err_msg) }));
+    let expected_err_msg = concat!(
+        "Failed to get changeset id from git submodule ",
+        "commit hash 76ba5635bc159cfa5ac555d95974116bc94473f0 in repo repo_b"
+    );
+
+    assert_validation_error(
+        validation_res,
+        vec![
+            "Validation of submodule submodules/repo_b failed",
+            "Failed to get submodule bonsai changeset id",
+            expected_err_msg,
+        ],
+    );
 
     Ok(())
 }
@@ -273,7 +302,7 @@ async fn test_deleting_submodule_metadata_file_without_expansion_passes_validati
     let SubmoduleSyncTestData {
         large_repo_info: (large_repo, large_repo_master),
         commit_syncer,
-        repo_a_info: (repo_a, _repo_a_cs_map),
+        small_repo_info: (small_repo, _small_repo_cs_map),
         live_commit_sync_config,
         ..
     } = build_submodule_sync_test_data(
@@ -287,17 +316,17 @@ async fn test_deleting_submodule_metadata_file_without_expansion_passes_validati
     const MESSAGE: &str = "Delete submodule metadata file without deleting expansion";
     let cs_id = CreateCommitContext::new(&ctx, &large_repo, vec![large_repo_master])
         .set_message(MESSAGE)
-        .delete_file("repo_a/submodules/.x-repo-submodule-repo_b")
+        .delete_file("small_repo/submodules/.x-repo-submodule-repo_b")
         .commit()
         .await
-        .context("Failed to create commit modifying repo_a directory")?;
+        .context("Failed to create commit modifying small_repo directory")?;
     let bonsai = cs_id.load(&ctx, large_repo.repo_blobstore()).await?;
 
     let validation_res = test_submodule_expansion_validation_in_large_repo_bonsai(
         ctx,
         bonsai,
         large_repo,
-        repo_a,
+        small_repo,
         commit_syncer,
         live_commit_sync_config,
     )
@@ -324,7 +353,7 @@ async fn test_deleting_submodule_expansion_without_metadata_file_fails_validatio
     let SubmoduleSyncTestData {
         large_repo_info: (large_repo, large_repo_master),
         commit_syncer,
-        repo_a_info: (repo_a, _repo_a_cs_map),
+        small_repo_info: (small_repo, _small_repo_cs_map),
         live_commit_sync_config,
         ..
     } = build_submodule_sync_test_data(
@@ -338,18 +367,18 @@ async fn test_deleting_submodule_expansion_without_metadata_file_fails_validatio
     const MESSAGE: &str = "Delete submodule expansion without deleting metadata file";
     let cs_id = CreateCommitContext::new(&ctx, &large_repo, vec![large_repo_master])
         .set_message(MESSAGE)
-        .delete_file("repo_a/submodules/repo_b/B_A")
-        .delete_file("repo_a/submodules/repo_b/B_B")
+        .delete_file("small_repo/submodules/repo_b/B_A")
+        .delete_file("small_repo/submodules/repo_b/B_B")
         .commit()
         .await
-        .context("Failed to create commit modifying repo_a directory")?;
+        .context("Failed to create commit modifying small_repo directory")?;
     let bonsai = cs_id.load(&ctx, large_repo.repo_blobstore()).await?;
 
     let validation_res = test_submodule_expansion_validation_in_large_repo_bonsai(
         ctx,
         bonsai,
         large_repo,
-        repo_a,
+        small_repo,
         commit_syncer,
         live_commit_sync_config,
     )
@@ -357,8 +386,28 @@ async fn test_deleting_submodule_expansion_without_metadata_file_fails_validatio
 
     println!("Validation result: {0:#?}", &validation_res);
 
-    let expected_err_msg = "Expansion of submodule submodules/repo_b changed without updating its metadata file repo_a/submodules/.x-repo-submodule-repo_b";
-    assert!(validation_res.is_err_and(|e| { e.to_string().contains(expected_err_msg) }));
+    let expected_err_msg = concat!(
+        "Expansion of submodule submodules/repo_b changed without updating ",
+        "its metadata file small_repo/submodules/.x-repo-submodule-repo_b"
+    );
+
+    assert_validation_error(
+        validation_res,
+        vec![
+            "Validation of submodule submodules/repo_b failed",
+            expected_err_msg,
+        ],
+    );
 
     Ok(())
+}
+
+/// Takes a Result that's expected to be a submodule expansion validation error
+/// and assert it matches the expectations (e.g. error message, contexts).
+fn assert_validation_error(result: Result<BonsaiChangeset>, expected_msgs: Vec<&str>) {
+    assert!(result.is_err_and(|e| {
+        let error_msgs = e.chain().map(|e| e.to_string()).collect::<Vec<_>>();
+        println!("Error messages: {:#?}", error_msgs);
+        error_msgs == expected_msgs
+    }));
 }

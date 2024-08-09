@@ -16,6 +16,8 @@ use clap::Args;
 use clap::Parser;
 use clap::Subcommand;
 use commit_graph::CommitGraph;
+use commit_graph::CommitGraphWriter;
+use filestore::FilestoreConfig;
 use git_symbolic_refs::GitSymbolicRefs;
 use metaconfig_types::RepoConfig;
 use mononoke_app::MononokeApp;
@@ -40,6 +42,8 @@ pub struct Repo {
     #[facet]
     commit_graph: CommitGraph,
     #[facet]
+    commit_graph_writer: dyn CommitGraphWriter,
+    #[facet]
     bookmarks: dyn Bookmarks,
     #[facet]
     repo_derived_data: RepoDerivedData,
@@ -55,6 +59,8 @@ pub struct Repo {
     bookmark_cache: dyn BookmarksCache,
     #[facet]
     repo_config: RepoConfig,
+    #[facet]
+    pub filestore_config: FilestoreConfig,
 }
 
 #[derive(Subcommand)]

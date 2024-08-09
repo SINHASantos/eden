@@ -8,21 +8,13 @@
   $ export COMMIT_SCRIBE_CATEGORY=mononoke_commits
   $ export BOOKMARK_SCRIBE_CATEGORY=mononoke_bookmark
 
-  $ setup_configerator_configs
-  $ cat > "$PUSHREDIRECT_CONF/enable" <<EOF
-  > {
-  > "per_repo": {
-  >   "1": {
-  >      "draft_push": false,
-  >      "public_push": true
-  >    }
-  >   }
-  > }
-  > EOF
-
-  $ init_large_small_repo
+  $ create_large_small_repo
   Adding synced mapping entry
+  $ setup_configerator_configs
+  $ enable_pushredirect 1
+  $ start_large_small_repo
   Starting Mononoke server
+  $ init_local_large_small_clones
 
 Push a merge from a large repo
   $ cd "$TESTTMP/large-hg-client"

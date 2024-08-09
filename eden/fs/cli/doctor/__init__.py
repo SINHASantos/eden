@@ -40,6 +40,7 @@ from . import (
     check_filesystems,
     check_hg,
     check_kerberos,
+    check_network,
     check_os,
     check_recent_writes,
     check_redirections,
@@ -75,6 +76,14 @@ except ImportError:
             self, *_args: Any, **_kwargs: Any
         ) -> None:
             pass
+
+
+try:
+    from .facebook.internal_consts import get_doctor_link
+except ImportError:
+
+    def get_doctor_link() -> str:
+        return ""
 
 
 # working_directory_was_stale may be set to True by the CLI main module
@@ -434,6 +443,32 @@ class EdenDoctor(EdenDoctorChecker):
                 num_problems=fixer.num_problems,
                 problems=fixer.problem_types.union(fixer.ignored_problem_types),
                 problem_description=fixer.problem_description,
+                num_failed_fixes=fixer.num_failed_fixes,
+                num_manual_fixes=fixer.num_manual_fixes,
+                num_no_fixes=fixer.num_no_fixes,
+                num_advisory_fixes=fixer.num_advisory_fixes,
+                problem_failed_fixes=fixer.problem_failed_fixes,
+                problem_manual_fixes=fixer.problem_manual_fixes,
+                problem_no_fixes=fixer.problem_no_fixes,
+                problem_advisory_fixes=fixer.problem_advisory_fixes,
+                exception=fixer.problem_failed_fixes_exceptions,
+            )
+        elif sys.platform == "win32":
+            # dry run doesn't run fixes so we count the number of fixable problems rather
+            # than the number of failed fixes
+            self.instance.log_sample(
+                "eden_doctor_dry_run",
+                num_problems=fixer.num_problems,
+                problems=fixer.problem_types.union(fixer.ignored_problem_types),
+                problem_description=fixer.problem_description,
+                num_fixable=fixer.num_fixable,
+                num_manual_fixes=fixer.num_manual_fixes,
+                num_no_fixes=fixer.num_no_fixes,
+                num_advisory_fixes=fixer.num_advisory_fixes,
+                problem_fixable=fixer.problem_fixable,
+                problem_manual_fixes=fixer.problem_manual_fixes,
+                problem_no_fixes=fixer.problem_no_fixes,
+                problem_advisory_fixes=fixer.problem_advisory_fixes,
             )
 
         if fixer.num_problems == 0:
@@ -464,12 +499,26 @@ class EdenDoctor(EdenDoctorChecker):
             out.writeln(
                 f"Failed to fix {problem_count(fixer.num_failed_fixes)}.", fg=out.RED
             )
+
+        if fixer.num_advisory_fixes:
+            out.writeln(
+                f"{fixer.num_advisory_fixes} issue{'' if fixer.num_advisory_fixes==1 else 's'} with recommended fixes.",
+                fg=out.YELLOW,
+            )
+
         if fixer.num_manual_fixes:
             if fixer.num_manual_fixes == 1:
                 msg = "1 issue requires manual attention."
             else:
                 msg = f"{fixer.num_manual_fixes} issues require manual attention."
             out.writeln(msg, fg=out.YELLOW)
+
+        if fixer.num_no_fixes:
+            if fixer.num_no_fixes == 1:
+                msg = "No standard fix for 1 issue."
+            else:
+                msg = f"No standard fix for {fixer.num_no_fixes} issues."
+            out.writeln(msg, fg=out.RED)
 
         if fixer.num_fixed_problems == fixer.num_problems:
             return 0
@@ -515,7 +564,11 @@ Please wait for edenfs to finish starting. You can watch its progress with
 
 If EdenFS seems to be taking too long to start you can try restarting it
 with "eden restart --force"'''
-        super().__init__("EdenFS is currently still starting.", remediation=remediation)
+        super().__init__(
+            "EdenFS is currently still starting.",
+            remediation=remediation,
+            severity=ProblemSeverity.ADVICE,
+        )
 
 
 class EdenfsStopping(Problem):
@@ -575,7 +628,9 @@ class NestedCheckout(Problem):
         super().__init__(
             f"""\
 edenfs reports that checkout {checkout.path} is nested within an existing checkout {existing_checkout.path}
-Nested checkouts are usually not intended and can cause spurious behavior. Consider running `eden rm {checkout.path}` to remove misplaced repo(s)\n"""
+Nested checkouts are usually not intended and can cause spurious behavior.""",
+            f"Consider running `eden rm {checkout.path}` to remove misplaced repo(s)\n",
+            severity=ProblemSeverity.ADVICE,
         )
 
 
@@ -586,13 +641,27 @@ class CheckoutInsideBackingRepo(Problem):
         super().__init__(
             f"""\
 edenfs reports that checkout {checkout.path} is created within backing repo of an existing checkout {existing_checkout.path} (backing repo: {existing_checkout.get_backing_repo_path()})
-Checkouts inside backing repo are usually not intended and can cause spurious behavior. Consider running `eden rm {checkout.path}` to remove misplaced repo(s)\n"""
+Checkouts inside backing repo are usually not intended and can cause spurious behavior.""",
+            f"Consider running `eden rm {checkout.path}` to remove misplaced repo(s)\n",
+            severity=ProblemSeverity.ADVICE,
         )
 
 
-class ConfigurationParsingProblem(Problem):
+class EdenCheckoutCorruption(Problem):
     def __init__(self, checkout: CheckoutInfo, ex: Exception) -> None:
-        super().__init__(f"error parsing the configuration for {checkout.path}: {ex}")
+        remediation = f"""\
+To recover, you will need to remove and reclone the repo.
+You will lose uncommitted work or shelves, but all your local
+commits are safe.
+
+To remove the corrupted repo, run: `eden rm {checkout.path}`"""
+        if get_doctor_link():
+            remediation += f"\nFor additional info see the wiki at {get_doctor_link()}"
+
+        super().__init__(
+            f"Eden's checkout state for {checkout.path} has been corrupted: {ex}",
+            remediation=remediation,
+        )
 
 
 def check_mount(
@@ -684,7 +753,13 @@ def check_running_mount(
     try:
         config = checkout.get_config()
     except Exception as ex:
-        tracker.add_problem(ConfigurationParsingProblem(checkout_info, ex))
+        # Config file is missing or invalid
+        tracker.add_problem(
+            EdenCheckoutCorruption(
+                checkout_info,
+                ex,
+            )
+        )
         # Just skip the remaining checks.
         # Most of them rely on values from the configuration.
         return
@@ -736,6 +811,10 @@ def check_running_mount(
     if config.scm_type in ["hg", "filteredhg"]:
         try:
             check_hg.check_hg(tracker, checkout)
+        except RuntimeError as ex:
+            tracker.add_problem(EdenCheckoutCorruption(checkout_info, ex))
+            # Exit here but don't reraise since we're already reporting a problem.
+            return
         except Exception as ex:
             raise RuntimeError("Failed to check Mercurial status") from ex
 
@@ -743,6 +822,12 @@ def check_running_mount(
             check_filesystems.check_hg_status_match_hg_diff(tracker, instance, checkout)
         except Exception as ex:
             raise RuntimeError("Failed to compare `hg status` with `hg diff`") from ex
+
+        try:
+            if not fast:
+                check_network.check_network(tracker, checkout)
+        except Exception as ex:
+            raise RuntimeError("Failed to check network for mount") from ex
 
 
 class CheckoutNotConfigured(Problem):
@@ -859,6 +944,32 @@ Failed to remount this mount with error:
             else:
                 raise
 
+    def check_fix(self) -> bool:
+        """
+        Check that mount return value is 1(already mounted) when rerunning command
+        """
+        try:
+            mount_value = self._instance.mount(str(self._mount_path), False)
+        except Exception as ex:
+            """
+            This should only happen if the mount becomes corrupted
+            between the time of the remount and the time of the check.
+            """
+            self._out.write(
+                f"\nAttempt to fix missing mount failed: {ex}.\n",
+                flush=True,
+            )
+            return False
+        if mount_value == 1:
+            return True
+        elif mount_value == 0:
+            """
+            This should only happen if the mount somehow gets unmounted
+            between the time of the remount and the time of the check.
+            """
+            return True
+        return False
+
 
 class StaleWorkingDirectory(Problem):
     def __init__(self, msg: str) -> None:
@@ -923,10 +1034,12 @@ The version of EdenFS that is running on your machine is:
     {running_version}
 This version is known to have issue:
     {reasons_string}
-
-Run `edenfsctl restart{"" if sys.platform == "win32" else " --graceful"}` to migrate to the newer version to avoid these issues.
 """
-        super().__init__(dedent(help_string), severity=ProblemSeverity.ADVICE)
+
+        remediation_string = 'Run `edenfsctl restart{"" if sys.platform == "win32" else " --graceful"}` to migrate to the newer version to avoid these issues.'
+        super().__init__(
+            dedent(help_string), remediation_string, severity=ProblemSeverity.ADVICE
+        )
 
 
 class OutOfDateVersion(Problem):
@@ -936,11 +1049,16 @@ The version of EdenFS that is installed on your machine is:
     {installed_version}
 but the version of EdenFS that is currently running is:
     {running_version}
+"""
 
-Consider running `edenfsctl restart --graceful` to migrate to the newer version,
+        remediation_string = """Consider running `edenfsctl restart --graceful` to migrate to the newer version,
 which may have important bug fixes or performance improvements.
 """
-        super().__init__(dedent(help_string), severity=ProblemSeverity.ADVICE)
+        super().__init__(
+            dedent(help_string),
+            dedent(remediation_string),
+            severity=ProblemSeverity.ADVICE,
+        )
 
 
 def check_edenfs_version(tracker: ProblemTracker, instance: EdenInstance) -> None:

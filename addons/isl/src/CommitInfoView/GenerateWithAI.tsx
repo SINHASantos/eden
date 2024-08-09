@@ -9,12 +9,8 @@ import type {Result} from '../types';
 import type {RefObject} from 'react';
 import type {Comparison} from 'shared/Comparison';
 
-import {ErrorNotice} from '../ErrorNotice';
 import {Internal} from '../Internal';
-import {Tooltip} from '../Tooltip';
 import {tracker} from '../analytics';
-import {Button} from '../components/Button';
-import {TextArea} from '../components/TextArea';
 import {useFeatureFlagSync} from '../featureFlags';
 import {T, t} from '../i18n';
 import {atomFamilyWeak, atomLoadableWithRefresh, readAtom} from '../jotaiUtils';
@@ -25,10 +21,14 @@ import {
   commitMode,
   latestCommitMessageFieldsWithEdits,
 } from './CommitInfoState';
+import {Button} from 'isl-components/Button';
+import {ErrorNotice} from 'isl-components/ErrorNotice';
+import {Icon} from 'isl-components/Icon';
+import {TextArea} from 'isl-components/TextArea';
+import {Tooltip} from 'isl-components/Tooltip';
 import {atom, useAtom, useAtomValue, useSetAtom} from 'jotai';
 import {useCallback} from 'react';
 import {ComparisonType} from 'shared/Comparison';
-import {Icon} from 'shared/Icon';
 import {useThrottledEffect} from 'shared/hooks';
 import {randomId, nullthrows} from 'shared/utils';
 

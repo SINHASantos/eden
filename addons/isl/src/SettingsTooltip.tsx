@@ -7,7 +7,6 @@
 
 import type {ThemeColor} from './theme';
 import type {PreferredSubmitCommand} from './types';
-import type {ReactNode} from 'react';
 
 import {splitSuggestionEnabled} from './CommitInfoView/SplitSuggestion';
 import {condenseObsoleteStacks} from './CommitTreeList';
@@ -16,18 +15,13 @@ import {confirmShouldSubmitEnabledAtom} from './ConfirmSubmitStack';
 import {DropdownField, DropdownFields} from './DropdownFields';
 import {useShowKeyboardShortcutsHelp} from './ISLShortcuts';
 import {Internal} from './Internal';
-import {Kbd} from './Kbd';
 import {Link} from './Link';
 import {RestackBehaviorSetting} from './RestackBehavior';
-import {Subtle} from './Subtle';
-import {Tooltip} from './Tooltip';
+import {Setting} from './Setting';
 import {codeReviewProvider} from './codeReview/CodeReviewInfo';
 import {showDiffNumberConfig} from './codeReview/DiffBadge';
 import {SubmitAsDraftCheckbox} from './codeReview/DraftCheckbox';
 import {overrideDisabledSubmitModes} from './codeReview/github/branchPrState';
-import {Button} from './components/Button';
-import {Checkbox} from './components/Checkbox';
-import {Dropdown} from './components/Dropdown';
 import GatedComponent from './components/GatedComponent';
 import {debugToolsEnabledState} from './debug/DebugToolsState';
 import {externalMergeToolAtom} from './externalMergeTool';
@@ -40,8 +34,15 @@ import platform from './platform';
 import {renderCompactAtom, useZoomShortcut, zoomUISettingAtom} from './responsive';
 import {repositoryInfo} from './serverAPIState';
 import {useThemeShortcut, themeState} from './theme';
+import {Button} from 'isl-components/Button';
+import {Checkbox} from 'isl-components/Checkbox';
+import {Dropdown} from 'isl-components/Dropdown';
+import {Icon} from 'isl-components/Icon';
+import {Kbd} from 'isl-components/Kbd';
+import {Subtle} from 'isl-components/Subtle';
+import {Tooltip} from 'isl-components/Tooltip';
 import {useAtom, useAtomValue} from 'jotai';
-import {Icon} from 'shared/Icon';
+import {Suspense} from 'react';
 import {KeyCode, Modifier} from 'shared/KeyboardShortcuts';
 import {tryJsonParse, nullthrows} from 'shared/utils';
 
@@ -195,6 +196,7 @@ function SettingsDropdown({
           </Column>
         </Setting>
       )}
+      <Suspense>{platform.Settings == null ? null : <platform.Settings />}</Suspense>
       <DebugToolsField />
     </DropdownFields>
   );
@@ -443,23 +445,6 @@ function DebugToolsField() {
           </Checkbox>
         )}
       </Column>
-    </DropdownField>
-  );
-}
-
-function Setting({
-  children,
-  title,
-  description,
-}: {
-  children: ReactNode;
-  title: ReactNode;
-  description?: ReactNode;
-}) {
-  return (
-    <DropdownField title={title}>
-      {description && <div className="setting-description">{description}</div>}
-      {children}
     </DropdownField>
   );
 }

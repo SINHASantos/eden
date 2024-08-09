@@ -16,6 +16,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use anyhow::anyhow;
 use dag::ops::DagAddHeads;
 use dag::ops::DagPersistent;
 use dag::Dag;
@@ -24,6 +25,7 @@ use dag::Vertex;
 use dag::VertexListWithOptions;
 use futures::lock::Mutex;
 use futures::lock::MutexGuard;
+use hgstore::split_hg_file_metadata;
 use manifest_tree::FileType;
 use manifest_tree::Flag;
 use manifest_tree::TreeEntry;
@@ -34,11 +36,26 @@ use mutationstore::MutationStore;
 use parking_lot::lock_api::RwLockReadGuard;
 use parking_lot::RawRwLock;
 use parking_lot::RwLock;
+use sha1::Digest;
+use sha1::Sha1;
+use storemodel::types::AugmentedDirectoryNode;
+use storemodel::types::AugmentedFileNode;
+use storemodel::types::AugmentedTree;
+use storemodel::types::AugmentedTreeEntry;
+use storemodel::types::AugmentedTreeWithDigest;
+use storemodel::types::CasDigest;
+use storemodel::types::HgId;
+use storemodel::types::Parents;
+use storemodel::types::RepoPathBuf;
+use storemodel::FileAuxData;
 use storemodel::SerializationFormat;
 use zstore::Id20;
 use zstore::Zstore;
 
 use crate::Result;
+
+const HG_PARENTS_LEN: usize = HgId::len() * 2;
+const HG_LEN: usize = HgId::len();
 
 /// Non-lazy, pure Rust, local repo implementation.
 ///
@@ -149,9 +166,51 @@ impl EagerRepoStore {
         }
     }
 
+    /// Read CAS data for digest.
+    #[tracing::instrument(skip(self), level = "trace")]
+    pub fn get_cas_blob(&self, digest: CasDigest) -> Result<Option<Bytes>> {
+        let Some(pointer_data) = self.get_sha1_blob(digest_id(digest))? else {
+            tracing::trace!("no CAS pointer data");
+            return Ok(None);
+        };
+
+        let pointer = CasPointer::deserialize(&pointer_data)?;
+        tracing::trace!("found CAS pointer {pointer:?}");
+
+        match CasPointer::deserialize(&pointer_data)? {
+            CasPointer::Tree(id) => {
+                // We store data for AugmentedTreeWithDigest, but we want to return data for AugmentedTree.
+                // Strip off the first line (which is the digest).
+                self.get_sha1_blob(augmented_id(id)).and_then(|blob| {
+                    tracing::trace!("found CAS tree data");
+                    blob.map(|blob| {
+                        if let Some(idx) = blob.as_ref().iter().position(|&b| b == b'\n') {
+                            Ok(blob.slice(idx + 1..))
+                        } else {
+                            Err(anyhow!("augmented tree data has no newline?").into())
+                        }
+                    })
+                    .transpose()
+                })
+            }
+            CasPointer::File(id) => match self.get_content(id)? {
+                Some(data) => {
+                    tracing::trace!("found CAS file data");
+                    Ok(Some(split_hg_file_metadata(&data).0))
+                }
+                None => Ok(None),
+            },
+        }
+    }
+
+    /// Read SHA1 blob from zstore for augmented data.
+    pub fn get_augmented_blob(&self, id: Id20) -> Result<Option<Bytes>> {
+        self.get_sha1_blob(augmented_id(id))
+    }
+
     /// Check files and trees referenced by the `id` are present.
     /// Missing paths are pushed to `missing`.
-    fn find_missing_references<'a>(
+    fn find_missing_references(
         &self,
         id: Id20,
         flag: Flag,
@@ -362,6 +421,134 @@ impl EagerRepo {
         self.store.get_sha1_blob(id)
     }
 
+    /// Insert SHA1 blob to zstore for augmented trees.
+    /// These blobs are not content addressed
+    pub fn add_augmented_tree_blob(&self, id: Id20, digest: CasDigest, data: &[u8]) -> Result<()> {
+        self.store.add_arbitrary_blob(augmented_id(id), data)?;
+        // Store a mapping from CasDigest to hg id so we can query augmented data by CasDigest.
+        self.add_cas_mapping(digest, CasPointer::Tree(id))
+    }
+
+    fn add_cas_mapping(&self, digest: CasDigest, pointer: CasPointer) -> Result<()> {
+        tracing::trace!("adding CAS mapping from {digest:?} to {pointer:?}");
+        self.store
+            .add_arbitrary_blob(digest_id(digest), &pointer.serialize())
+    }
+
+    /// Extract parents out of a SHA1 manifest blob, returns the remaining data.
+    fn extract_parents_from_tree_data(data: Bytes) -> Result<(Parents, Bytes)> {
+        let p2 = HgId::from_slice(&data[..HG_LEN]).map_err(anyhow::Error::from)?;
+        let p1 = HgId::from_slice(&data[HG_LEN..HG_PARENTS_LEN]).map_err(anyhow::Error::from)?;
+        Ok((Parents::new(p1, p2), data.slice(HG_PARENTS_LEN..)))
+    }
+
+    /// Parse a file blob into raw data and copy_from metadata.
+    fn parse_file_blob(data: Bytes) -> (Bytes, Bytes) {
+        // drop the p1/p2 info
+        let data = data.slice(HG_PARENTS_LEN..);
+        let (raw_data, copy_from) = hgstore::split_hg_file_metadata(&data);
+        (raw_data, copy_from)
+    }
+
+    /// Calculate augmented trees recursively
+    pub fn derive_augmented_tree_recursively(&self, id: Id20) -> Result<Option<Bytes>> {
+        match self.store.get_augmented_blob(id)? {
+            Some(t) => Ok(Some(t)),
+            None => {
+                let sapling_manifest = self.get_sha1_blob(id)?;
+                if sapling_manifest.is_none() {
+                    // Can't really calculate because corresponding sapling manifest is missing
+                    return Ok(None);
+                }
+                let sapling_manifest = sapling_manifest.unwrap();
+                let (parents, data) = Self::extract_parents_from_tree_data(sapling_manifest)?;
+                let tree_entry = manifest_tree::TreeEntry(data, SerializationFormat::Hg);
+                let mut entries: Vec<(RepoPathBuf, AugmentedTreeEntry)> = Vec::new();
+                for child in tree_entry.elements() {
+                    let child = child?;
+                    let hgid = child.hgid;
+                    let entry: AugmentedTreeEntry = match child.flag {
+                        Flag::Directory => {
+                            let subtree_bytes = self.derive_augmented_tree_recursively(hgid)?;
+                            if subtree_bytes.is_none() {
+                                return Ok(None); // Can't calculate because subtree's data is missing.
+                            }
+                            let CasDigest { hash, size } =
+                                AugmentedTreeWithDigest::try_deserialize_digest(
+                                    &mut std::io::Cursor::new(subtree_bytes.unwrap()),
+                                )?;
+                            AugmentedTreeEntry::DirectoryNode(AugmentedDirectoryNode {
+                                treenode: hgid,
+                                augmented_manifest_id: hash,
+                                augmented_manifest_size: size,
+                            })
+                        }
+                        Flag::File(file_type) => {
+                            let bytes = self.get_sha1_blob(hgid)?;
+                            if bytes.is_none() {
+                                return Ok(None); // Can't calculate because file is missing.
+                            }
+                            let (raw_data, copy_from) = Self::parse_file_blob(bytes.unwrap());
+                            let aux_data = FileAuxData::from_content(&raw_data);
+
+                            // Store a mapping from CasDigest to hg id so we can query augmented data by CasDigest.
+                            self.add_cas_mapping(
+                                CasDigest {
+                                    hash: aux_data.blake3,
+                                    size: aux_data.total_size,
+                                },
+                                CasPointer::File(hgid),
+                            )?;
+
+                            AugmentedTreeEntry::FileNode(AugmentedFileNode {
+                                file_type,
+                                filenode: hgid,
+                                content_blake3: aux_data.blake3,
+                                content_sha1: aux_data.sha1,
+                                total_size: aux_data.total_size,
+                                file_header_metadata: if copy_from.is_empty() {
+                                    None
+                                } else {
+                                    Some(copy_from)
+                                },
+                            })
+                        }
+                    };
+                    let path = RepoPathBuf::from_string(child.component.to_string())
+                        .map_err(anyhow::Error::from)?;
+                    entries.push((path, entry));
+                }
+
+                let aug_tree = AugmentedTree {
+                    hg_node_id: id,
+                    computed_hg_node_id: None,
+                    p1: parents.p1().copied(),
+                    p2: parents.p2().copied(),
+                    entries,
+                };
+
+                let digest = aug_tree.compute_content_addressed_digest()?;
+
+                let aug_tree_with_digest = AugmentedTreeWithDigest {
+                    augmented_manifest_id: digest.hash,
+                    augmented_manifest_size: digest.size,
+                    augmented_tree: aug_tree,
+                };
+
+                let mut buf: Vec<u8> =
+                    Vec::with_capacity(aug_tree_with_digest.serialized_tree_blob_size());
+                aug_tree_with_digest
+                    .try_serialize(&mut buf)
+                    .expect("writing failed");
+
+                // Store the augmented tree in zstore
+                self.add_augmented_tree_blob(id, digest, &buf)?;
+
+                Ok(Some(Bytes::from(buf)))
+            }
+        }
+    }
+
     /// Insert a commit. Return the commit hash.
     pub async fn add_commit(&self, parents: &[Id20], raw_text: &[u8]) -> Result<Id20> {
         let parents: Vec<Vertex> = parents
@@ -476,6 +663,60 @@ impl EagerRepo {
     /// Obtain an instance to the store.
     pub fn store(&self) -> EagerRepoStore {
         self.store.clone()
+    }
+}
+
+// Hash something else in to differentiate augmented and non-augmented keys.
+fn augmented_id(id: Id20) -> Id20 {
+    let mut hasher = Sha1::new();
+    hasher.update(b"augmented");
+    hasher.update(id.as_ref());
+    let hash: [u8; 20] = hasher.finalize().into();
+    Id20::from_byte_array(hash)
+}
+
+fn digest_id(digest: CasDigest) -> Id20 {
+    let mut hasher = Sha1::new();
+    hasher.update(digest.hash.as_ref());
+    let hash: [u8; 20] = hasher.finalize().into();
+    Id20::from_byte_array(hash)
+}
+
+// Point to either a tree blob or file blob. Tree blobs are stored in the desired
+// augmented format, but files are stored with hg metadata prepended, so we must
+// differentiat the two.
+#[derive(Debug)]
+enum CasPointer {
+    Tree(Id20),
+    File(Id20),
+}
+
+impl CasPointer {
+    fn serialize(&self) -> Vec<u8> {
+        let mut data = Vec::with_capacity(21);
+        match self {
+            Self::File(id) => {
+                data.push(0);
+                data.extend_from_slice(id.as_ref());
+            }
+            Self::Tree(id) => {
+                data.push(1);
+                data.extend_from_slice(id.as_ref());
+            }
+        }
+        data
+    }
+
+    fn deserialize(data: &[u8]) -> Result<Self> {
+        if data.len() != 21 {
+            Err(anyhow!("bad CAS pointer length {}", data.len()).into())
+        } else {
+            match data[0] {
+                0 => Ok(Self::File(Id20::from_slice(&data[1..]).unwrap())),
+                1 => Ok(Self::Tree(Id20::from_slice(&data[1..]).unwrap())),
+                _ => Err(anyhow!("bad pointer type {}", data[0]).into()),
+            }
+        }
     }
 }
 
@@ -604,7 +845,7 @@ mod tests {
         repo.flush().await.unwrap();
 
         let repo2 = EagerRepo::open(dir).unwrap();
-        let rendered = dag::render::render_namedag(&*repo2.dag().await, |v| {
+        let rendered = dag::render::render_dag(&*repo2.dag().await, |v| {
             let id = Id20::from_slice(v.as_ref()).unwrap();
             let blob = repo2.get_sha1_blob(id).unwrap().unwrap();
             Some(String::from_utf8_lossy(&blob[Id20::len() * 2..]).to_string())

@@ -173,7 +173,10 @@ class basectx:
             cleanset = set()
         deleted, unknown, ignored = s.deleted, s.unknown, s.ignored
         deletedset = set(deleted)
-        d = mf1.diff(mf2, matcher=match)
+        dmf1, dmf2 = mf1, mf2
+        if mf1.hasgrafts():
+            dmf1, dmf2 = bindings.manifest.treemanifest.applydiffgrafts(mf1, mf2)
+        d = dmf1.diff(dmf2, matcher=match)
         for fn, value in pycompat.iteritems(d):
             if listclean:
                 cleanset.discard(fn)
@@ -1511,14 +1514,18 @@ class committablectx(basectx):
         self._extra = {}
         if extra:
             self._extra = extra.copy()
-        if "branch" not in self._extra:
-            try:
-                branch = encoding.fromlocal(self._repo.dirstate.branch())
-            except UnicodeDecodeError:
-                raise error.Abort(_("branch name not in UTF-8!"))
-            self._extra["branch"] = branch
-        if self._extra["branch"] == "":
+
+        if repo.ui.configbool("experimental", "no-branch", True):
             self._extra["branch"] = "default"
+        else:
+            if "branch" not in self._extra:
+                try:
+                    branch = encoding.fromlocal(self._repo.dirstate.branch())
+                except UnicodeDecodeError:
+                    raise error.Abort(_("branch name not in UTF-8!"))
+                self._extra["branch"] = branch
+            if self._extra["branch"] == "":
+                self._extra["branch"] = "default"
 
     def __bytes__(self):
         return encodeutf8(str(self))
@@ -2304,11 +2311,9 @@ class overlayworkingctx(committablectx):
 
         flag = self._flagfunc
         for path in self.added():
-            man[path] = addednodeid
-            man.setflag(path, flag(path))
+            man.set(path, addednodeid, flag(path))
         for path in self.modified():
-            man[path] = modifiednodeid
-            man.setflag(path, flag(path))
+            man.set(path, modifiednodeid, flag(path))
         for path in self.removed():
             del man[path]
         return man

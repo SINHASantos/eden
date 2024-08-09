@@ -8,8 +8,6 @@
 import type {CommitInfo} from '../types';
 
 import {Row} from '../ComponentUtils';
-import {ErrorBoundary} from '../ErrorNotice';
-import {Tooltip} from '../Tooltip';
 import {T, t} from '../i18n';
 import {SLOC_THRESHOLD_FOR_SPLIT_SUGGESTIONS} from '../sloc/diffStatConstants';
 import {
@@ -17,7 +15,9 @@ import {
   useFetchSignificantLinesOfCode,
 } from '../sloc/useFetchSignificantLinesOfCode';
 import * as stylex from '@stylexjs/stylex';
-import {Icon} from 'shared/Icon';
+import {ErrorBoundary} from 'isl-components/ErrorNotice';
+import {Icon} from 'isl-components/Icon';
+import {Tooltip} from 'isl-components/Tooltip';
 
 type Props = {commit: CommitInfo};
 const styles = stylex.create({
@@ -81,7 +81,7 @@ function ResolvedDiffStatsView({
           //formatting this on multiple lines to look good in the tooltip
           `Consider unselecting some of these changes.
 
-Small Diffs lead to less SEVs & quicker review times.
+Small Diffs lead to quicker review times.
 `,
         )}>
         <Icon icon="warning" color="yellow" />

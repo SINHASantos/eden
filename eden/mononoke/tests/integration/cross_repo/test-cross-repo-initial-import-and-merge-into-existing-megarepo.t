@@ -31,6 +31,22 @@
   > }
   > EOF
 
+-- Init the imported repos
+  $ IMPORTED_REPO_NAME="imported_repo"
+  $ REPOID="$IMPORTED_REPO_ID" REPONAME="$IMPORTED_REPO_NAME" setup_common_config "blob_files"
+  $ ANOTHER_REPO_NAME="another_repo"
+  $ REPOID="$ANOTHER_REPO_ID" REPONAME="$ANOTHER_REPO_NAME" setup_common_config "blob_files"
+
+-- Init large and small repos
+  $ GLOBALREVS_PUBLISHING_BOOKMARK=$MASTER_BOOKMARK GLOBALREVS_SMALL_REPO_ID=$SMALL_REPO_ID \
+  > REPOID=$LARGE_REPO_ID INFINITEPUSH_ALLOW_WRITES=true REPONAME=$LARGE_REPO_NAME \
+  > setup_common_config blob_files
+  $ DISALLOW_NON_PUSHREBASE=1 GLOBALREVS_PUBLISHING_BOOKMARK=$MASTER_BOOKMARK \
+  > REPOID=$SMALL_REPO_ID REPONAME=$SMALL_REPO_NAME \
+  > setup_common_config blob_files
+  $ large_small_megarepo_config
+  $ large_small_setup
+  Adding synced mapping entry
   $ setup_configerator_configs
   $ cat > "$PUSHREDIRECT_CONF/enable" <<EOF
   > {
@@ -50,23 +66,10 @@
   >   }
   > }
   > EOF
+  $ enable_pushredirect_xdb 1 false true
+  $ enable_pushredirect_xdb 2 false false
+  $ enable_pushredirect_xdb 2 false false
 
--- Init the imported repos
-  $ IMPORTED_REPO_NAME="imported_repo"
-  $ REPOID="$IMPORTED_REPO_ID" REPONAME="$IMPORTED_REPO_NAME" setup_common_config "blob_files"
-  $ ANOTHER_REPO_NAME="another_repo"
-  $ REPOID="$ANOTHER_REPO_ID" REPONAME="$ANOTHER_REPO_NAME" setup_common_config "blob_files"
-
--- Init large and small repos
-  $ GLOBALREVS_PUBLISHING_BOOKMARK=$MASTER_BOOKMARK GLOBALREVS_SMALL_REPO_ID=$SMALL_REPO_ID \
-  > REPOID=$LARGE_REPO_ID INFINITEPUSH_ALLOW_WRITES=true REPONAME=$LARGE_REPO_NAME \
-  > setup_common_config blob_files
-  $ DISALLOW_NON_PUSHREBASE=1 GLOBALREVS_PUBLISHING_BOOKMARK=$MASTER_BOOKMARK \
-  > REPOID=$SMALL_REPO_ID REPONAME=$SMALL_REPO_NAME \
-  > setup_common_config blob_files
-  $ large_small_megarepo_config
-  $ large_small_setup
-  Adding synced mapping entry
   $ start_large_small_repo
   Starting Mononoke server
   $ init_local_large_small_clones
@@ -135,12 +138,14 @@ Before config change
 
   $ with_stripped_logs mononoke_x_repo_sync "$IMPORTED_REPO_ID"  "$LARGE_REPO_ID" initial-import -i "$IC" --version-name "imported_noop"
   Starting session with id * (glob)
+  Starting up X Repo Sync from small repo imported_repo to large repo large-mon
   Checking if 65f0b76c034d87adf7dac6f0b5a5442ab3f62edda21adb8e8ec57d1a99fb5905 is already synced 2->0
   Syncing 65f0b76c034d87adf7dac6f0b5a5442ab3f62edda21adb8e8ec57d1a99fb5905 for inital import
   Source repo: imported_repo / Target repo: large-mon
   Found 3 unsynced ancestors
   changeset 65f0b76c034d87adf7dac6f0b5a5442ab3f62edda21adb8e8ec57d1a99fb5905 synced as ecc8ec74d00988653ae64ebf206a9ed42898449125b91f59ecd1d8a0a93f4a97 in *ms (glob)
   successful sync of head 65f0b76c034d87adf7dac6f0b5a5442ab3f62edda21adb8e8ec57d1a99fb5905
+  X Repo Sync execution finished from small repo imported_repo to large repo large-mon
 
   $ mononoke_newadmin fetch -R $LARGE_REPO_NAME  -i ecc8ec74d00988653ae64ebf206a9ed42898449125b91f59ecd1d8a0a93f4a97 --json | jq .parents
   [
@@ -227,6 +232,7 @@ Before config change
   $ PREV_BOOK_VALUE=$(get_bookmark_value_edenapi $SMALL_REPO_NAME $MASTER_BOOKMARK)
   $ with_stripped_logs mononoke_x_repo_sync "$IMPORTED_REPO_ID"  "$LARGE_REPO_ID" once --commit "$ID" --unsafe-change-version-to "new_version" --target-bookmark $MASTER_BOOKMARK
   Starting session with id * (glob)
+  Starting up X Repo Sync from small repo imported_repo to large repo large-mon
   changeset resolved as: ChangesetId(Blake2(a14dee507f7605083e9a99901971ac7c5558d8b28d7d01090bd2cff2432fa707))
   Checking if a14dee507f7605083e9a99901971ac7c5558d8b28d7d01090bd2cff2432fa707 is already synced 2->0
   Changing mapping version during pushrebase to new_version
@@ -236,6 +242,7 @@ Before config change
   syncing a14dee507f7605083e9a99901971ac7c5558d8b28d7d01090bd2cff2432fa707 via pushrebase for master_bookmark
   changeset a14dee507f7605083e9a99901971ac7c5558d8b28d7d01090bd2cff2432fa707 synced as 402c52f0f2156a83bf5354aae35c3cae55e92b23da3ed61bc10ee7960e172c8e in *ms (glob)
   successful sync
+  X Repo Sync execution finished from small repo imported_repo to large repo large-mon
   $ wait_for_bookmark_move_away_edenapi $SMALL_REPO_NAME $MASTER_BOOKMARK  "$PREV_BOOK_VALUE"
 
   $ cd "$TESTTMP/small-hg-client"
@@ -320,12 +327,14 @@ Before config change
 
   $ with_stripped_logs mononoke_x_repo_sync "$ANOTHER_REPO_ID"  "$LARGE_REPO_ID" initial-import -i "$AC" --version-name "another_noop"
   Starting session with id * (glob)
+  Starting up X Repo Sync from small repo another_repo to large repo large-mon
   Checking if 156943c35cda314d72b0177b06d5edf3c92dc9c9505d7b3171b9230f7c1768bb is already synced 3->0
   Syncing 156943c35cda314d72b0177b06d5edf3c92dc9c9505d7b3171b9230f7c1768bb for inital import
   Source repo: another_repo / Target repo: large-mon
   Found 3 unsynced ancestors
   changeset 156943c35cda314d72b0177b06d5edf3c92dc9c9505d7b3171b9230f7c1768bb synced as 0a9797a0fa6b3284b9d73ec43357f06a9b00d6fa402122d1bbfbeac16e3a2c39 in *ms (glob)
   successful sync of head 156943c35cda314d72b0177b06d5edf3c92dc9c9505d7b3171b9230f7c1768bb
+  X Repo Sync execution finished from small repo another_repo to large repo large-mon
 
   $ mononoke_newadmin fetch -R $LARGE_REPO_NAME  -i 0a9797a0fa6b3284b9d73ec43357f06a9b00d6fa402122d1bbfbeac16e3a2c39 --json | jq .parents
   [
@@ -369,6 +378,7 @@ Before config change
   $ PREV_BOOK_VALUE=$(get_bookmark_value_edenapi $SMALL_REPO_NAME $MASTER_BOOKMARK)
   $ with_stripped_logs mononoke_x_repo_sync "$ANOTHER_REPO_ID"  "$LARGE_REPO_ID" once --commit "$AD" --unsafe-change-version-to "another_version" --target-bookmark $MASTER_BOOKMARK
   Starting session with id * (glob)
+  Starting up X Repo Sync from small repo another_repo to large repo large-mon
   changeset resolved as: ChangesetId(Blake2(1d0bbdb162c2887a5b93893d7a48fd852a304ab58be2245899bb795e80aa10e9))
   Checking if 1d0bbdb162c2887a5b93893d7a48fd852a304ab58be2245899bb795e80aa10e9 is already synced 3->0
   Changing mapping version during pushrebase to another_version
@@ -378,6 +388,7 @@ Before config change
   syncing 1d0bbdb162c2887a5b93893d7a48fd852a304ab58be2245899bb795e80aa10e9 via pushrebase for master_bookmark
   changeset 1d0bbdb162c2887a5b93893d7a48fd852a304ab58be2245899bb795e80aa10e9 synced as 76b08a5702ff09571621ca88b107d886963d2c8265f508edc6e4d8f95777fd3e in *ms (glob)
   successful sync
+  X Repo Sync execution finished from small repo another_repo to large repo large-mon
   $ wait_for_bookmark_move_away_edenapi $SMALL_REPO_NAME $MASTER_BOOKMARK  "$PREV_BOOK_VALUE"
 
   $ PREV_BOOK_VALUE=$(get_bookmark_value_edenapi "$IMPORTED_REPO_NAME" heads/$MASTER_BOOKMARK)
@@ -390,7 +401,7 @@ Before config change
   IH=390213545a07b8f0b3452f97e862443d56b58375
   II=6738aefcbd6e1d868fa73a489b55aab543fd0c53
   $ wait_for_bookmark_move_away_edenapi "$IMPORTED_REPO_NAME" heads/$MASTER_BOOKMARK  "$PREV_BOOK_VALUE"
-  $ quiet with_stripped_logs mononoke_x_repo_sync "$IMPORTED_REPO_ID"  "$LARGE_REPO_ID" tail --bookmark-regex "heads/$MASTER_BOOKMARK" --catch-up-once 
+  $ quiet with_stripped_logs mononoke_x_repo_sync "$IMPORTED_REPO_ID"  "$LARGE_REPO_ID" tail --bookmark-regex "heads/$MASTER_BOOKMARK" --catch-up-once
 
   $ FINAL_BOOK_VALUE=$(x_repo_lookup $IMPORTED_REPO_NAME $LARGE_REPO_NAME $II)
 
@@ -482,7 +493,7 @@ so they'll be dumped to files to keep this (already long) integration test short
 -- wait a second to give backsyncer some time to catch up
   $ wait_for_bookmark_move_away_edenapi $SMALL_REPO_NAME $MASTER_BOOKMARK  "$PREV_BOOK_VALUE"
 
--- Check if changes were backsynced properly  
+-- Check if changes were backsynced properly
   $ cd "$TESTTMP/small-hg-client"
   $ REPONAME=$SMALL_REPO_NAME hgmn pull -q
   $ log_globalrev -l 10

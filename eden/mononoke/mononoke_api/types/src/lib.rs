@@ -15,13 +15,13 @@ use bonsai_svnrev_mapping::BonsaiSvnrevMapping;
 use bonsai_tag_mapping::BonsaiTagMapping;
 use bookmarks::BookmarkUpdateLog;
 use bookmarks::Bookmarks;
-use changeset_fetcher::ChangesetFetcher;
-use changesets::Changesets;
 use commit_cloud::CommitCloud;
 use commit_graph::CommitGraph;
+use commit_graph::CommitGraphWriter;
 use ephemeral_blobstore::RepoEphemeralStore;
 use filenodes::Filenodes;
 use filestore::FilestoreConfig;
+use git_push_redirect::GitPushRedirectConfig;
 use git_symbolic_refs::GitSymbolicRefs;
 use mercurial_mutation::HgMutationStore;
 use metaconfig_types::RepoConfig;
@@ -37,7 +37,7 @@ use repo_identity::RepoIdentity;
 use repo_lock::RepoLock;
 use repo_permission_checker::RepoPermissionChecker;
 use repo_sparse_profiles::RepoSparseProfiles;
-use segmented_changelog_types::SegmentedChangelog;
+use sql_query_config::SqlQueryConfig;
 use streaming_clone::StreamingClone;
 
 // Eventually everything inside Repo should really be here
@@ -59,8 +59,6 @@ pub struct InnerRepo {
         dyn BonsaiSvnrevMapping,
         dyn BookmarkUpdateLog,
         dyn Bookmarks,
-        dyn ChangesetFetcher,
-        dyn Changesets,
         dyn Filenodes,
         dyn Phases,
         dyn PushrebaseMutationMapping,
@@ -69,6 +67,7 @@ pub struct InnerRepo {
         dyn RepoPermissionChecker,
         dyn RepoLock,
         CommitGraph,
+        dyn CommitGraphWriter,
         dyn GitSymbolicRefs,
         CommitCloud
     )]
@@ -76,9 +75,6 @@ pub struct InnerRepo {
 
     #[facet]
     pub repo_config: RepoConfig,
-
-    #[facet]
-    pub segmented_changelog: dyn SegmentedChangelog,
 
     #[facet]
     pub ephemeral_store: RepoEphemeralStore,
@@ -97,6 +93,12 @@ pub struct InnerRepo {
 
     #[facet]
     pub streaming_clone: StreamingClone,
+
+    #[facet]
+    pub sql_query_config: SqlQueryConfig,
+
+    #[facet]
+    pub git_push_redirect_config: dyn GitPushRedirectConfig,
 }
 
 impl AsBlobRepo for InnerRepo {

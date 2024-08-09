@@ -6,13 +6,13 @@
  */
 
 import {Row} from './ComponentUtils';
-import {Tooltip} from './Tooltip';
-import {Button} from './components/Button';
 import {t, T} from './i18n';
 import {configBackedAtom} from './jotaiUtils';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
+import {Tooltip} from 'isl-components/Tooltip';
 import {useAtom} from 'jotai';
 import {useContextMenu} from 'shared/ContextMenu';
-import {Icon} from 'shared/Icon';
 import {isMac} from 'shared/OperatingSystem';
 
 export type ChangedFilesDisplayType = 'short' | 'fullPaths' | 'tree' | 'fish';

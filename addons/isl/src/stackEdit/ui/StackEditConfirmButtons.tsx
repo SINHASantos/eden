@@ -11,8 +11,6 @@ import {
   editedCommitMessages,
   getDefaultEditedCommitMessage,
 } from '../../CommitInfoView/CommitInfoState';
-import {Tooltip, DOCUMENTATION_DELAY} from '../../Tooltip';
-import {Button} from '../../components/Button';
 import {T, t} from '../../i18n';
 import {writeAtom} from '../../jotaiUtils';
 import {ImportStackOperation} from '../../operations/ImportStackOperation';
@@ -27,9 +25,11 @@ import {
   sendStackEditMetrics,
   useStackEditState,
 } from './stackEditState';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
+import {Tooltip, DOCUMENTATION_DELAY} from 'isl-components/Tooltip';
 import {useAtom, useAtomValue} from 'jotai';
 import {useCallback} from 'react';
-import {Icon} from 'shared/Icon';
 
 export function StackEditConfirmButtons(): React.ReactElement {
   const [[stackIntention], setStackIntentionHashes] = useAtom(editingStackIntentionHashes);

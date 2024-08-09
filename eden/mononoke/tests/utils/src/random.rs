@@ -11,8 +11,9 @@ use std::collections::BTreeMap;
 use anyhow::Error;
 use anyhow::Result;
 use blobstore::Storable;
-use changesets::ChangesetsRef;
 use changesets_creation::save_changesets;
+use commit_graph::CommitGraphRef;
+use commit_graph::CommitGraphWriterRef;
 use context::CoreContext;
 use futures::future;
 use futures::stream;
@@ -24,6 +25,7 @@ use mononoke_types::DateTime;
 use mononoke_types::FileChange;
 use mononoke_types::FileContents;
 use mononoke_types::FileType;
+use mononoke_types::GitLfs;
 use mononoke_types::MPathElement;
 use mononoke_types::NonRootMPath;
 use rand::seq::SliceRandom;
@@ -31,10 +33,11 @@ use rand::Rng;
 use rand_distr::Binomial;
 use rand_distr::Uniform;
 use repo_blobstore::RepoBlobstoreRef;
+use repo_identity::RepoIdentityRef;
 
 pub async fn create_random_stack(
     ctx: &CoreContext,
-    repo: &(impl RepoBlobstoreRef + ChangesetsRef),
+    repo: &(impl RepoBlobstoreRef + CommitGraphRef + CommitGraphWriterRef + RepoIdentityRef),
     rng: &mut impl Rng,
     parent: Option<ChangesetId>,
     changes_count: impl IntoIterator<Item = usize>,
@@ -110,7 +113,7 @@ impl GenManifest {
     async fn gen_stack(
         &mut self,
         ctx: &CoreContext,
-        repo: &(impl RepoBlobstoreRef + ChangesetsRef),
+        repo: &(impl RepoBlobstoreRef + CommitGraphRef + CommitGraphWriterRef + RepoIdentityRef),
         rng: &mut impl Rng,
         settings: &GenSettings,
         parent: Option<ChangesetId>,
@@ -138,7 +141,13 @@ impl GenManifest {
                             store_changes.push(blob.store(ctx, blobstore));
                             file_changes.insert(
                                 path,
-                                FileChange::tracked(id, FileType::Regular, size, None),
+                                FileChange::tracked(
+                                    id,
+                                    FileType::Regular,
+                                    size,
+                                    None,
+                                    GitLfs::FullContent,
+                                ),
                             );
                         }
                     }

@@ -266,7 +266,7 @@ async fn commit_revlog_data(
         .await
         .context(ErrorKind::CommitRevlogDataRequestFailed)?
         .ok_or(ErrorKind::HgIdNotFound(hg_id))?;
-    let answer = CommitRevlogData::new(hg_id, bytes);
+    let answer = CommitRevlogData::new(hg_id, bytes.into());
     Ok(answer)
 }
 
@@ -387,7 +387,7 @@ impl SaplingRemoteApiHandler for UploadBonsaiChangesetHandler {
             })
             .try_collect()
             .await?;
-        let cs_id = repo
+        let (_hg_extra, cs_ctx) = repo
             .repo()
             .create_changeset(
                 parents,
@@ -416,8 +416,9 @@ impl SaplingRemoteApiHandler for UploadBonsaiChangesetHandler {
                 .as_ref(),
             )
             .await
-            .with_context(|| anyhow!("When creating bonsai changeset"))?
-            .id();
+            .with_context(|| anyhow!("When creating bonsai changeset"))?;
+
+        let cs_id = cs_ctx.id();
 
         Ok(stream::once(async move {
             Ok(UploadTokensResponse {

@@ -370,7 +370,7 @@ class InstallSysDepsCmd(ProjectCmdBase):
         parser.add_argument(
             "--os-type",
             help="Filter to just this OS type to run",
-            choices=["linux", "darwin", "windows"],
+            choices=["linux", "darwin", "windows", "pacman-package"],
             action="store",
             dest="ostype",
             default=None,
@@ -440,7 +440,10 @@ class InstallSysDepsCmd(ProjectCmdBase):
             packages = sorted(set(all_packages["homebrew"]))
             if packages:
                 cmd_args = ["brew", "install"] + packages
-
+        elif manager == "pacman-package":
+            packages = sorted(list(set(all_packages["pacman-package"])))
+            if packages:
+                cmd_args = ["pacman", "-S"] + packages
         else:
             host_tuple = loader.build_opts.host_type.as_tuple_string()
             print(
@@ -844,14 +847,20 @@ class FixupDeps(ProjectCmdBase):
         # Accumulate the install directories so that the build steps
         # can find their dep installation
         install_dirs = []
+        dep_manifests = []
 
         for m in projects:
             inst_dir = loader.get_project_install_dir_respecting_install_prefix(m)
             install_dirs.append(inst_dir)
+            dep_manifests.append(m)
 
             if m == manifest:
+                ctx = loader.ctx_gen.get_context(m.name)
+                env = loader.build_opts.compute_env_for_install_dirs(
+                    loader, dep_manifests, ctx
+                )
                 dep_munger = create_dyn_dep_munger(
-                    loader.build_opts, install_dirs, args.strip
+                    loader.build_opts, env, install_dirs, args.strip
                 )
                 if dep_munger is None:
                     print(f"dynamic dependency fixups not supported on {sys.platform}")

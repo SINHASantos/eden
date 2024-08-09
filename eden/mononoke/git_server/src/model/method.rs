@@ -9,23 +9,29 @@ use std::fmt;
 
 use gotham_derive::StateData;
 
+use crate::command::Command;
+
 /// Enum representing the method (and the corresponding handler) supported by the Git Server
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum GitMethod {
+    /// Method responsible for advertising the server capabilities for git-upload-pack to the client
+    AdvertiseRead,
+    /// Method responsible for advertising the server capabilities for git-receive-pack to the client
+    AdvertiseWrite,
     /// Method responsible for performing incremental pull of the repo
     Pull,
     /// Method responsible for performing full clone of the repo
     Clone,
     /// Method responsible for listing all known refs to the client
     LsRefs,
+    /// Method responsible for pushing changes to the repo
+    Push,
 }
 
 impl GitMethod {
     /// Returns true if the method is read-only
     pub fn is_read_only(&self) -> bool {
-        // Since the current version of Mononoke Git server does not support pushes, all
-        // its methods are read-only
-        true
+        *self != Self::Push
     }
 }
 
@@ -35,6 +41,9 @@ impl fmt::Display for GitMethod {
             Self::Pull => "pull",
             Self::Clone => "clone",
             Self::LsRefs => "ls-refs",
+            Self::AdvertiseRead => "advertise-read",
+            Self::AdvertiseWrite => "advertise-write",
+            Self::Push => "push",
         };
         write!(f, "{}", name)
     }
@@ -80,5 +89,43 @@ impl GitMethodInfo {
             .map(|v| v.to_string())
             .collect::<Vec<String>>()
             .join(",")
+    }
+
+    pub fn standard(repo: String, method: GitMethod) -> Self {
+        Self {
+            repo,
+            method,
+            variants: vec![GitMethodVariant::Standard],
+        }
+    }
+
+    pub fn from_command(command: &Command, repo: String) -> Self {
+        let (method, variants) = match command {
+            Command::LsRefs(_) => (GitMethod::LsRefs, vec![GitMethodVariant::Standard]),
+            Command::Fetch(ref fetch_args) => {
+                let method = if fetch_args.haves.is_empty() && fetch_args.done {
+                    GitMethod::Clone
+                } else {
+                    GitMethod::Pull
+                };
+                let mut variants = vec![];
+                if fetch_args.is_shallow() {
+                    variants.push(GitMethodVariant::Shallow);
+                }
+                if fetch_args.is_filter() {
+                    variants.push(GitMethodVariant::Filter);
+                }
+                if variants.is_empty() {
+                    variants.push(GitMethodVariant::Standard);
+                }
+                (method, variants)
+            }
+            Command::Push(_) => (GitMethod::Push, vec![GitMethodVariant::Standard]),
+        };
+        GitMethodInfo {
+            method,
+            variants,
+            repo,
+        }
     }
 }

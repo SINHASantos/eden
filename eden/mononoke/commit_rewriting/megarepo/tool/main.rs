@@ -13,8 +13,10 @@ use anyhow::format_err;
 use anyhow::Context;
 use anyhow::Error;
 use anyhow::Result;
+use blobstore_factory::MetadataSqlFactory;
 use bookmarks::BookmarkKey;
 use borrowed::borrowed;
+use cached_config::ConfigStore;
 use clap::ArgMatches;
 use clientinfo::ClientEntryPoint;
 use clientinfo::ClientInfo;
@@ -22,10 +24,11 @@ use cmdlib::args;
 use cmdlib::args::MononokeMatches;
 use cmdlib::helpers;
 use cmdlib_x_repo::create_commit_syncer_from_matches;
-use cmdlib_x_repo::get_all_possible_small_repo_submodule_deps_from_matches;
+use cmdlib_x_repo::repo_provider_from_matches;
 use context::CoreContext;
 use cross_repo_sync::create_commit_syncer_lease;
 use cross_repo_sync::find_toposorted_unsynced_ancestors;
+use cross_repo_sync::get_all_submodule_deps;
 use cross_repo_sync::verify_working_copy_with_version;
 use cross_repo_sync::CandidateSelectionHint;
 use cross_repo_sync::CommitSyncContext;
@@ -34,7 +37,6 @@ use cross_repo_sync::CommitSyncer;
 use cross_repo_sync::ConcreteRepo as CrossRepo;
 use cross_repo_sync::Source;
 use cross_repo_sync::Target;
-use derived_data::BonsaiDerived;
 use fbinit::FacebookInit;
 use fsnodes::RootFsnodeId;
 use futures::compat::Future01CompatExt;
@@ -57,6 +59,7 @@ use mononoke_types::NonRootMPath;
 use mononoke_types::RepositoryId;
 use movers::get_small_to_large_mover;
 use movers::Mover;
+use pushredirect::SqlPushRedirectionConfigBuilder;
 use regex::Regex;
 use repo_blobstore::RepoBlobstoreRef;
 use repo_identity::RepoIdentityRef;
@@ -67,6 +70,7 @@ use sql_ext::facebook::MyAdmin;
 use sql_ext::replication::NoReplicaLagMonitor;
 use sql_ext::replication::ReplicaLagMonitor;
 use sql_ext::replication::WaitForReplicationConfig;
+use sql_query_config::SqlQueryConfig;
 use synced_commit_mapping::EquivalentWorkingCopyEntry;
 use synced_commit_mapping::SqlSyncedCommitMapping;
 use synced_commit_mapping::SyncedCommitMapping;
@@ -89,9 +93,8 @@ use bonsai_globalrev_mapping::BonsaiGlobalrevMapping;
 use bonsai_hg_mapping::BonsaiHgMapping;
 use bookmarks::BookmarkUpdateLog;
 use bookmarks::Bookmarks;
-use changeset_fetcher::ChangesetFetcher;
-use changesets::Changesets;
 use commit_graph::CommitGraph;
+use commit_graph::CommitGraphWriter;
 use filenodes::Filenodes;
 use filestore::FilestoreConfig;
 use megarepolib::chunking::even_chunker_with_max_size;
@@ -117,6 +120,7 @@ use repo_blobstore::RepoBlobstore;
 use repo_bookmark_attrs::RepoBookmarkAttrs;
 use repo_cross_repo::RepoCrossRepo;
 use repo_derived_data::RepoDerivedData;
+use repo_derived_data::RepoDerivedDataRef;
 use repo_identity::RepoIdentity;
 
 use crate::cli::cs_args_from_matches;
@@ -190,8 +194,6 @@ pub struct Repo(
     dyn Bookmarks,
     dyn Phases,
     dyn BookmarkUpdateLog,
-    dyn Changesets,
-    dyn ChangesetFetcher,
     FilestoreConfig,
     dyn MutableCounters,
     RepoBlobstore,
@@ -199,14 +201,15 @@ pub struct Repo(
     RepoDerivedData,
     RepoIdentity,
     CommitGraph,
+    dyn CommitGraphWriter,
     dyn Filenodes,
+    SqlQueryConfig,
 );
 
 async fn run_move<'a>(
     ctx: &CoreContext,
     matches: &MononokeMatches<'a>,
     sub_m: &ArgMatches<'a>,
-    live_commit_sync_config: CfgrLiveCommitSyncConfig,
 ) -> Result<(), Error> {
     let origin_repo =
         RepositoryId::new(args::get_i32_opt(sub_m, ORIGIN_REPO).expect("Origin repo is missing"));
@@ -217,6 +220,11 @@ async fn run_move<'a>(
         .value_of(MAPPING_VERSION_NAME)
         .ok_or_else(|| format_err!("mapping-version-name is not specified"))?;
     let mapping_version = CommitSyncConfigVersion(mapping_version_name.to_string());
+
+    let live_commit_sync_config =
+        get_live_commit_sync_config(ctx, ctx.fb, matches, matches.config_store(), origin_repo)
+            .await
+            .context("building live_commit_sync_config")?;
 
     let commit_sync_config = live_commit_sync_config
         .get_commit_sync_config_by_version(origin_repo, &mapping_version)
@@ -330,25 +338,38 @@ async fn run_sync_diamond_merge<'a>(
 
     let source_merge_cs_id = helpers::csid_resolve(ctx, &source_repo, merge_commit_hash).await?;
 
-    let config_store = matches.config_store();
-    let live_commit_sync_config = CfgrLiveCommitSyncConfig::new(ctx.logger(), config_store)?;
+    let live_commit_sync_config = get_live_commit_sync_config(
+        ctx,
+        ctx.fb,
+        matches,
+        config_store,
+        source_repo.repo_identity().id(),
+    )
+    .await
+    .context("building live_commit_sync_config")?;
 
     let caching = matches.caching();
     let x_repo_syncer_lease = create_commit_syncer_lease(ctx.fb, caching)?;
 
     let live_commit_sync_config = Arc::new(live_commit_sync_config);
-    let submodule_deps = get_all_possible_small_repo_submodule_deps_from_matches(
+
+    let repo_provider = repo_provider_from_matches(ctx, matches);
+
+    let source_repo_arc = Arc::new(source_repo);
+    let target_repo_arc = Arc::new(target_repo);
+    let submodule_deps = get_all_submodule_deps(
         ctx,
-        matches,
-        &source_repo,
+        source_repo_arc.clone(),
+        target_repo_arc.clone(),
+        repo_provider,
         live_commit_sync_config.clone(),
     )
     .await?;
 
     sync_diamond_merge::do_sync_diamond_merge(
         ctx,
-        &source_repo,
-        &target_repo,
+        source_repo_arc.as_ref(),
+        target_repo_arc.as_ref(),
         submodule_deps,
         source_merge_cs_id,
         mapping,
@@ -783,7 +804,16 @@ async fn run_check_push_redirection_prereqs<'a>(
     );
 
     let config_store = matches.config_store();
-    let live_commit_sync_config = CfgrLiveCommitSyncConfig::new(ctx.logger(), config_store)?;
+    let live_commit_sync_config = get_live_commit_sync_config(
+        ctx,
+        ctx.fb,
+        matches,
+        config_store,
+        source_repo.repo_identity().id(),
+    )
+    .await
+    .context("building live_commit_sync_config")?;
+
     verify_working_copy_with_version(
         ctx,
         &commit_syncer,
@@ -850,12 +880,12 @@ async fn run_mover<'a>(
 ) -> Result<(), Error> {
     let commit_syncer = create_commit_syncer_from_matches::<CrossRepo>(ctx, matches, None).await?;
     let version = get_version(sub_m)?;
-    let mover = commit_syncer.get_mover_by_version(&version).await?;
+    let movers = commit_syncer.get_movers_by_version(&version).await?;
     let path = sub_m
         .value_of(PATH)
         .ok_or_else(|| format_err!("{} not set", PATH))?;
     let path = NonRootMPath::new(path)?;
-    println!("{:?}", mover(&path));
+    println!("{:?}", (movers.mover)(&path));
     Ok(())
 }
 
@@ -1067,8 +1097,10 @@ async fn run_diff_mapping_versions<'a>(
         .values_of(MAPPING_VERSION_NAME)
         .ok_or_else(|| format_err!("{} is supposed to be set", MAPPING_VERSION_NAME))?;
 
-    let config_store = matches.config_store();
-    let live_commit_sync_config = CfgrLiveCommitSyncConfig::new(ctx.logger(), config_store)?;
+    let live_commit_sync_config =
+        get_live_commit_sync_config(ctx, ctx.fb, matches, config_store, source_repo_id)
+            .await
+            .context("building live_commit_sync_config")?;
 
     let mut commit_sync_configs = vec![];
     for version in mapping_version_names {
@@ -1295,7 +1327,10 @@ async fn run_delete_no_longer_bound_files_from_large_repo<'a>(
 
     // Find all files under a given path
     let prefix = sub_m.value_of(PATH_PREFIX).context("prefix is not set")?;
-    let root_fsnode_id = RootFsnodeId::derive(ctx, large_repo, cs_id).await?;
+    let root_fsnode_id = large_repo
+        .repo_derived_data()
+        .derive::<RootFsnodeId>(ctx, cs_id)
+        .await?;
     let entries = root_fsnode_id
         .fsnode_id()
         .find_entries(
@@ -1359,11 +1394,39 @@ async fn find_mover_for_commit<R: cross_repo_sync::Repo>(
             ));
         }
         RewrittenAs(_, version) | EquivalentWorkingCopyAncestor(_, version) => {
-            commit_syncer.get_mover_by_version(&version).await?
+            commit_syncer.get_movers_by_version(&version).await?.mover
         }
     };
 
     Ok(mover)
+}
+
+async fn get_live_commit_sync_config(
+    ctx: &CoreContext,
+    fb: FacebookInit,
+    matches: &MononokeMatches<'_>,
+    config_store: &ConfigStore,
+    repo_id: RepositoryId,
+) -> Result<CfgrLiveCommitSyncConfig> {
+    let (_, repo_config) = args::get_config_by_repoid(config_store, matches, repo_id)?;
+
+    let sql_factory: MetadataSqlFactory = MetadataSqlFactory::new(
+        fb,
+        repo_config.storage_config.metadata.clone(),
+        matches.mysql_options().clone(),
+        *matches.readonly_storage(),
+    )
+    .await?;
+    let builder = sql_factory
+        .open::<SqlPushRedirectionConfigBuilder>()
+        .await?;
+    let push_redirection_config = builder.build(Arc::new(SqlQueryConfig { caching: None }));
+
+    CfgrLiveCommitSyncConfig::new_with_xdb(
+        ctx.logger(),
+        config_store,
+        Arc::new(push_redirection_config),
+    )
 }
 
 #[fbinit::main]
@@ -1371,7 +1434,6 @@ fn main(fb: FacebookInit) -> Result<()> {
     let app = setup_app();
     let (matches, _runtime) = app.get_matches(fb)?;
     let logger = matches.logger();
-    let config_store = matches.config_store();
     let ctx = CoreContext::new_with_logger_and_client_info(
         fb,
         logger.clone(),
@@ -1396,11 +1458,7 @@ fn main(fb: FacebookInit) -> Result<()> {
                 run_mark_not_synced(ctx, &matches, sub_m).await
             }
             (MERGE, Some(sub_m)) => run_merge(ctx, &matches, sub_m).await,
-            (MOVE, Some(sub_m)) => {
-                let live_commit_sync_config =
-                    CfgrLiveCommitSyncConfig::new(ctx.logger(), config_store)?;
-                run_move(ctx, &matches, sub_m, live_commit_sync_config).await
-            }
+            (MOVE, Some(sub_m)) => run_move(ctx, &matches, sub_m).await,
             (RUN_MOVER, Some(sub_m)) => run_mover(ctx, &matches, sub_m).await,
             (SYNC_COMMIT_AND_ANCESTORS, Some(sub_m)) => {
                 run_sync_commit_and_ancestors(ctx, &matches, sub_m).await

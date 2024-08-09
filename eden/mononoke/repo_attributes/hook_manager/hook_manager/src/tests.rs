@@ -26,6 +26,7 @@ use mononoke_types::BonsaiChangesetMut;
 use mononoke_types::DateTime;
 use mononoke_types::FileChange;
 use mononoke_types::FileType;
+use mononoke_types::GitLfs;
 use mononoke_types::NonRootMPath;
 use mononoke_types_mocks::contentid::ONES_CTID;
 use mononoke_types_mocks::contentid::THREES_CTID;
@@ -39,10 +40,10 @@ use crate::ChangesetHook;
 use crate::CrossRepoPushSource;
 use crate::FileHook;
 use crate::HookExecution;
-use crate::HookFileContentProvider;
 use crate::HookManager;
 use crate::HookRejectionInfo;
-use crate::InMemoryHookFileContentProvider;
+use crate::HookStateProvider;
+use crate::InMemoryHookStateProvider;
 use crate::PushAuthoredBy;
 
 #[derive(Clone, Debug)]
@@ -63,7 +64,7 @@ impl ChangesetHook for FnChangesetHook {
         _ctx: &'ctx CoreContext,
         _bookmark: &BookmarkKey,
         _changeset: &'cs BonsaiChangeset,
-        _content_manager: &'fetcher dyn HookFileContentProvider,
+        _content_manager: &'fetcher dyn HookStateProvider,
         _cross_repo_push_source: CrossRepoPushSource,
         _push_authored_by: PushAuthoredBy,
     ) -> Result<HookExecution, Error> {
@@ -93,7 +94,7 @@ impl ChangesetHook for FileContentMatchingChangesetHook {
         ctx: &'ctx CoreContext,
         _bookmark: &BookmarkKey,
         changeset: &'cs BonsaiChangeset,
-        content_manager: &'fetcher dyn HookFileContentProvider,
+        content_manager: &'fetcher dyn HookStateProvider,
         _cross_repo_push_source: CrossRepoPushSource,
         _push_authored_by: PushAuthoredBy,
     ) -> Result<HookExecution, Error> {
@@ -165,7 +166,7 @@ impl ChangesetHook for LengthMatchingChangesetHook {
         ctx: &'ctx CoreContext,
         _bookmark: &BookmarkKey,
         changeset: &'cs BonsaiChangeset,
-        content_manager: &'fetcher dyn HookFileContentProvider,
+        content_manager: &'fetcher dyn HookStateProvider,
         _cross_repo_push_source: CrossRepoPushSource,
         _push_authored_by: PushAuthoredBy,
     ) -> Result<HookExecution, Error> {
@@ -177,8 +178,9 @@ impl ChangesetHook for LengthMatchingChangesetHook {
                 Some(change) => {
                     let fut = async move {
                         let size = content_manager
-                            .get_file_size(ctx, change.content_id())
-                            .await?;
+                            .get_file_metadata(ctx, change.content_id())
+                            .await?
+                            .total_size;
 
                         Ok(expected_length == Some(size).as_ref())
                     };
@@ -225,7 +227,7 @@ impl FileHook for FnFileHook {
     async fn run<'this: 'change, 'ctx: 'this, 'change, 'fetcher: 'change, 'path: 'change>(
         &'this self,
         _ctx: &'ctx CoreContext,
-        _content_manager: &'fetcher dyn HookFileContentProvider,
+        _content_manager: &'fetcher dyn HookStateProvider,
         _change: Option<&'change BasicFileChange>,
         _path: &'path NonRootMPath,
         _cross_repo_push_source: CrossRepoPushSource,
@@ -255,7 +257,7 @@ impl FileHook for PathMatchingFileHook {
     async fn run<'this: 'change, 'ctx: 'this, 'change, 'fetcher: 'change, 'path: 'change>(
         &'this self,
         _ctx: &'ctx CoreContext,
-        _content_manager: &'fetcher dyn HookFileContentProvider,
+        _content_manager: &'fetcher dyn HookStateProvider,
         _change: Option<&'change BasicFileChange>,
         path: &'path NonRootMPath,
         _cross_repo_push_source: CrossRepoPushSource,
@@ -283,7 +285,7 @@ impl FileHook for FileContentMatchingFileHook {
     async fn run<'this: 'change, 'ctx: 'this, 'change, 'fetcher: 'change, 'path: 'change>(
         &'this self,
         ctx: &'ctx CoreContext,
-        content_manager: &'fetcher dyn HookFileContentProvider,
+        content_manager: &'fetcher dyn HookStateProvider,
         change: Option<&'change BasicFileChange>,
         _path: &'path NonRootMPath,
         _cross_repo_push_source: CrossRepoPushSource,
@@ -327,7 +329,7 @@ impl FileHook for IsSymLinkMatchingFileHook {
     async fn run<'this: 'change, 'ctx: 'this, 'change, 'fetcher: 'change, 'path: 'change>(
         &'this self,
         _ctx: &'ctx CoreContext,
-        _content_manager: &'fetcher dyn HookFileContentProvider,
+        _content_manager: &'fetcher dyn HookStateProvider,
         change: Option<&'change BasicFileChange>,
         _path: &'path NonRootMPath,
         _cross_repo_push_source: CrossRepoPushSource,
@@ -359,7 +361,7 @@ impl FileHook for LengthMatchingFileHook {
     async fn run<'this: 'change, 'ctx: 'this, 'change, 'fetcher: 'change, 'path: 'change>(
         &'this self,
         ctx: &'ctx CoreContext,
-        content_manager: &'fetcher dyn HookFileContentProvider,
+        content_manager: &'fetcher dyn HookStateProvider,
         change: Option<&'change BasicFileChange>,
         _path: &'path NonRootMPath,
         _cross_repo_push_source: CrossRepoPushSource,
@@ -368,8 +370,9 @@ impl FileHook for LengthMatchingFileHook {
         let length = match change {
             Some(change) => {
                 content_manager
-                    .get_file_size(ctx, change.content_id())
+                    .get_file_metadata(ctx, change.content_id())
                     .await?
+                    .total_size
             }
             None => return Ok(HookExecution::Accepted),
         };
@@ -387,7 +390,7 @@ fn length_matching_file_hook(length: u64) -> Box<dyn FileHook> {
 async fn hook_manager_inmem(fb: FacebookInit) -> HookManager {
     let ctx = CoreContext::test_mock(fb);
 
-    let mut content_manager = InMemoryHookFileContentProvider::new();
+    let mut content_manager = InMemoryHookStateProvider::new();
     content_manager.insert(ONES_CTID, "elephants");
     content_manager.insert(TWOS_CTID, "hippopatami");
     content_manager.insert(THREES_CTID, "eels");
@@ -443,9 +446,9 @@ fn default_changeset() -> BonsaiChangeset {
         git_extra_headers: None,
         git_tree_hash: None,
         file_changes: sorted_vector_map!{
-            to_mpath("dir1/subdir1/subsubdir1/file_1") => FileChange::tracked(ONES_CTID, FileType::Symlink, 15, None),
-            to_mpath("dir1/subdir1/subsubdir2/file_1") => FileChange::tracked(TWOS_CTID, FileType::Regular, 17, None),
-            to_mpath("dir1/subdir1/subsubdir2/file_2") => FileChange::tracked(THREES_CTID, FileType::Regular, 2, None),
+            to_mpath("dir1/subdir1/subsubdir1/file_1") => FileChange::tracked(ONES_CTID, FileType::Symlink, 15, None, GitLfs::FullContent),
+            to_mpath("dir1/subdir1/subsubdir2/file_1") => FileChange::tracked(TWOS_CTID, FileType::Regular, 17, None, GitLfs::FullContent),
+            to_mpath("dir1/subdir1/subsubdir2/file_2") => FileChange::tracked(THREES_CTID, FileType::Regular, 2, None, GitLfs::FullContent),
         },
         is_snapshot: false,
         git_annotated_tag: None,

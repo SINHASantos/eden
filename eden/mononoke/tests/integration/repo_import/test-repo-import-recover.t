@@ -5,6 +5,8 @@
 # directory of this source tree.
 
   $ . "${TEST_FIXTURES}/library.sh"
+  $ . "${TEST_FIXTURES}/library-push-redirector.sh"
+
   $ setup_common_config
   $ GIT_REPO="${TESTTMP}/repo-git"
   $ HG_REPO="${TESTTMP}/repo-hg"
@@ -20,16 +22,7 @@
   starting Mononoke
   cloning repo in hg client 'repo2'
   $ SKIP_CROSS_REPO_CONFIG=1 setup_configerator_configs
-  $ cat > "$PUSHREDIRECT_CONF/enable" <<EOF
-  > {
-  > "per_repo": {
-  >   "0": {
-  >      "draft_push": false,
-  >      "public_push": false
-  >    }
-  >   }
-  > }
-  > EOF
+  $ enable_pushredirect 0 false false
 
 # Setup git repository
   $ mkdir "$GIT_REPO"
@@ -64,22 +57,7 @@
   * ce435b0 Add file1 and file2
   $ GIT_MASTER_HASH=$(git log -n 1 --pretty=format:"%H" master)
 
-
-# run segmented changelog tailer on master bookmark
-  $ cat >> "$TESTTMP/mononoke-config/repos/repo/server.toml" <<CONFIG
-  > [segmented_changelog_config]
-  > heads_to_include = [
-  >    { bookmark = "master_bookmark" },
-  > ]
-  > CONFIG
-  $ segmented_changelog_tailer_reseed --repo repo  2>&1 | grep -e successfully -e segmented_changelog_tailer
-  * repo name 'repo' translates to id 0 (glob)
-  * SegmentedChangelogTailer initialized, repo_id: 0 (glob)
-  * successfully seeded segmented changelog, repo_id: 0 (glob)
-  * SegmentedChangelogTailer is done, repo_id: 0 (glob)
-
 # Import the repo
-# Segmented changelog should be rebuild for newly imported commits along the way.
   $ cd "$TESTTMP"
   $ cat > "${TESTTMP}/recovery_file.json" <<EOF
   >  {
@@ -93,7 +71,7 @@
   >    "git_merge_bcs_id": null,
   >    "git_merge_rev_id": "2c01e4a5658421e2bfcd08e31d9b69399319bcd3",
   >    "git_repo_path": "${TESTTMP}/repo-git",
-  >    "gitimport_bcs_ids": null, 
+  >    "gitimport_bcs_ids": null,
   >    "hg_sync_check_disabled": true,
   >    "import_stage": "GitImport",
   >    "imported_cs_id": null,
@@ -117,10 +95,6 @@
   * Fetched the recovery stage for importing. (glob)
   Starting from stage: GitImport
   * Started importing git commits to Mononoke (glob)
-  * GitRepo:$TESTTMP/repo-git commit 1 of 5 - Oid:ce435b03 => Bid:071d73e6 (glob)
-  * GitRepo:$TESTTMP/repo-git commit 2 of 5 - Oid:2c01e4a5 => Bid:4dbc9506 (glob)
-  * GitRepo:$TESTTMP/repo-git commit 3 of 5 - Oid:38f71f7e => Bid:d805ae48 (glob)
-  * GitRepo:$TESTTMP/repo-git commit 4 of 5 - Oid:13aef6ec => Bid:260f78ba (glob)
   * GitRepo:$TESTTMP/repo-git commit 5 of 5 - Oid:6783febd => Bid:8d76deb1 (glob)
   * Added commits to Mononoke (glob)
   * Commit 1/5: Remapped ChangesetId(Blake2(071d73e6b97823ffbde324c6147a785013f479157ade3f83c9b016c8f40c09de)) => ChangesetId(Blake2(4f830791a5ae7a2981d6c252d2be0bd7ebd3b1090080074b4b4bae6deb250b4a)) (glob)
@@ -132,19 +106,6 @@
   * Saved shifted bonsai changesets (glob)
   * Start deriving data types (glob)
   * Finished deriving data types (glob)
-  * Start tailing segmented changelog (glob)
-  * Using the following segmented changelog heads: [* "master_bookmark" *] (glob)
-  * SegmentedChangelogTailer initialized (glob)
-  * starting incremental update to segmented changelog (glob)
-  * iddag initialized, it covers 3 ids (glob)
-  * starting the actual update (glob)
-  * Adding hints for idmap_version 1 (glob)
-  * idmap_version 1 has a full set of hints * (glob)
-  * IdMap updated, IdDag updated (glob)
-  * segmented changelog version saved, idmap_version: 1, iddag_version: * (glob)
-  * successful incremental update to segmented changelog (glob)
-  * SegmentedChangelogTailer is done (glob)
-  * Finished tailing segmented changelog (glob)
   * Start moving the bookmark (glob)
   * Created bookmark * "repo_import_new_repo" * pointing to 4f830791a5ae7a2981d6c252d2be0bd7ebd3b1090080074b4b4bae6deb250b4a (glob)
   * Set bookmark * "repo_import_new_repo" * to point to ChangesetId(Blake2(6b49fda25c209960aad992721e872237737671564a6ce0f0347f04f4c0fee177)) (glob)

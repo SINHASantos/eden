@@ -11,19 +11,20 @@ pub use test_dag::TestDag;
 
 pub use self::drawdag::DrawDag;
 use crate::id::Group;
-use crate::id::VertexName;
-use crate::nameset::SyncNameSetQuery;
+use crate::id::Vertex;
 use crate::ops::DagAddHeads;
 use crate::ops::DagPersistent;
 use crate::ops::ImportAscii;
 #[cfg(feature = "render")]
-use crate::render::render_namedag;
+use crate::render::render_dag;
+use crate::set::SyncSetQuery;
+use crate::Dag;
 use crate::DagAlgorithm;
 use crate::IdMap;
+#[cfg(test)]
 use crate::IdSet;
-use crate::NameDag;
-use crate::NameSet;
 use crate::Result;
+use crate::Set;
 
 mod drawdag;
 mod test_dag;
@@ -61,9 +62,9 @@ pub mod dummy_dag;
 #[cfg(test)]
 pub(crate) use test_dag::ProtocolMonitor;
 
+use crate::dag::MemDag;
 #[cfg(test)]
 use crate::iddag::FirstAncestorConstraint;
-use crate::namedag::MemNameDag;
 use crate::ops::IdConvert;
 #[cfg(test)]
 use crate::protocol::Process;
@@ -113,9 +114,9 @@ static ASCII_DAG5: &str = r#"
 fn test_dag_sort_version<T: DagAlgorithm + IdConvert>(dag: &T) -> Result<()> {
     // Test that sort() returns a set with dag and map hints assigned.
     let sets = [
-        nameset(""),
-        nameset("A C B"),
-        r(from_ascii(MemNameDag::new(), ASCII_DAG3).sort(&nameset("C A B")))?,
+        set(""),
+        set("A C B"),
+        r(from_ascii(MemDag::new(), ASCII_DAG3).sort(&set("C A B")))?,
     ];
     for set in sets {
         let sorted = r(dag.sort(&set))?;
@@ -131,23 +132,17 @@ fn test_generic_dag1<T: DagAlgorithm + DagAddHeads + IdConvert>(dag: T) -> Resul
     let dag = from_ascii(dag, ASCII_DAG1);
     assert_eq!(expand(r(dag.all())?), "A B C D E F G H I J K L");
     assert_eq!(expand(r(dag.dirty())?), "A B C D E F G H I J K L");
-    assert_eq!(
-        expand(r(dag.ancestors(nameset("H I")))?),
-        "A B C D E F G H I"
-    );
-    assert_eq!(
-        expand(r(dag.sort(&nameset("H E A")))?.skip(1).take(2)),
-        "A E"
-    );
-    assert_eq!(expand(r(dag.first_ancestors(nameset("F")))?), "A B E F");
-    assert_eq!(expand(r(dag.parents(nameset("H I E")))?), "B D G");
-    assert_eq!(expand(r(dag.children(nameset("G D L")))?), "E H I");
+    assert_eq!(expand(r(dag.ancestors(set("H I")))?), "A B C D E F G H I");
+    assert_eq!(expand(r(dag.sort(&set("H E A")))?.skip(1).take(2)), "A E");
+    assert_eq!(expand(r(dag.first_ancestors(set("F")))?), "A B E F");
+    assert_eq!(expand(r(dag.parents(set("H I E")))?), "B D G");
+    assert_eq!(expand(r(dag.children(set("G D L")))?), "E H I");
     assert_eq!(expand(r(dag.merges(r(dag.all())?))?), "E K");
-    assert_eq!(expand(r(dag.merges(nameset("E F J K")))?), "E K");
-    assert_eq!(expand(r(dag.merges(nameset("A B D F H J L")))?), "");
-    assert_eq!(expand(r(dag.roots(nameset("A B E F C D I J")))?), "A C I");
-    assert_eq!(expand(r(dag.heads(nameset("A B E F C D I J")))?), "F J");
-    assert_eq!(expand(r(dag.gca_all(nameset("J K H")))?), "G");
+    assert_eq!(expand(r(dag.merges(set("E F J K")))?), "E K");
+    assert_eq!(expand(r(dag.merges(set("A B D F H J L")))?), "");
+    assert_eq!(expand(r(dag.roots(set("A B E F C D I J")))?), "A C I");
+    assert_eq!(expand(r(dag.heads(set("A B E F C D I J")))?), "F J");
+    assert_eq!(expand(r(dag.gca_all(set("J K H")))?), "G");
 
     test_dag_sort_version(&dag)?;
 
@@ -170,10 +165,10 @@ fn test_generic_dag_beautify<D: DagAlgorithm + DagAddHeads>(
     let dag2 = r(dag.beautify(None))?;
     assert_eq!(expand(r(dag2.all())?), "A B C D E");
 
-    let dag3 = r(dag.beautify(Some(nameset("A B E"))))?;
+    let dag3 = r(dag.beautify(Some(set("A B E"))))?;
     assert_eq!(expand(r(dag3.all())?), "A B C D E");
 
-    let dag4 = r(dag.beautify(Some(nameset("C D E"))))?;
+    let dag4 = r(dag.beautify(Some(set("C D E"))))?;
     assert_eq!(expand(r(dag4.all())?), "A B C D E");
 
     let ascii = r#"
@@ -191,7 +186,7 @@ fn test_generic_dag_beautify<D: DagAlgorithm + DagAddHeads>(
     let dag2 = r(dag.beautify(None))?;
     assert_eq!(expand(r(dag2.all())?), "A B C D E F G");
 
-    let dag3 = r(dag.beautify(Some(r(dag.ancestors(nameset("A")))?)))?;
+    let dag3 = r(dag.beautify(Some(r(dag.ancestors(set("A")))?)))?;
     assert_eq!(expand(r(dag3.all())?), "A B C D E F G");
 
     let ascii = r#"
@@ -227,35 +222,30 @@ fn test_generic_dag_reachable_roots(dag: impl DagAlgorithm + DagAddHeads) -> Res
     // B is not reachable without going through other roots (C).
     // A is reachable through Z -> F -> E -> A.
     assert_eq!(
-        expand(r(dag.reachable_roots(nameset("A B C"), nameset("Z")))?),
+        expand(r(dag.reachable_roots(set("A B C"), set("Z")))?),
         "A C"
     );
 
     // A, E are not reachable without going through other roots (C, F).
     assert_eq!(
-        expand(r(dag.reachable_roots(nameset("A C E F"), nameset("Z")))?),
+        expand(r(dag.reachable_roots(set("A C E F"), set("Z")))?),
         "C F"
     );
 
     // roots and heads overlap.
     assert_eq!(
-        expand(r(
-            dag.reachable_roots(nameset("A B C D E F Z"), nameset("D F"))
-        )?),
+        expand(r(dag.reachable_roots(set("A B C D E F Z"), set("D F")))?),
         "D F"
     );
 
     // E, F are not reachable.
     assert_eq!(
-        expand(r(dag.reachable_roots(nameset("A B E F"), nameset("D")))?),
+        expand(r(dag.reachable_roots(set("A B E F"), set("D")))?),
         "B"
     );
 
     // "Bogus" root "Z".
-    assert_eq!(
-        expand(r(dag.reachable_roots(nameset("A Z"), nameset("C")))?),
-        "A"
-    );
+    assert_eq!(expand(r(dag.reachable_roots(set("A Z"), set("C")))?), "A");
 
     Ok(())
 }
@@ -274,8 +264,8 @@ fn test_specific_dag_import(dag: impl DagAlgorithm + DagAddHeads) -> Result<()> 
     let dag1 = from_ascii_with_heads(dag, ascii, Some(&["J", "K"][..]));
 
     let dir = tempdir().unwrap();
-    let mut dag2 = NameDag::open(dir.path())?;
-    r(dag2.import_and_flush(&dag1, nameset("J")))?;
+    let mut dag2 = Dag::open(dir.path())?;
+    r(dag2.import_and_flush(&dag1, set("J")))?;
     #[cfg(feature = "render")]
     assert_eq!(
         render(&dag2),
@@ -304,7 +294,7 @@ fn test_specific_dag_import(dag: impl DagAlgorithm + DagAddHeads) -> Result<()> 
     );
 
     // Check that dag2 is actually flushed to disk.
-    let dag3 = NameDag::open(dir.path())?;
+    let dag3 = Dag::open(dir.path())?;
     #[cfg(feature = "render")]
     assert_eq!(
         render(&dag3),
@@ -345,38 +335,32 @@ fn test_generic_dag2<T: DagAlgorithm + DagAddHeads>(dag: T) -> Result<T> {
         A B C D"#;
     let dag = from_ascii_with_heads(dag, ascii, Some(&["J", "K"][..]));
 
-    let v = |name: &str| -> VertexName { VertexName::copy_from(name.as_bytes()) };
+    let v = |name: &str| -> Vertex { Vertex::copy_from(name.as_bytes()) };
 
     assert_eq!(expand(r(dag.all())?), "A B C D E F G H I J K");
-    assert_eq!(expand(r(dag.ancestors(nameset("H I")))?), "A B C D E F H I");
-    assert_eq!(expand(r(dag.first_ancestors(nameset("H I")))?), "A D E H I");
-    assert_eq!(
-        expand(r(dag.first_ancestors(nameset("J G D")))?),
-        "A D E G J"
-    );
-    assert_eq!(expand(r(dag.parents(nameset("H I E")))?), "A B D E F");
+    assert_eq!(expand(r(dag.ancestors(set("H I")))?), "A B C D E F H I");
+    assert_eq!(expand(r(dag.first_ancestors(set("H I")))?), "A D E H I");
+    assert_eq!(expand(r(dag.first_ancestors(set("J G D")))?), "A D E G J");
+    assert_eq!(expand(r(dag.parents(set("H I E")))?), "A B D E F");
     assert_eq!(r(dag.first_ancestor_nth(v("H"), 2))?.unwrap(), v("A"));
     assert!(r(dag.first_ancestor_nth(v("H"), 3))?.is_none());
-    assert_eq!(expand(r(dag.heads(nameset("E H F K I D")))?), "K");
-    assert_eq!(expand(r(dag.children(nameset("E F I")))?), "G H I J K");
+    assert_eq!(expand(r(dag.heads(set("E H F K I D")))?), "K");
+    assert_eq!(expand(r(dag.children(set("E F I")))?), "G H I J K");
     assert_eq!(expand(r(dag.merges(r(dag.all())?))?), "E F H I J K");
-    assert_eq!(expand(r(dag.merges(nameset("E H G D I")))?), "E H I");
-    assert_eq!(expand(r(dag.roots(nameset("E G H J I K D")))?), "D E");
-    assert_eq!(r(dag.gca_one(nameset("J K")))?, Some(v("I")));
-    assert_eq!(expand(r(dag.gca_all(nameset("J K")))?), "E I");
-    assert_eq!(expand(r(dag.common_ancestors(nameset("G H")))?), "A B E");
+    assert_eq!(expand(r(dag.merges(set("E H G D I")))?), "E H I");
+    assert_eq!(expand(r(dag.roots(set("E G H J I K D")))?), "D E");
+    assert_eq!(r(dag.gca_one(set("J K")))?, Some(v("I")));
+    assert_eq!(expand(r(dag.gca_all(set("J K")))?), "E I");
+    assert_eq!(expand(r(dag.common_ancestors(set("G H")))?), "A B E");
     assert!(r(dag.is_ancestor(v("B"), v("K")))?);
     assert!(!r(dag.is_ancestor(v("K"), v("B")))?);
-    assert_eq!(
-        expand(r(dag.heads_ancestors(nameset("A E F D G")))?),
-        "D F G"
-    );
-    assert_eq!(expand(r(dag.range(nameset("A"), nameset("K")))?), "A E H K");
-    assert_eq!(expand(r(dag.only(nameset("I"), nameset("G")))?), "C D F I");
-    let (reachable, unreachable) = r(dag.only_both(nameset("I"), nameset("G")))?;
+    assert_eq!(expand(r(dag.heads_ancestors(set("A E F D G")))?), "D F G");
+    assert_eq!(expand(r(dag.range(set("A"), set("K")))?), "A E H K");
+    assert_eq!(expand(r(dag.only(set("I"), set("G")))?), "C D F I");
+    let (reachable, unreachable) = r(dag.only_both(set("I"), set("G")))?;
     assert_eq!(expand(reachable), "C D F I");
-    assert_eq!(expand(unreachable), expand(r(dag.ancestors(nameset("G")))?));
-    assert_eq!(expand(r(dag.descendants(nameset("F E")))?), "E F G H I J K");
+    assert_eq!(expand(unreachable), expand(r(dag.ancestors(set("G")))?));
+    assert_eq!(expand(r(dag.descendants(set("F E")))?), "E F G H I J K");
 
     assert!(r(dag.is_ancestor(v("B"), v("J")))?);
     assert!(r(dag.is_ancestor(v("F"), v("F")))?);
@@ -392,25 +376,25 @@ fn test_import_ascii_with_vertex_fn() {
         |/
         A
     "#;
-    let mut dag = MemNameDag::new();
-    let vertex_fn = |s: &str| -> VertexName {
+    let mut dag = MemDag::new();
+    let vertex_fn = |s: &str| -> Vertex {
         let mut bytes = s.as_bytes().to_vec();
         bytes.push(b'0');
-        VertexName::copy_from(&bytes)
+        Vertex::copy_from(&bytes)
     };
     dag.import_ascii_with_vertex_fn(ascii, vertex_fn).unwrap();
     assert_eq!(expand(r(dag.all()).unwrap()), "A0 B0 C0");
 }
 
 #[test]
-fn test_mem_namedag() {
-    let new_dag = MemNameDag::new;
+fn test_mem_dag() {
+    let new_dag = MemDag::new;
     test_generic_dag(&new_dag);
     test_specific_dag_import(new_dag()).unwrap();
 }
 
 #[test]
-fn test_namedag() {
+fn test_dag() {
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 
@@ -418,7 +402,7 @@ fn test_namedag() {
     let counter = AtomicUsize::new(0);
     let new_dag = move || {
         let count = counter.fetch_add(1, Ordering::AcqRel);
-        NameDag::open(dir.path().join(count.to_string())).unwrap()
+        Dag::open(dir.path().join(count.to_string())).unwrap()
     };
     test_generic_dag(&new_dag);
     test_specific_dag_import(new_dag()).unwrap();
@@ -454,26 +438,26 @@ Lv1: R0-0[] R1-8[0]"#
     let request1: RequestLocationToName =
         r((&built.name_dag.map, &built.name_dag.dag).process(ids)).unwrap();
     assert_eq!(
-        replace(format!("{:?}", &request1)),
+        replace(dbg(&request1)),
         "RequestLocationToName { paths: [L~2, J~1(+5), D~1, B~1] }"
     );
 
     // [name] -> RequestNameToLocation (useful for getting ids from commit hashes).
     let names = b"ABCEFGHI"
         .iter()
-        .map(|&b| VertexName::copy_from(&[b]))
+        .map(|&b| Vertex::copy_from(&[b]))
         .collect();
     let request2: RequestNameToLocation =
         r((&built.name_dag.map, &built.name_dag.dag).process(names)).unwrap();
     assert_eq!(
-        replace(format!("{:?}", &request2)),
+        replace(dbg(&request2)),
         "RequestNameToLocation { names: [A, B, C, E, F, G, H, I], heads: [L] }"
     );
 
     // RequestLocationToName -> ResponseIdNamePair
     let response1 = r((&built.name_dag.map, &built.name_dag.dag).process(request1)).unwrap();
     assert_eq!(
-        replace(format!("{:?}", &response1)),
+        replace(dbg(&response1)),
         "ResponseIdNamePair { path_names: [(L~2, [H]), (J~1(+5), [I, G, F, E, B]), (D~1, [C]), (B~1, [A])] }"
     );
 
@@ -481,7 +465,7 @@ Lv1: R0-0[] R1-8[0]"#
     // Only B, D, H, J, L are used since they are "universally known".
     let response2 = r((&built.name_dag.map, &built.name_dag.dag).process(request2)).unwrap();
     assert_eq!(
-        replace(format!("{:?}", &response2)),
+        replace(dbg(&response2)),
         "ResponseIdNamePair { path_names: [(B~1, [A]), (H~4, [B]), (D~1, [C]), (H~3, [E]), (H~2, [F]), (H~1, [G]), (L~2, [H]), (J~1, [I])] }"
     );
 
@@ -498,13 +482,13 @@ Lv1: R0-0[] R1-8[0]"#
         .write_sparse_idmap(&built.name_dag.map, &mut sparse_id_map))
     .unwrap();
     assert_eq!(
-        format!("{:?}", &sparse_id_map),
+        dbg(&sparse_id_map),
         "IdMap {\n  D: 2,\n  B: 3,\n  J: 8,\n  H: 9,\n  L: 11,\n}\n"
     );
     // Apply response2.
     r((&mut sparse_id_map, &built.name_dag.dag).process(response2)).unwrap();
     assert_eq!(
-        format!("{:?}", &sparse_id_map),
+        dbg(&sparse_id_map),
         r#"IdMap {
   A: 0,
   C: 1,
@@ -751,41 +735,38 @@ Lv0: RH0-6[] 7-10[5] H11-12[6, 10] N0-N3[1] N4-N5[N3, 9]"#
     );
 
     // Parent-child indexes work fine.
-    assert_eq!(
-        format!("{:?}", built.name_dag.dag.children_id(Id(5)).unwrap(),),
-        "6 7"
-    );
+    assert_eq!(dbg(built.name_dag.dag.children_id(Id(5)).unwrap(),), "6 7");
 }
 
 #[test]
-fn test_namedag_reassign_master() -> crate::Result<()> {
+fn test_dag_reassign_master() -> crate::Result<()> {
     let dir = tempdir().unwrap();
-    let mut dag = NameDag::open(dir.path())?;
+    let mut dag = Dag::open(dir.path())?;
     dag = from_ascii(dag, "A-B-C");
 
     // The in-memory DAG can answer parent_names questions.
-    assert_eq!(format!("{:?}", r(dag.parent_names("A".into()))?), "[]");
-    assert_eq!(format!("{:?}", r(dag.parent_names("C".into()))?), "[B]");
+    assert_eq!(dbg(r(dag.parent_names("A".into()))?), "[]");
+    assert_eq!(dbg(r(dag.parent_names("C".into()))?), "[B]");
 
     // First flush, A, B, C are non-master.
     r(dag.flush(&Default::default())).unwrap();
 
-    assert_eq!(format!("{:?}", r(dag.vertex_id("A".into()))?), "N0");
-    assert_eq!(format!("{:?}", r(dag.vertex_id("C".into()))?), "N2");
+    assert_eq!(dbg(r(dag.vertex_id("A".into()))?), "N0");
+    assert_eq!(dbg(r(dag.vertex_id("C".into()))?), "N2");
 
     // Second flush, making B master without adding new vertexes.
     let heads =
-        VertexListWithOptions::from(vec![VertexName::from("B")]).with_desired_group(Group::MASTER);
+        VertexListWithOptions::from(vec![Vertex::from("B")]).with_desired_group(Group::MASTER);
     r(dag.flush(&heads)).unwrap();
-    assert_eq!(format!("{:?}", r(dag.vertex_id("A".into()))?), "0");
-    assert_eq!(format!("{:?}", r(dag.vertex_id("B".into()))?), "1");
-    assert_eq!(format!("{:?}", r(dag.vertex_id("C".into()))?), "N0");
+    assert_eq!(dbg(r(dag.vertex_id("A".into()))?), "0");
+    assert_eq!(dbg(r(dag.vertex_id("B".into()))?), "1");
+    assert_eq!(dbg(r(dag.vertex_id("C".into()))?), "N0");
 
     Ok(())
 }
 
 #[test]
-fn test_namedag_reassign_non_master() {
+fn test_dag_reassign_non_master() {
     let mut t = TestDag::new();
 
     // A: master; B, Z: non-master.
@@ -816,7 +797,7 @@ fn test_namedag_reassign_non_master() {
     // Z can round-trip in IdMap.
     let z_id = r(t.dag.vertex_id("Z".into())).unwrap();
     let z_vertex = r(t.dag.vertex_name(z_id)).unwrap();
-    assert_eq!(format!("{:?}", z_vertex), "Z");
+    assert_eq!(dbg(z_vertex), "Z");
 }
 
 #[test]
@@ -925,17 +906,16 @@ Lv1: R0-7[]"#
 
     let dag = result.name_dag.dag;
 
-    let parents = |spans| -> String { format_set(dag.parents(IdSet::from_spans(spans)).unwrap()) };
-    let parent_ids = |id| -> String { format!("{:?}", dag.parent_ids(Id(id)).unwrap()) };
-    let first_ancestor_nth =
-        |id, n| -> String { format!("{:?}", dag.first_ancestor_nth(Id(id), n).unwrap()) };
+    let parents = |spans| -> String { dbg(dag.parents(IdSet::from_spans(spans)).unwrap()) };
+    let parent_ids = |id| -> String { dbg(dag.parent_ids(Id(id)).unwrap()) };
+    let first_ancestor_nth = |id, n| -> String { dbg(dag.first_ancestor_nth(Id(id), n).unwrap()) };
     let to_first_ancestor_nth = |id| -> String {
         let c = FirstAncestorConstraint::KnownUniversally {
             heads: Id(11).into(),
         };
         let res = dag.to_first_ancestor_nth(Id(id), c);
         match res {
-            Ok(s) => format!("{:?}", s),
+            Ok(s) => dbg(s),
             Err(e) => e.to_string(),
         }
     };
@@ -1003,8 +983,7 @@ Lv1: R0-7[]"#
 fn test_children() {
     let result = build_segments(ASCII_DAG1, "L", 3);
     let dag = result.name_dag.dag;
-    let children =
-        |spans| -> String { format_set(dag.children(IdSet::from_spans(spans)).unwrap()) };
+    let children = |spans| -> String { dbg(dag.children(IdSet::from_spans(spans)).unwrap()) };
 
     // See test_parents above for the ASCII DAG.
 
@@ -1063,7 +1042,7 @@ Lv2: R0-2[] R3-6[] R7-9[]"#
     );
 
     let dag = result.name_dag.dag;
-    let heads = |spans| -> String { format_set(dag.heads(IdSet::from_spans(spans)).unwrap()) };
+    let heads = |spans| -> String { dbg(dag.heads(IdSet::from_spans(spans)).unwrap()) };
 
     assert_eq!(heads(vec![]), "");
     assert_eq!(heads(vec![0..=11]), "2 6 9 10 11");
@@ -1096,7 +1075,7 @@ Lv2: R0-2[] R3-6[] R7-7[]"#
     );
 
     let dag = result.name_dag.dag;
-    let roots = |spans| -> String { format_set(dag.roots(IdSet::from_spans(spans)).unwrap()) };
+    let roots = |spans| -> String { dbg(dag.roots(IdSet::from_spans(spans)).unwrap()) };
 
     assert_eq!(roots(vec![]), "");
     assert_eq!(roots(vec![0..=11]), "0 3 7 8 9");
@@ -1134,10 +1113,9 @@ Lv2: R0-3[] R4-6[1]"#
 
     let dag = result.name_dag.dag;
     let range = |roots, heads| -> String {
-        format_set(
-            dag.range(IdSet::from_spans(roots), IdSet::from_spans(heads))
-                .unwrap(),
-        )
+        dbg(dag
+            .range(IdSet::from_spans(roots), IdSet::from_spans(heads))
+            .unwrap())
     };
 
     assert_eq!(range(vec![6], vec![3]), "");
@@ -1317,7 +1295,7 @@ o  B(N0)-Z(N1)
 #[cfg_attr(test, tokio::test)]
 async fn test_subdag() {
     let t = TestDag::draw("A..E");
-    let s = t.dag.subdag(nameset("B D E")).await.unwrap();
+    let s = t.dag.subdag(set("B D E")).await.unwrap();
     #[cfg(feature = "render")]
     assert_eq!(
         render(&s),
@@ -1331,8 +1309,8 @@ async fn test_subdag() {
 
     // Test ordering: preserve the heads order (D before C).
     let t = TestDag::draw("A-X B-X X-C X-D");
-    let s1 = t.dag.subdag(nameset("D C B A")).await.unwrap();
-    let s2 = t.dag.subdag(nameset("A B C D")).await.unwrap();
+    let s1 = t.dag.subdag(set("D C B A")).await.unwrap();
+    let s2 = t.dag.subdag(set("A B C D")).await.unwrap();
     #[cfg(feature = "render")]
     assert_eq!(
         render(&s1),
@@ -1351,7 +1329,7 @@ async fn test_subdag() {
 
 // Test utilities
 
-fn expand(set: NameSet) -> String {
+fn expand(set: Set) -> String {
     let mut names = set
         .iter()
         .unwrap()
@@ -1361,16 +1339,12 @@ fn expand(set: NameSet) -> String {
     names.join(" ")
 }
 
-fn nameset(names: &str) -> NameSet {
-    let names: Vec<VertexName> = names
+fn set(names: &str) -> Set {
+    let names: Vec<Vertex> = names
         .split_whitespace()
-        .map(|n| VertexName::copy_from(n.as_bytes()))
+        .map(|n| Vertex::copy_from(n.as_bytes()))
         .collect();
-    NameSet::from_static_names(names)
-}
-
-fn format_set(set: IdSet) -> String {
-    format!("{:?}", set)
+    Set::from_static_names(names)
 }
 
 impl IdMap {
@@ -1401,12 +1375,12 @@ impl IdMap {
     }
 }
 
-fn get_parents_func_from_ascii(text: &str) -> impl Fn(VertexName) -> Result<Vec<VertexName>> {
+fn get_parents_func_from_ascii(text: &str) -> impl Fn(Vertex) -> Result<Vec<Vertex>> {
     let parents = ::drawdag::parse(text);
-    move |name: VertexName| -> Result<Vec<VertexName>> {
+    move |name: Vertex| -> Result<Vec<Vertex>> {
         Ok(parents[&String::from_utf8(name.as_ref().to_vec()).unwrap()]
             .iter()
-            .map(|p| VertexName::copy_from(p.as_bytes()))
+            .map(|p| Vertex::copy_from(p.as_bytes()))
             .collect())
     }
 }
@@ -1414,12 +1388,12 @@ fn get_parents_func_from_ascii(text: &str) -> impl Fn(VertexName) -> Result<Vec<
 /// Result of `build_segments`.
 pub(crate) struct BuildSegmentResult {
     pub(crate) ascii: Vec<String>,
-    pub(crate) name_dag: NameDag,
+    pub(crate) name_dag: Dag,
     pub(crate) dir: tempfile::TempDir,
 }
 
 /// Take an ASCII DAG, assign segments from given heads.
-/// Return the ASCII DAG and the built NameDag.
+/// Return the ASCII DAG and the built Dag.
 pub(crate) fn build_segments(text: &str, heads: &str, segment_size: usize) -> BuildSegmentResult {
     let mut dag = TestDag::new_with_segment_size(segment_size);
 
@@ -1465,5 +1439,28 @@ pub fn test_generic_dag<D: DagAddHeads + DagAlgorithm + IdConvert + Send + Sync 
 
 #[cfg(feature = "render")]
 fn render(dag: &(impl DagAlgorithm + ?Sized)) -> String {
-    render_namedag(dag, |_| None).unwrap()
+    render_dag(dag, |_| None).unwrap()
+}
+
+#[cfg(test)]
+pub(crate) fn nid(i: u64) -> Id {
+    Group::NON_MASTER.min_id() + i
+}
+
+#[cfg(test)]
+pub(crate) fn vid(i: u64) -> Id {
+    Group::VIRTUAL.min_id() + i
+}
+
+#[cfg(test)]
+pub(crate) fn dbg_iter<'a, T: std::fmt::Debug>(
+    iter: Box<dyn Iterator<Item = Result<T>> + 'a>,
+) -> String {
+    let v = iter.map(|s| s.unwrap()).collect::<Vec<_>>();
+    dbg(v)
+}
+
+#[cfg(test)]
+pub(crate) fn dbg<T: std::fmt::Debug>(t: T) -> String {
+    format!("{:?}", t)
 }

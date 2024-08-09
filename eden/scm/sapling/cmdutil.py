@@ -33,7 +33,6 @@ from . import (
     crecord as crecordmod,
     dagop,
     dirstateguard,
-    eagerepo,
     edenfs,
     encoding,
     error,
@@ -3869,6 +3868,19 @@ def samefile(f, ctx1, ctx2, m1=None, m2=None):
 
 
 def amend(ui, repo, old, extra, pats, opts):
+    wctx = repo[None]
+    matcher = scmutil.match(wctx, pats, opts)
+
+    amend_copies = copies.collect_amend_copies(repo.ui, wctx, old, matcher)
+
+    node = _amend(ui, repo, wctx, old, extra, opts, matcher)
+
+    copies.record_amend_copies(repo, amend_copies, old, repo[node])
+
+    return node
+
+
+def _amend(ui, repo, wctx, old, extra, opts, matcher):
     # avoid cycle context -> subrepo -> cmdutil
     from . import context
 
@@ -3884,7 +3896,6 @@ def amend(ui, repo, old, extra, pats, opts):
         # old      o - changeset to amend
         #          |
         # base     o - first parent of the changeset to amend
-        wctx = repo[None]
 
         # Copy to avoid mutating input
         extra = extra.copy()
@@ -3910,7 +3921,6 @@ def amend(ui, repo, old, extra, pats, opts):
 
         # add/remove the files to the working copy if the "addremove" option
         # was specified.
-        matcher = scmutil.match(wctx, pats, opts)
         if opts.get("addremove") and scmutil.addremove(repo, matcher, "", opts):
             raise error.Abort(
                 _("failed to mark all new/missing files as added/removed")
@@ -4816,3 +4826,50 @@ def wrongtooltocontinue(repo, task):
     if after[1]:
         hint = after[0]
     raise error.Abort(_("no %s in progress") % task, hint=hint)
+
+
+diffgraftopts = [
+    (
+        "",
+        "from-path",
+        [],
+        _("re-map this path to correspondong --to-path (ADVANCED)"),
+        _("PATH"),
+    ),
+    (
+        "",
+        "to-path",
+        [],
+        _("re-map corresponding --from-path to this path (ADVANCED)"),
+        _("PATH"),
+    ),
+]
+
+
+def registerdiffgrafts(opts, *ctxs):
+    """Register --from-path/--to-path manifest "grafts" in ctx's manifest.
+
+    These grafts are applied temporarily before diff operations, allowing users
+    to "remap" directories.
+    """
+    from_paths = opts.get("from_path") or []
+    to_paths = opts.get("to_path") or []
+
+    if not from_paths and not to_paths:
+        return
+
+    if len(from_paths) != len(to_paths):
+        raise error.Abort(_("must provide same number of --from-path and --to-path"))
+
+    # Disallow overlapping --to-path to keep things simple.
+    to_dirs = util.dirs(to_paths)
+    seen = set()
+    for p in to_paths:
+        if p in to_dirs or p in seen:
+            raise error.Abort(_("overlapping --to-path entries"))
+        seen.add(p)
+
+    for ctx in ctxs:
+        manifest = ctx.manifest()
+        for f, t in zip(from_paths, to_paths):
+            manifest.registerdiffgraft(f, t)

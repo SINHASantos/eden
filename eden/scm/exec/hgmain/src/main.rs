@@ -107,6 +107,9 @@ fn main() {
     #[cfg(windows)]
     windows::enable_vt_processing().unwrap();
 
+    #[cfg(feature = "cas")]
+    thin_cas_client::init();
+
     let mut io = clidispatch::io::IO::stdio();
 
     let _ = io.setup_term();

@@ -21,6 +21,7 @@ mod tests {
     use bookmarks::BookmarkUpdateReason;
     use bookmarks::BookmarksRef;
     use bookmarks::Freshness;
+    use bulk_derivation::BulkDerivation;
     use cacheblob::InProcessLease;
     use cached_config::ConfigStore;
     use cached_config::ModificationTime;
@@ -30,11 +31,9 @@ mod tests {
     use cross_repo_sync::CommitSyncContext;
     use cross_repo_sync::SubmoduleDeps;
     use derived_data_manager::BonsaiDerivable;
-    use derived_data_utils::derived_data_utils;
     use fbinit::FacebookInit;
     use futures::stream::TryStreamExt;
     use git_types::MappedGitCommitId;
-    use git_types::RootGitDeltaManifestId;
     use git_types::RootGitDeltaManifestV2Id;
     use git_types::TreeHandle;
     use live_commit_sync_config::CfgrLiveCommitSyncConfig;
@@ -65,9 +64,11 @@ mod tests {
     use mononoke_types_mocks::changesetid::TWOS_CSID;
     use movers::DefaultAction;
     use movers::Mover;
+    use movers::Movers;
     use mutable_counters::MutableCountersRef;
+    use pushredirect::PushRedirectionConfig;
+    use pushredirect::TestPushRedirectionConfig;
     use repo_blobstore::RepoBlobstoreRef;
-    use repo_derived_data::RepoDerivedDataArc;
     use repo_derived_data::RepoDerivedDataRef;
     use sql_construct::SqlConstruct;
     use synced_commit_mapping::SqlSyncedCommitMapping;
@@ -84,6 +85,7 @@ mod tests {
     use crate::find_mapping_version;
     use crate::get_large_repo_config_if_pushredirected;
     use crate::get_large_repo_setting;
+    use crate::get_reverse_mover;
     use crate::merge_imported_commit;
     use crate::move_bookmark;
     use crate::push_merge_commit;
@@ -113,7 +115,6 @@ mod tests {
                 // Repo import has no need of these derived data types
                 config.types.remove(&TreeHandle::VARIANT);
                 config.types.remove(&MappedGitCommitId::VARIANT);
-                config.types.remove(&RootGitDeltaManifestId::VARIANT);
                 config.types.remove(&RootGitDeltaManifestV2Id::VARIANT);
             })
             .with_id(RepositoryId::new(id))
@@ -383,7 +384,7 @@ mod tests {
             pushrebase: PushrebaseParams {
                 globalrev_config: Some(GlobalrevConfig {
                     publishing_bookmark: BookmarkKey::new("master")?,
-                    small_repo_id: None,
+                    globalrevs_small_repo_id: None,
                 }),
                 ..Default::default()
             },
@@ -492,14 +493,26 @@ mod tests {
         test_source.insert_to_refresh(CONFIGERATOR_PUSHREDIRECT_ENABLE.to_string());
         test_source.insert_to_refresh(CONFIGERATOR_ALL_COMMIT_SYNC_CONFIGS.to_string());
 
-        let config_store = ConfigStore::new(test_source.clone(), Duration::from_millis(2), None);
-        let live_commit_sync_config = CfgrLiveCommitSyncConfig::new(ctx.logger(), &config_store)?;
+        let test_push_redirection_config = Arc::new(TestPushRedirectionConfig::new());
+        test_push_redirection_config
+            .set(&ctx, RepositoryId::new(1), false, true)
+            .await?;
+        test_push_redirection_config
+            .set(&ctx, RepositoryId::new(2), true, false)
+            .await?;
 
         let repo0 = create_repo(fb, 0).await?;
 
+        let config_store = ConfigStore::new(test_source.clone(), Duration::from_millis(2), None);
+        let live_commit_sync_config = CfgrLiveCommitSyncConfig::new_with_xdb(
+            ctx.logger(),
+            &config_store,
+            test_push_redirection_config,
+        )?;
+
         insert_repo_config(0, &mut repos);
         assert!(
-            get_large_repo_config_if_pushredirected(&repo0, &live_commit_sync_config, &repos)
+            get_large_repo_config_if_pushredirected(&ctx, &repo0, &live_commit_sync_config, &repos)
                 .await?
                 .is_none()
         );
@@ -508,7 +521,7 @@ mod tests {
 
         insert_repo_config(1, &mut repos);
         assert!(
-            get_large_repo_config_if_pushredirected(&repo1, &live_commit_sync_config, &repos)
+            get_large_repo_config_if_pushredirected(&ctx, &repo1, &live_commit_sync_config, &repos)
                 .await?
                 .is_some()
         );
@@ -517,7 +530,7 @@ mod tests {
 
         insert_repo_config(2, &mut repos);
         assert!(
-            get_large_repo_config_if_pushredirected(&repo2, &live_commit_sync_config, &repos)
+            get_large_repo_config_if_pushredirected(&ctx, &repo2, &live_commit_sync_config, &repos)
                 .await?
                 .is_none()
         );
@@ -734,8 +747,9 @@ mod tests {
         movers.push(
             syncers
                 .small_to_large
-                .get_mover_by_version(&CommitSyncConfigVersion("TEST_VERSION".to_string()))
-                .await?,
+                .get_movers_by_version(&CommitSyncConfigVersion("TEST_VERSION".to_string()))
+                .await?
+                .mover,
         );
 
         let combined_mover: Mover = Arc::new(move |source_path: &NonRootMPath| {
@@ -750,13 +764,17 @@ mod tests {
             Ok(Some(mutable_path))
         });
 
+        let combined_movers = Movers {
+            mover: combined_mover.clone(),
+            reverse_mover: get_reverse_mover(),
+        };
+
         let (shifted_bcs_ids, _git_merge_shifted_bcs_id) = rewrite_file_paths(
             &ctx,
             &large_repo,
-            &combined_mover,
+            &combined_movers,
             &cs_ids,
             cs_ids.last().unwrap(),
-            SubmoduleDeps::ForSync(HashMap::new()),
         )
         .await?;
 
@@ -805,12 +823,12 @@ mod tests {
         cs_ids: &[ChangesetId],
     ) -> Result<()> {
         let derived_data_types = &repo.repo_derived_data().active_config().types;
-        let blob_repo = repo.as_blob_repo();
 
         for derived_data_type in derived_data_types {
-            let derived_utils = derived_data_utils(ctx.fb, blob_repo, *derived_data_type)?;
-            let pending = derived_utils
-                .pending(ctx.clone(), repo.repo_derived_data_arc(), cs_ids.to_vec())
+            let pending = repo
+                .repo_derived_data()
+                .manager()
+                .pending(ctx, cs_ids, None, *derived_data_type)
                 .await?;
             assert!(pending.is_empty());
         }
@@ -901,8 +919,9 @@ mod tests {
         movers.push(
             syncers
                 .small_to_large
-                .get_mover_by_version(&CommitSyncConfigVersion("TEST_VERSION".to_string()))
-                .await?,
+                .get_movers_by_version(&CommitSyncConfigVersion("TEST_VERSION".to_string()))
+                .await?
+                .mover,
         );
 
         let combined_mover: Mover = Arc::new(move |source_path: &NonRootMPath| {
@@ -916,14 +935,17 @@ mod tests {
             }
             Ok(Some(mutable_path))
         });
+        let combined_movers = Movers {
+            mover: combined_mover.clone(),
+            reverse_mover: get_reverse_mover(),
+        };
 
         let (large_repo_cs_ids, _) = rewrite_file_paths(
             &ctx,
             &large_repo,
-            &combined_mover,
+            &combined_movers,
             &cs_ids,
             cs_ids.last().unwrap(),
-            SubmoduleDeps::ForSync(HashMap::new()),
         )
         .await?;
         let small_repo_cs_ids = back_sync_commits_to_small_repo(

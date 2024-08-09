@@ -30,6 +30,7 @@ use mononoke_types::ChangesetId;
 use mononoke_types::DateTime;
 use mononoke_types::FileChange;
 use mononoke_types::FileType;
+use mononoke_types::GitLfs;
 use mononoke_types::RepositoryId;
 use sorted_vector_map::SortedVectorMap;
 use test_repo_factory::TestRepoFactory;
@@ -60,8 +61,13 @@ pub async fn store_files(
                 )
                 .await
                 .unwrap();
-                let file_change =
-                    FileChange::tracked(metadata.content_id, FileType::Regular, size, None);
+                let file_change = FileChange::tracked(
+                    metadata.content_id,
+                    FileType::Regular,
+                    size,
+                    None,
+                    GitLfs::FullContent,
+                );
                 res.insert(path, file_change);
             }
             None => {
@@ -979,7 +985,7 @@ pub fn json_config_small() -> String {
 
 #[cfg(test)]
 mod test {
-    use changesets::ChangesetsRef;
+    use commit_graph::CommitGraphRef;
 
     use super::*;
 
@@ -1000,12 +1006,16 @@ mod test {
                 .iter()
                 .map(|name| commits[name])
                 .collect::<BTreeSet<_>>();
-            let cs = repo.changesets().get(&ctx, cs_id).await.unwrap().unwrap();
+            let cs_parents = repo
+                .commit_graph()
+                .changeset_parents(&ctx, cs_id)
+                .await
+                .unwrap();
             assert_eq!(
-                cs.parents.iter().copied().collect::<BTreeSet<_>>(),
+                cs_parents.iter().copied().collect::<BTreeSet<_>>(),
                 parents,
                 "{name} ({cs_id}) parents mismatch: {:?} != {:?}",
-                cs.parents,
+                cs_parents,
                 parents
             );
         }

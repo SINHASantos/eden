@@ -9,18 +9,13 @@ import type {Heartbeat} from '../heartbeat';
 import type {ReactNode} from 'react';
 import type {ExclusiveOr} from 'shared/typeUtils';
 
+import {colors} from '../../../components/theme/tokens.stylex';
 import {debugLogMessageTraffic} from '../ClientToServerAPI';
 import {Column, Row} from '../ComponentUtils';
 import {DropdownField, DropdownFields} from '../DropdownFields';
-import {InlineErrorBadge} from '../ErrorNotice';
 import messageBus from '../MessageBus';
-import {Subtle} from '../Subtle';
-import {Tooltip} from '../Tooltip';
 import {enableReactTools, enableReduxTools} from '../atoms/debugToolAtoms';
 import {holdingCtrlAtom} from '../atoms/keyboardAtoms';
-import {Badge} from '../components/Badge';
-import {Button} from '../components/Button';
-import {Checkbox} from '../components/Checkbox';
 import {DagCommitInfo} from '../dag/dagCommitInfo';
 import {useHeartbeat} from '../heartbeat';
 import {t, T} from '../i18n';
@@ -37,11 +32,16 @@ import {
   repositoryInfo,
 } from '../serverAPIState';
 import {showToast} from '../toast';
-import {colors} from '../tokens.stylex';
 import {isDev} from '../utils';
 import {ComponentExplorerButton} from './ComponentExplorer';
 import {readInterestingAtoms, serializeAtomsState} from './getInterestingAtoms';
 import * as stylex from '@stylexjs/stylex';
+import {Badge} from 'isl-components/Badge';
+import {Button} from 'isl-components/Button';
+import {Checkbox} from 'isl-components/Checkbox';
+import {InlineErrorBadge} from 'isl-components/ErrorNotice';
+import {Subtle} from 'isl-components/Subtle';
+import {Tooltip} from 'isl-components/Tooltip';
 import {atom, useAtom, useAtomValue} from 'jotai';
 import {useState, useCallback, useEffect} from 'react';
 

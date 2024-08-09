@@ -939,7 +939,9 @@ def _dispatch(req):
 
         cmd, func, args, options, cmdoptions, foundaliases = _parse(lui, args)
 
-        tracing.debug(target="command_info", command=cmd)
+        tracing.debug(
+            target="command_info", command=getattr(func, "legacyname", None) or cmd
+        )
 
         lui.cmdname = ui.cmdname = cmd
         lui.cmdtype = ui.cmdtype = getattr(func, "cmdtype", None)
@@ -964,20 +966,30 @@ def _dispatch(req):
         i18n.init()
 
         if options["config"] != req.earlyoptions["config"]:
-            raise error.Abort(_("option --config may not be abbreviated!"))
+            raise error.Abort(
+                _(
+                    "option --config may not be abbreviated, used in aliases, or used as a value for another option"
+                )
+            )
         if options["configfile"] != req.earlyoptions["configfile"]:
-            raise error.Abort(_("option --configfile may not be abbreviated!"))
+            raise error.Abort(
+                _("option --configfile may not be abbreviated or used in aliases")
+            )
         if options["cwd"] != req.earlyoptions["cwd"]:
-            raise error.Abort(_("option --cwd may not be abbreviated!"))
+            raise error.Abort(
+                _("option --cwd may not be abbreviated or used in aliases")
+            )
         if options["repository"] != req.earlyoptions["repository"]:
             raise error.Abort(
                 _(
-                    "option -R has to be separated from other options (e.g. not "
-                    "-qR) and --repository may only be abbreviated as --repo!"
+                    "option -R must appear alone, and --repository may not be "
+                    "abbreviated or used in aliases"
                 )
             )
         if options["debugger"] != req.earlyoptions["debugger"]:
-            raise error.Abort(_("option --debugger may not be abbreviated!"))
+            raise error.Abort(
+                _("option --debugger may not be abbreviated or used in aliases")
+            )
         # don't validate --profile/--traceback, which can be enabled from now
 
         if options["time"]:

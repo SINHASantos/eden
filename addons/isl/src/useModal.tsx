@@ -9,11 +9,11 @@ import type {Deferred} from 'shared/utils';
 
 import {useCommand} from './ISLShortcuts';
 import {Modal} from './Modal';
-import {Button} from './components/Button';
 import {writeAtom} from './jotaiUtils';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
 import {atom, useAtom, useSetAtom} from 'jotai';
 import React, {useCallback, useEffect, useRef} from 'react';
-import {Icon} from 'shared/Icon';
 import {defer} from 'shared/utils';
 
 import './useModal.css';

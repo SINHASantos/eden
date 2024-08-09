@@ -406,6 +406,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use anyhow::anyhow;
@@ -418,7 +419,7 @@ mod tests {
     use memblob::Memblob;
     use mononoke_types::path::MPath;
     use mononoke_types::FileType;
-    use mononoke_types::TrieMap;
+    use mononoke_types::SortedVectorTrieMap;
     use pretty_assertions::assert_eq;
 
     use super::*;
@@ -433,21 +434,26 @@ mod tests {
         mf: TestManifestId,
         path: &str,
         prefix: &str,
-    ) -> Result<TrieMap<Entry<TestManifestId, (FileType, TestLeafId)>>> {
+    ) -> Result<SortedVectorTrieMap<Entry<TestManifestId, (FileType, TestLeafId)>>> {
         let mf = mf
             .find_entry(ctx.clone(), blobstore.clone(), MPath::new(path)?)
             .await?
             .ok_or_else(|| anyhow!("path {} not found", path))?
             .into_tree()
             .ok_or_else(|| anyhow!("path {} is not a tree", path))?;
-        let trie_map = mf
+        let mut trie_map = mf
             .load(ctx, blobstore)
             .await?
             .into_trie_map(ctx, blobstore)
             .await?;
-        trie_map
-            .extract_prefix(prefix.as_bytes())
-            .ok_or_else(|| anyhow!("prefix {} not found at {}", prefix, path))
+        for byte in prefix.as_bytes() {
+            let (_, subentries) = trie_map.expand()?;
+            let mut subentries = subentries.into_iter().collect::<BTreeMap<_, _>>();
+            trie_map = subentries
+                .remove(byte)
+                .ok_or_else(|| anyhow!("prefix {} not found at {}", prefix, path))?;
+        }
+        Ok(trie_map)
     }
 
     async fn get_entry(

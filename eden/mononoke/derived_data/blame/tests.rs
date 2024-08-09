@@ -12,8 +12,8 @@ use anyhow::Error;
 use bonsai_hg_mapping::BonsaiHgMapping;
 use bookmarks::Bookmarks;
 use borrowed::borrowed;
-use changesets::Changesets;
 use commit_graph::CommitGraph;
+use commit_graph::CommitGraphWriter;
 use context::CoreContext;
 use fbinit::FacebookInit;
 use filestore::FilestoreConfig;
@@ -26,6 +26,7 @@ use mononoke_types::ChangesetId;
 use mononoke_types::NonRootMPath;
 use repo_blobstore::RepoBlobstore;
 use repo_derived_data::RepoDerivedData;
+use repo_identity::RepoIdentity;
 use test_repo_factory::TestRepoFactory;
 use tests_utils::create_commit;
 use tests_utils::store_files;
@@ -49,7 +50,9 @@ struct TestRepo {
     #[facet]
     commit_graph: CommitGraph,
     #[facet]
-    changesets: dyn Changesets,
+    commit_graph_writer: dyn CommitGraphWriter,
+    #[facet]
+    repo_identity: RepoIdentity,
 }
 
 // File with multiple changes and a merge

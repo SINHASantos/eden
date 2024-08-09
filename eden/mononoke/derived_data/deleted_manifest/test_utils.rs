@@ -14,10 +14,10 @@ use blobstore::Loadable;
 use bonsai_hg_mapping::BonsaiHgMapping;
 use bookmarks::Bookmarks;
 use bounded_traversal::bounded_traversal_stream;
-use changesets::Changesets;
 use changesets_creation::save_changesets;
 use cloned::cloned;
 use commit_graph::CommitGraph;
+use commit_graph::CommitGraphWriter;
 use context::CoreContext;
 use derived_data_test_utils::bonsai_changeset_from_hg;
 use fbinit::FacebookInit;
@@ -47,6 +47,7 @@ use repo_blobstore::RepoBlobstoreArc;
 use repo_blobstore::RepoBlobstoreRef;
 use repo_derived_data::RepoDerivedData;
 use repo_derived_data::RepoDerivedDataRef;
+use repo_identity::RepoIdentity;
 use sorted_vector_map::SortedVectorMap;
 use tests_utils::CreateCommitContext;
 use unodes::RootUnodeManifestId;
@@ -72,7 +73,9 @@ pub(crate) struct TestRepo {
     #[facet]
     commit_graph: CommitGraph,
     #[facet]
-    changesets: dyn Changesets,
+    commit_graph_writer: dyn CommitGraphWriter,
+    #[facet]
+    repo_identity: RepoIdentity,
 }
 
 /// Defines all common DM tests.

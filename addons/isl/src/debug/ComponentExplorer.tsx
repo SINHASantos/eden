@@ -5,13 +5,13 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import {Button} from '../components/Button';
 import {T} from '../i18n';
 import {useModal} from '../useModal';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
 import {Suspense, lazy} from 'react';
-import {Icon} from 'shared/Icon';
 
-const ComponentExplorerModal = lazy(() => import('./ComponentExplorerModal'));
+const ComponentExplorer = lazy(() => import('isl-components/explorer/ComponentExplorer'));
 
 export function ComponentExplorerButton({dismiss}: {dismiss: () => unknown}) {
   const showModal = useModal();
@@ -26,9 +26,9 @@ export function ComponentExplorerButton({dismiss}: {dismiss: () => unknown}) {
           height: 'inherit',
           type: 'custom',
           dataTestId: 'component-explorer',
-          component: ({returnResultAndDismiss}) => (
+          component: () => (
             <Suspense fallback={<Icon icon="loading" size="M" />}>
-              <ComponentExplorerModal dismiss={returnResultAndDismiss} />
+              <ComponentExplorer />
             </Suspense>
           ),
         });

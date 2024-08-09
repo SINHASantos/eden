@@ -5,16 +5,13 @@
  * GNU General Public License version 2.
  */
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use changesets::ChangesetsArc;
-use commit_graph::CommitGraphRef;
 use context::CoreContext;
 use ephemeral_blobstore::Bubble;
-use ephemeral_blobstore::EphemeralChangesets;
+use ephemeral_blobstore::EphemeralOnlyChangesetStorage;
 use mononoke_types::ChangesetId;
-use repo_blobstore::RepoBlobstoreRef;
-use repo_identity::RepoIdentityRef;
 
 use super::DerivationAssigner;
 use super::DerivationAssignment;
@@ -23,20 +20,25 @@ use super::DerivedDataManagerInner;
 use super::SecondaryManagerData;
 
 struct BubbleAssigner {
-    changesets: Arc<EphemeralChangesets>,
+    ephemeral_only_changesets_storage: Arc<EphemeralOnlyChangesetStorage>,
 }
 
 #[async_trait::async_trait]
 impl DerivationAssigner for BubbleAssigner {
     async fn assign(
         &self,
-        _ctx: &CoreContext,
-        cs: Vec<ChangesetId>,
+        ctx: &CoreContext,
+        cs_ids: Vec<ChangesetId>,
     ) -> anyhow::Result<DerivationAssignment> {
-        let in_bubble = self.changesets.fetch_gens(&cs).await?;
-        let (in_bubble, not_in_bubble) = cs
+        let in_bubble = self
+            .ephemeral_only_changesets_storage
+            .known_changesets(ctx, cs_ids.clone())
+            .await?
             .into_iter()
-            .partition(|cs_id| in_bubble.contains_key(cs_id));
+            .collect::<HashSet<_>>();
+        let (in_bubble, not_in_bubble) = cs_ids
+            .into_iter()
+            .partition(|cs_id| in_bubble.contains(cs_id));
         Ok(DerivationAssignment {
             primary: not_in_bubble,
             secondary: in_bubble,
@@ -45,14 +47,15 @@ impl DerivationAssigner for BubbleAssigner {
 }
 
 impl DerivedDataManager {
-    pub fn for_bubble(
-        self,
-        bubble: Bubble,
-        // Perhaps this can be fetched from inside the manager in the future
-        container: &(impl CommitGraphRef + ChangesetsArc + RepoIdentityRef + RepoBlobstoreRef),
-    ) -> Self {
-        let changesets = Arc::new(bubble.changesets(container));
-        let commit_graph = Arc::new(bubble.commit_graph(container));
+    pub fn for_bubble(self, bubble: Bubble) -> Self {
+        let commit_graph = Arc::new(bubble.commit_graph(
+            self.repo_id(),
+            self.repo_blobstore().clone(),
+            self.commit_graph(),
+        ));
+        let ephemeral_only_changesets_storage = Arc::new(
+            bubble.ephemeral_only_changesets_storage(self.repo_id(), self.repo_blobstore().clone()),
+        );
         let wrapped_blobstore = bubble.wrap_repo_blobstore(self.inner.repo_blobstore.clone());
         let mut derivation_context = self.inner.derivation_context.clone();
         derivation_context.bonsai_hg_mapping = None;
@@ -65,15 +68,19 @@ impl DerivedDataManager {
                 secondary: Some(SecondaryManagerData {
                     manager: Self {
                         inner: Arc::new(DerivedDataManagerInner {
-                            changesets: changesets.clone(),
-                            commit_graph,
+                            bubble_id: Some(bubble.bubble_id()),
+                            commit_graph: commit_graph.clone(),
                             repo_blobstore: wrapped_blobstore,
                             derivation_context,
                             ..self.inner.as_ref().clone()
                         }),
                     },
-                    assigner: Arc::new(BubbleAssigner { changesets }),
+                    assigner: Arc::new(BubbleAssigner {
+                        ephemeral_only_changesets_storage,
+                    }),
                 }),
+                bubble_id: Some(bubble.bubble_id()),
+                commit_graph,
                 ..self.inner.as_ref().clone()
             }),
         }

@@ -9,18 +9,15 @@ import type {CommitInfo} from '../types';
 import type {CommitInfoMode} from './CommitInfoState';
 import type {CommitMessageFields, FieldConfig} from './types';
 
+import {font, spacing} from '../../../components/theme/tokens.stylex';
 import {FlexSpacer} from '../ComponentUtils';
 import {Internal} from '../Internal';
-import {DOCUMENTATION_DELAY, Tooltip} from '../Tooltip';
 import {tracker} from '../analytics';
-import {Button} from '../components/Button';
-import {LinkButton} from '../components/LinkButton';
 import {T, t} from '../i18n';
 import {readAtom, writeAtom} from '../jotaiUtils';
 import foundPlatform from '../platform';
 import {dagWithPreviews} from '../previews';
 import {layout} from '../stylexUtils';
-import {font, spacing} from '../tokens.stylex';
 import {useModal} from '../useModal';
 import {
   getDefaultEditedCommitMessage,
@@ -36,9 +33,12 @@ import {
 } from './CommitMessageFields';
 import {SmallCapsTitle} from './utils';
 import * as stylex from '@stylexjs/stylex';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
+import {LinkButton} from 'isl-components/LinkButton';
+import {DOCUMENTATION_DELAY, Tooltip} from 'isl-components/Tooltip';
 import {useCallback} from 'react';
 import {useContextMenu} from 'shared/ContextMenu';
-import {Icon} from 'shared/Icon';
 
 /**
  * The last entry in a tokenized field value is used as the value being typed in the editor.

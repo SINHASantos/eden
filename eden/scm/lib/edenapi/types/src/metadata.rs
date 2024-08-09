@@ -8,7 +8,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use bytes::Bytes;
+use minibytes::Bytes;
 #[cfg(any(test, feature = "for-tests"))]
 use quickcheck::Arbitrary;
 #[cfg(any(test, feature = "for-tests"))]
@@ -16,6 +16,9 @@ use quickcheck_arbitrary_derive::Arbitrary;
 use serde_derive::Deserialize;
 use serde_derive::Serialize;
 use type_macros::auto_wire;
+pub use types::Blake3;
+pub use types::Sha1;
+pub use types::Sha256;
 
 use crate::FileAuxData;
 use crate::ServerError;
@@ -33,21 +36,23 @@ pub struct DirectoryMetadata {
     pub augmented_manifest_size: u64,
 }
 
+pub type WireTreeAuxData = WireDirectoryMetadata;
+
 /// File entry metadata
 #[auto_wire]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct FileMetadata {
     // #[id(0)] # deprecated
-    #[id(1)] //  deprecated, the field to be removed after 06/15/2024
+    #[id(1)] //  deprecated
     #[no_default]
     pub content_id: ContentId,
     // #[id(2)] # deprecated
     #[id(3)]
-    #[no_default] // for compatibility, to be removed after 06/15/2024
+    #[no_default] // for compatibility
     pub size: u64,
     #[id(4)]
     pub content_sha1: Sha1,
-    #[id(5)] // deprecated, the field to be removed after 06/15/2024
+    #[id(5)] // deprecated
     #[no_default]
     pub content_sha256: Sha256,
     #[id(6)]
@@ -96,9 +101,6 @@ impl Arbitrary for FileMetadata {
     }
 }
 
-sized_hash!(Sha1, 20);
-sized_hash!(Sha256, 32);
-sized_hash!(Blake3, 32);
 blake2_hash!(ContentId);
 blake2_hash!(FsnodeId);
 

@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::SystemTime;
 
+use actions::UpdateAction;
 use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::format_err;
@@ -27,7 +28,7 @@ use async_runtime::block_on;
 use atexit::AtExit;
 use context::CoreContext;
 use crossbeam::channel;
-use dag::VertexName;
+use dag::Vertex;
 #[cfg(windows)]
 use fs_err as fs;
 use manifest::FileMetadata;
@@ -73,7 +74,6 @@ use crate::watchman_state::WatchmanStateChange;
 mod actions;
 #[allow(dead_code)]
 mod conflict;
-#[cfg(feature = "eden")]
 pub mod edenfs;
 pub mod errors;
 #[allow(dead_code)]
@@ -129,6 +129,8 @@ struct UpdateContentAction {
     content_hgid: HgId,
     /// New file type.
     file_type: FileType,
+    /// File type of existing file, if any.
+    from_file_type: Option<FileType>,
 }
 
 /// Only update metadata on the file, do not update content
@@ -156,7 +158,7 @@ pub struct CheckoutStats {
 }
 
 enum Work {
-    Write(Key, Bytes, UpdateFlag),
+    Write(Key, Bytes, UpdateFlag, Option<UpdateFlag>),
     SetExec(RepoPathBuf, bool),
     Remove(RepoPathBuf),
 }
@@ -203,7 +205,7 @@ impl CheckoutPlan {
                     update_meta.push(UpdateMetaAction { path, set_x_flag })
                 }
                 Action::Update(up) => {
-                    update_content.insert(path, UpdateContentAction::new(up.to));
+                    update_content.insert(path, UpdateContentAction::new(up));
                 }
             }
         }
@@ -299,8 +301,13 @@ impl CheckoutPlan {
                     let mut bar_count = 0;
                     while let Ok(work) = rx.recv() {
                         let result = match &work {
-                            Work::Write(key, data, flag) => {
-                                vfs.write(&key.path, data, *flag).map(|_| ())
+                            Work::Write(key, data, flag, from_flag) => {
+                                if matches!(from_flag, Some(UpdateFlag::Symlink)) {
+                                    // Take special care if we are writing over a symlink.
+                                    vfs.rewrite_symlink(&key.path, data, *flag).map(|_| ())
+                                } else {
+                                    vfs.write(&key.path, data, *flag).map(|_| ())
+                                }
                             }
                             Work::SetExec(path, exec) => {
                                 vfs.set_executable(path, *exec).map(|_| ())
@@ -353,7 +360,12 @@ impl CheckoutPlan {
                     .get(&key)
                     .ok_or_else(|| format_err!("Storage returned unknown key {}", key))?;
                 let flag = type_to_flag(&action.file_type);
-                tx.send(Work::Write(key, data, flag))?;
+                tx.send(Work::Write(
+                    key,
+                    data,
+                    flag,
+                    action.from_file_type.as_ref().map(type_to_flag),
+                ))?;
             }
             drop(tx);
 
@@ -380,7 +392,7 @@ impl CheckoutPlan {
                     }
                     Some(Work::Remove(path)) => stats.remove_failed.push((path, err)),
                     Some(Work::SetExec(path, _)) => stats.set_exec_failed.push((path, err)),
-                    Some(Work::Write(key, _, _)) => stats.write_failed.push((key.path, err)),
+                    Some(Work::Write(key, ..)) => stats.write_failed.push((key.path, err)),
                 }
             }
 
@@ -908,10 +920,11 @@ fn type_to_flag(ft: &FileType) -> UpdateFlag {
 }
 
 impl UpdateContentAction {
-    pub fn new(meta: FileMetadata) -> Self {
+    pub fn new(up: UpdateAction) -> Self {
         Self {
-            content_hgid: meta.hgid,
-            file_type: meta.file_type,
+            content_hgid: up.to.hgid,
+            file_type: up.to.file_type,
+            from_file_type: up.from.map(|from| from.file_type),
         }
     }
 }
@@ -1019,6 +1032,7 @@ pub fn checkout(
     bookmark_action: BookmarkAction,
     update_mode: CheckoutMode,
     report_mode: ReportMode,
+    flush_dirstate: bool,
 ) -> Result<Option<(usize, usize)>> {
     if update_mode == CheckoutMode::MergeConflicts {
         unimplemented!("Rust checkout doesn't support merging files");
@@ -1061,15 +1075,16 @@ pub fn checkout(
         }
     }
 
-    let stats = if repo.requirements.contains("eden") {
-        #[cfg(feature = "eden")]
-        {
-            edenfs::edenfs_checkout(ctx, repo, wc, target_commit, revert_conflicts)?;
-            None
-        }
-
-        #[cfg(not(feature = "eden"))]
-        bail!("checkout() called on eden working copy on non-eden build");
+    let stats = if repo.requirements.contains("eden") || repo.requirements.contains("dotgit") {
+        edenfs::edenfs_checkout(
+            ctx,
+            repo,
+            wc,
+            target_commit,
+            revert_conflicts,
+            flush_dirstate,
+        )?;
+        None
     } else {
         Some(filesystem_checkout(
             ctx,
@@ -1077,6 +1092,7 @@ pub fn checkout(
             wc,
             target_commit,
             revert_conflicts,
+            flush_dirstate,
         )?)
     };
 
@@ -1149,13 +1165,15 @@ pub fn checkout(
         wc.set_active_bookmark(new_bookmark)?;
     }
 
-    wc.journal.record_new_entry(
-        &ctx.raw_args,
-        "wdirparent",
-        ".",
-        &[source_commit],
-        &[target_commit],
-    )?;
+    if flush_dirstate {
+        wc.journal.record_new_entry(
+            &ctx.raw_args,
+            "wdirparent",
+            ".",
+            &[source_commit],
+            &[target_commit],
+        )?;
+    }
 
     state_change.mark_success();
 
@@ -1170,7 +1188,7 @@ fn prefetch_children(repo: &Repo, node: &HgId) -> Result<()> {
         return Ok(());
     }
 
-    let vertex = VertexName::copy_from(node.as_ref());
+    let vertex = Vertex::copy_from(node.as_ref());
 
     let dag = repo.dag_commits()?;
     let mut dag = dag.write();
@@ -1204,11 +1222,11 @@ fn update_distance(repo: &Repo, source: &HgId, dest: &HgId) -> Result<u64> {
     let dag = repo.dag_commits()?;
     let dag = dag.read();
 
-    let to_nameset = |id: &HgId| -> dag::NameSet {
+    let to_nameset = |id: &HgId| -> dag::Set {
         if id.is_null() {
-            dag::NameSet::empty()
+            dag::Set::empty()
         } else {
-            VertexName::copy_from(id.as_ref()).into()
+            Vertex::copy_from(id.as_ref()).into()
         }
     };
 
@@ -1250,6 +1268,7 @@ pub fn filesystem_checkout(
     wc: &LockedWorkingCopy,
     target_commit: HgId,
     revert_conflicts: bool,
+    flush_dirstate: bool,
 ) -> Result<(usize, usize)> {
     let current_commit = wc.first_parent()?;
 
@@ -1342,8 +1361,10 @@ pub fn filesystem_checkout(
 
     // 5. Update the treestate parents, dirstate
     wc.set_parents(vec![target_commit], None)?;
-    record_updates(&plan, wc.vfs(), &mut ts.lock())?;
-    dirstate::flush(wc.vfs().root(), &mut ts.lock(), repo.locker(), None, None)?;
+    record_updates(&plan, wc.vfs(), &mut ts.lock(), &status, revert_conflicts)?;
+    if flush_dirstate {
+        dirstate::flush(wc.vfs().root(), &mut ts.lock(), repo.locker(), None, None)?;
+    }
 
     util::file::unlink_if_exists(&updatestate_path)?;
     if let Some(progress_path) = progress_path {
@@ -1428,6 +1449,24 @@ fn overlay_working_changes(
     Ok(())
 }
 
+#[derive(Debug)]
+pub struct CheckoutConflictsError {
+    pub conflicts: Vec<RepoPathBuf>,
+}
+
+impl std::fmt::Display for CheckoutConflictsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{:?} conflicting file changes:\n {}\n(commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)",
+            self.conflicts.len(),
+            truncated_error_list(&self.conflicts, 5).join("\n "),
+        )
+    }
+}
+
+impl std::error::Error for CheckoutConflictsError {}
+
 pub(crate) fn check_conflicts(
     repo: &Repo,
     wc: &LockedWorkingCopy,
@@ -1450,15 +1489,11 @@ pub(crate) fn check_conflicts(
 
     conflicts.sort();
 
-    if !conflicts.is_empty() {
-        bail!(
-            "{:?} conflicting file changes:\n {}\n{}",
-            conflicts.len(),
-            truncated_error_list(&conflicts, 5).join("\n "),
-            "(commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)",
-        );
+    if conflicts.is_empty() {
+        Ok(())
+    } else {
+        Err(CheckoutConflictsError { conflicts }.into())
     }
-    Ok(())
 }
 
 fn truncated_error_list(
@@ -1565,7 +1600,13 @@ fn create_plan(
     Ok(plan)
 }
 
-fn record_updates(plan: &CheckoutPlan, vfs: &VFS, treestate: &mut TreeState) -> Result<()> {
+fn record_updates(
+    plan: &CheckoutPlan,
+    vfs: &VFS,
+    treestate: &mut TreeState,
+    status: &Status,
+    clean: bool,
+) -> Result<()> {
     let bar = ProgressBar::new_adhoc("recording", plan.all_files().count() as u64, "files");
 
     for removed in plan.removed_files() {
@@ -1573,13 +1614,35 @@ fn record_updates(plan: &CheckoutPlan, vfs: &VFS, treestate: &mut TreeState) -> 
         bar.increase_position(1);
     }
 
+    let mut max_mtime = None;
+
     for updated in plan
         .updated_content_files()
         .chain(plan.updated_meta_files())
     {
         let fstate = file_state(vfs, updated)?;
+        if fstate.mtime > max_mtime.unwrap_or(0) {
+            max_mtime = Some(fstate.mtime);
+        }
         treestate.insert(updated, &fstate)?;
         bar.increase_position(1);
+    }
+
+    if clean {
+        for (p, s) in status.iter() {
+            if matches!(s, FileStatus::Deleted | FileStatus::Removed) {
+                // If a locally removed file wasn't updated via "sl go -C", that means it
+                // was also deleted in the destination. Nothing else will remove it from
+                // the treestate, so we do so here.
+                if !plan.update_content.contains_key(p) {
+                    treestate.remove(p)?;
+                }
+            }
+        }
+    }
+
+    if let Some(max_mtime) = max_mtime {
+        treestate.invalidate_mtime(max_mtime)?;
     }
 
     Ok(())

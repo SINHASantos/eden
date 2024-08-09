@@ -25,8 +25,8 @@ use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateLog;
 use bookmarks::BookmarkUpdateReason;
 use bookmarks::Bookmarks;
-use changesets::Changesets;
 use commit_graph::CommitGraph;
+use commit_graph::CommitGraphWriter;
 use commit_transformation::upload_commits;
 use context::CoreContext;
 use cross_repo_sync::rewrite_commit;
@@ -36,7 +36,6 @@ use cross_repo_sync::CommitSyncContext;
 use cross_repo_sync::CommitSyncRepos;
 use cross_repo_sync::CommitSyncer;
 use cross_repo_sync::InMemoryRepo;
-use cross_repo_sync::Large;
 use cross_repo_sync::Repo;
 use cross_repo_sync::SubmoduleDeps;
 use cross_repo_sync::SubmoduleExpansionData;
@@ -69,6 +68,7 @@ use repo_cross_repo::RepoCrossRepo;
 use repo_derived_data::RepoDerivedData;
 use repo_identity::RepoIdentity;
 use sql_construct::SqlConstruct;
+use sql_query_config::SqlQueryConfig;
 use synced_commit_mapping::SqlSyncedCommitMapping;
 use synced_commit_mapping::SyncedCommitMapping;
 use synced_commit_mapping::SyncedCommitMappingEntry;
@@ -87,7 +87,6 @@ pub struct TestRepo {
         dyn BonsaiGlobalrevMapping,
         dyn PushrebaseMutationMapping,
         RepoBookmarkAttrs,
-        dyn Changesets,
         dyn Filenodes,
         FilestoreConfig,
         dyn MutableCounters,
@@ -96,6 +95,7 @@ pub struct TestRepo {
         RepoDerivedData,
         RepoIdentity,
         CommitGraph,
+        dyn CommitGraphWriter,
     )]
     pub blob_repo: BlobRepo,
 
@@ -104,6 +104,9 @@ pub struct TestRepo {
 
     #[facet]
     pub repo_config: RepoConfig,
+
+    #[facet]
+    pub sql_query_config: SqlQueryConfig,
 }
 
 impl AsBlobRepo for TestRepo {
@@ -155,7 +158,7 @@ where
     let rewrite_res = {
         let map = HashMap::new();
         let version = CommitSyncConfigVersion("TEST_VERSION_NAME".to_string());
-        let mover = commit_syncer.get_mover_by_version(&version).await?;
+        let movers = commit_syncer.get_movers_by_version(&version).await?;
         let (x_repo_submodule_metadata_file_prefix, dangling_submodule_pointers) =
             submodule_metadata_file_prefix_and_dangling_pointers(
                 source_repo.repo_identity().id(),
@@ -164,13 +167,14 @@ where
             )
             .await?;
 
+        let small_repo = commit_syncer.get_small_repo();
+        let small_repo_id = small_repo.repo_identity().id();
         let large_repo = commit_syncer.get_large_repo();
-        let large_repo_id = Large(large_repo.repo_identity().id());
         let fallback_repos = vec![Arc::new(source_repo.clone())]
             .into_iter()
             .chain(submodule_deps.repos())
             .collect::<Vec<_>>();
-        let large_in_memory_repo = InMemoryRepo::from_repo(target_repo, fallback_repos)?;
+        let large_in_memory_repo = InMemoryRepo::from_repo(large_repo, fallback_repos)?;
 
         let submodule_expansion_data = match submodule_deps {
             SubmoduleDeps::ForSync(deps) => Some(SubmoduleExpansionData {
@@ -178,7 +182,7 @@ where
                 submodule_deps: deps,
                 x_repo_submodule_metadata_file_prefix: x_repo_submodule_metadata_file_prefix
                     .as_str(),
-                large_repo_id,
+                small_repo_id,
                 dangling_submodule_pointers,
             }),
             SubmoduleDeps::NotNeeded | SubmoduleDeps::NotAvailable => None,
@@ -188,7 +192,7 @@ where
             &ctx,
             source_bcs_mut,
             &map,
-            mover,
+            movers,
             source_repo,
             Default::default(),
             Default::default(),

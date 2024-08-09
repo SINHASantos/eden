@@ -45,7 +45,7 @@ use mononoke_types::FileType;
 use mononoke_types::MPathElement;
 use mononoke_types::NonRootMPath;
 use mononoke_types::SkeletonManifestId;
-use mononoke_types::TrieMap;
+use mononoke_types::SortedVectorTrieMap;
 use sorted_vector_map::SortedVectorMap;
 
 use crate::SkeletonManifestDerivationError;
@@ -237,7 +237,7 @@ async fn create_skeleton_manifest(
         SkeletonManifestId,
         (),
         Option<SkeletonManifestSummary>,
-        TrieMap<Entry<SkeletonManifestId, ()>>,
+        SortedVectorTrieMap<Entry<SkeletonManifestId, ()>>,
     >,
 ) -> Result<(Option<SkeletonManifestSummary>, SkeletonManifestId)> {
     let entries = collect_skeleton_subentries(
@@ -340,8 +340,8 @@ mod test {
     use anyhow::anyhow;
     use bonsai_hg_mapping::BonsaiHgMapping;
     use bookmarks::Bookmarks;
-    use changesets::Changesets;
     use commit_graph::CommitGraph;
+    use commit_graph::CommitGraphWriter;
     use fbinit::FacebookInit;
     use filestore::FilestoreConfig;
     use mononoke_types::ChangesetId;
@@ -351,6 +351,7 @@ mod test {
     use repo_blobstore::RepoBlobstoreRef;
     use repo_derived_data::RepoDerivedData;
     use repo_derived_data::RepoDerivedDataRef;
+    use repo_identity::RepoIdentity;
     use tests_utils::drawdag::changes;
     use tests_utils::drawdag::create_from_dag_with_changes;
     use tests_utils::CreateCommitContext;
@@ -365,15 +366,17 @@ mod test {
         #[facet]
         bookmarks: dyn Bookmarks,
         #[facet]
-        changesets: dyn Changesets,
-        #[facet]
         commit_graph: CommitGraph,
+        #[facet]
+        commit_graph_writer: dyn CommitGraphWriter,
         #[facet]
         repo_derived_data: RepoDerivedData,
         #[facet]
         repo_blobstore: RepoBlobstore,
         #[facet]
         filestore_config: FilestoreConfig,
+        #[facet]
+        repo_identity: RepoIdentity,
     }
 
     const B_FILES: &[&str] = &[

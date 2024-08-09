@@ -24,6 +24,7 @@ use manifest::FsNodeMetadata;
 use manifest::Manifest;
 use repo::repo::Repo;
 use revisionstore::scmstore::file_to_async_key_stream;
+use revisionstore::scmstore::tree::types::TreeAttributes;
 use revisionstore::scmstore::FileAttributes;
 use serde::de::value;
 use serde::de::value::StringDeserializer;
@@ -43,8 +44,14 @@ define_flags! {
         /// Choose fetch mode (e.g. local_only or allow_remote)
         fetch_mode: Option<String>,
 
-        /// Only fetch AUX data (don't request file content).
+        /// Only fetch AUX data (don't request file/tree content).
         aux_only: bool,
+
+        /// Only fetch pure file content (allows request to go to CAS).
+        pure_content: bool,
+
+        /// Request tree parents.
+        tree_parents: bool,
 
         /// Revision for positional file paths.
         #[short('r')]
@@ -121,8 +128,16 @@ pub fn run(ctx: ReqCtx<DebugScmStoreOpts>, repo: &mut Repo) -> Result<u8> {
             keys,
             fetch_mode,
             ctx.opts.aux_only,
+            ctx.opts.pure_content,
         )?,
-        FetchType::Tree => fetch_trees(&ctx.core.io, &fresh_repo, keys, fetch_mode)?,
+        FetchType::Tree => fetch_trees(
+            &ctx.core.io,
+            &fresh_repo,
+            keys,
+            fetch_mode,
+            ctx.opts.tree_parents,
+            ctx.opts.aux_only,
+        )?,
     }
 
     Ok(0)
@@ -134,6 +149,7 @@ fn fetch_files(
     keys: Vec<Key>,
     fetch_mode: FetchMode,
     aux_only: bool,
+    pure_content: bool,
 ) -> Result<()> {
     repo.file_store()?;
     let store = repo.file_scm_store().unwrap();
@@ -155,7 +171,8 @@ fn fetch_files(
     let mut missing = fetch_and_display_successes(
         keys,
         FileAttributes {
-            content: !aux_only,
+            pure_content: !aux_only,
+            content_header: !aux_only && !pure_content,
             aux_data: true,
         },
     );
@@ -166,14 +183,16 @@ fn fetch_files(
         missing = fetch_and_display_successes(
             missing.into_keys().collect(),
             FileAttributes {
-                content: true,
+                pure_content: true,
+                content_header: !pure_content,
                 aux_data: false,
             },
         );
         missing = fetch_and_display_successes(
             missing.into_keys().collect(),
             FileAttributes {
-                content: false,
+                pure_content: false,
+                content_header: false,
                 aux_data: true,
             },
         );
@@ -186,13 +205,29 @@ fn fetch_files(
     Ok(())
 }
 
-fn fetch_trees(io: &IO, repo: &Repo, keys: Vec<Key>, fetch_mode: FetchMode) -> Result<()> {
+fn fetch_trees(
+    io: &IO,
+    repo: &Repo,
+    keys: Vec<Key>,
+    fetch_mode: FetchMode,
+    tree_parents: bool,
+    aux_only: bool,
+) -> Result<()> {
     repo.tree_store()?;
     let store = repo.tree_scm_store().unwrap();
 
     let mut stdout = io.output();
 
-    let fetch_result = store.fetch_batch(keys.into_iter(), fetch_mode);
+    let mut attrs = if aux_only {
+        TreeAttributes::AUX_DATA
+    } else {
+        TreeAttributes::CONTENT
+    };
+    if tree_parents {
+        attrs |= TreeAttributes::PARENTS;
+    }
+
+    let fetch_result = store.fetch_batch(keys.into_iter(), attrs, fetch_mode);
 
     let (found, missing, _errors) = fetch_result.consume();
     for complete in found.into_iter() {

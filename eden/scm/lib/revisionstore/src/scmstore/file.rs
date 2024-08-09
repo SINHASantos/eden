@@ -20,6 +20,7 @@ use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::ensure;
 use anyhow::Result;
+use cas_client::CasClient;
 use clientinfo::get_client_request_info_thread_local;
 use clientinfo::set_client_request_info_thread_local;
 use crossbeam::channel::unbounded;
@@ -42,7 +43,6 @@ pub use self::types::StoreFile;
 use crate::datastore::HgIdDataStore;
 use crate::datastore::HgIdMutableDeltaStore;
 use crate::datastore::RemoteDataStore;
-use crate::fetch_logger::FetchLogger;
 use crate::indexedlogauxstore::AuxStore;
 use crate::indexedlogdatastore::Entry;
 use crate::indexedlogdatastore::IndexedLogHgIdDataStore;
@@ -87,9 +87,6 @@ pub struct FileStore {
     // Configured by scmstore.max-prefetch-size, where 0 means unlimited.
     pub(crate) max_prefetch_size: usize,
 
-    // Record remote fetches
-    pub(crate) fetch_logger: Option<Arc<FetchLogger>>,
-
     // Local-only stores
     pub(crate) indexedlog_local: Option<Arc<IndexedLogHgIdDataStore>>,
     pub(crate) lfs_local: Option<Arc<LfsStore>>,
@@ -109,6 +106,8 @@ pub struct FileStore {
 
     // Aux Data Store
     pub(crate) aux_cache: Option<Arc<AuxStore>>,
+
+    pub(crate) cas_client: Option<Arc<dyn CasClient>>,
 
     // Metrics, statistics, debugging
     pub(crate) activity_logger: Option<Arc<Mutex<ActivityLogger>>>,
@@ -179,6 +178,7 @@ impl FileStore {
         let lfs_cache = self.lfs_cache.clone();
         let lfs_local = self.lfs_local.clone();
         let edenapi = self.edenapi.clone();
+        let cas_client = self.cas_client.clone();
         let lfs_remote = self.lfs_remote.clone();
         let contentstore = self.contentstore.clone();
         let metrics = self.metrics.clone();
@@ -204,11 +204,17 @@ impl FileStore {
             );
             let _enter = span.enter();
 
-            if fetch_local {
+            if fetch_local || (fetch_remote && cas_client.is_some()) {
                 if let Some(ref aux_cache) = aux_cache {
-                    state.fetch_aux_indexedlog(aux_cache, StoreLocation::Cache);
+                    state.fetch_aux_indexedlog(
+                        aux_cache,
+                        StoreLocation::Cache,
+                        cas_client.is_some(),
+                    );
                 }
+            }
 
+            if fetch_local {
                 if let Some(ref indexedlog_cache) = indexedlog_cache {
                     state.fetch_indexedlog(
                         indexedlog_cache,
@@ -235,6 +241,10 @@ impl FileStore {
             }
 
             if fetch_remote {
+                if let Some(cas_client) = &cas_client {
+                    state.fetch_cas(cas_client);
+                }
+
                 if let Some(ref edenapi) = edenapi {
                     state.fetch_edenapi(
                         edenapi,
@@ -397,7 +407,7 @@ impl FileStore {
 
         let mut metrics = self.metrics.write();
         for (k, v) in metrics.metrics() {
-            hg_metrics::increment_counter(k, v);
+            hg_metrics::increment_counter(k, v as u64);
         }
         *metrics = Default::default();
 
@@ -435,9 +445,9 @@ impl FileStore {
 
             edenapi: None,
             lfs_remote: None,
+            cas_client: None,
 
             contentstore: None,
-            fetch_logger: None,
             metrics: FileStoreMetrics::new(),
             activity_logger: None,
 
@@ -461,6 +471,48 @@ impl FileStore {
         clone.contentstore = Some(cs);
         clone
     }
+
+    /// Returns only the local cache / shared stores, in place of the local-only stores,
+    /// such that writes will go directly to the local cache.
+    pub fn with_shared_only(&self) -> Self {
+        // this is infallible in ContentStore so panic if there are no shared/cache stores.
+        assert!(
+            self.indexedlog_cache.is_some() || self.lfs_cache.is_some(),
+            "cannot get shared_mutable, no shared / local cache stores available"
+        );
+
+        Self {
+            extstored_policy: self.extstored_policy.clone(),
+            lfs_threshold_bytes: self.lfs_threshold_bytes.clone(),
+            edenapi_retries: self.edenapi_retries.clone(),
+            allow_write_lfs_ptrs: self.allow_write_lfs_ptrs,
+
+            prefetch_aux_data: self.prefetch_aux_data,
+            compute_aux_data: self.compute_aux_data,
+            max_prefetch_size: self.max_prefetch_size,
+
+            indexedlog_local: self.indexedlog_cache.clone(),
+            lfs_local: self.lfs_cache.clone(),
+
+            indexedlog_cache: None,
+            lfs_cache: None,
+
+            edenapi: None,
+            lfs_remote: None,
+            cas_client: None,
+
+            contentstore: None,
+            metrics: self.metrics.clone(),
+            activity_logger: self.activity_logger.clone(),
+
+            aux_cache: None,
+
+            lfs_progress: self.lfs_progress.clone(),
+
+            // Conservatively flushing on drop here, didn't see perf problems and might be needed by Python
+            flush_on_drop: true,
+        }
+    }
 }
 
 impl FileStore {
@@ -482,45 +534,9 @@ impl FileStore {
 }
 
 impl LegacyStore for FileStore {
-    /// Returns only the local cache / shared stores, in place of the local-only stores, such that writes will go directly to the local cache.
     /// For compatibility with ContentStore::get_shared_mutable
     fn get_shared_mutable(&self) -> Arc<dyn HgIdMutableDeltaStore> {
-        // this is infallible in ContentStore so panic if there are no shared/cache stores.
-        assert!(
-            self.indexedlog_cache.is_some() || self.lfs_cache.is_some(),
-            "cannot get shared_mutable, no shared / local cache stores available"
-        );
-        Arc::new(FileStore {
-            extstored_policy: self.extstored_policy.clone(),
-            lfs_threshold_bytes: self.lfs_threshold_bytes.clone(),
-            edenapi_retries: self.edenapi_retries.clone(),
-            allow_write_lfs_ptrs: self.allow_write_lfs_ptrs,
-
-            prefetch_aux_data: self.prefetch_aux_data,
-            compute_aux_data: self.compute_aux_data,
-            max_prefetch_size: self.max_prefetch_size,
-
-            indexedlog_local: self.indexedlog_cache.clone(),
-            lfs_local: self.lfs_cache.clone(),
-
-            indexedlog_cache: None,
-            lfs_cache: None,
-
-            edenapi: None,
-            lfs_remote: None,
-
-            contentstore: None,
-            fetch_logger: self.fetch_logger.clone(),
-            metrics: self.metrics.clone(),
-            activity_logger: self.activity_logger.clone(),
-
-            aux_cache: None,
-
-            lfs_progress: self.lfs_progress.clone(),
-
-            // Conservatively flushing on drop here, didn't see perf problems and might be needed by Python
-            flush_on_drop: true,
-        })
+        Arc::new(self.with_shared_only())
     }
 
     fn get_file_content(&self, key: &Key) -> Result<Option<Bytes>> {

@@ -18,11 +18,12 @@ use crate::ops::DagExportPullData;
 use crate::ops::DagImportPullData;
 use crate::ops::DagPersistent;
 use crate::ops::IdConvert;
+use crate::tests::dbg;
 use crate::Group;
 use crate::Id;
 use crate::Set;
+use crate::Vertex;
 use crate::VertexListWithOptions;
-use crate::VertexName;
 
 #[tokio::test]
 async fn test_sparse_dag() {
@@ -55,7 +56,7 @@ async fn test_sparse_dag() {
         // Note: some ids (ex. 11) does not have matching name in its IdMap.
         // The server-side non-master (X) is not cloned.
         assert_eq!(
-            format!("{:?}", &client.dag),
+            dbg(&client.dag),
             r#"Max Level: 0
  Level 0
   Group Master:
@@ -86,16 +87,13 @@ async fn test_sparse_dag() {
         assert_eq!(client.dag.vertex_name(Id(9)).await.unwrap(), "C".into());
         assert_eq!(client.dag.vertex_id("E".into()).await.unwrap(), Id(11));
 
-        // NameSet iteration works too, and resolve Ids in batch.
-        let all: Vec<VertexName> = {
+        // Set iteration works too, and resolve Ids in batch.
+        let all: Vec<Vertex> = {
             let all = client.dag.all().await.unwrap();
             let iter = all.iter().await.unwrap();
             iter.try_collect().await.unwrap()
         };
-        assert_eq!(
-            format!("{:?}", all),
-            "[M, E, D, C, B, J, L, K, I, H, G, F, A]"
-        );
+        assert_eq!(dbg(all), "[M, E, D, C, B, J, L, K, I, H, G, F, A]");
 
         assert_eq!(
             client.output(),
@@ -160,10 +158,7 @@ async fn test_add_heads() {
     let parents = pending.dag.dag_snapshot().unwrap();
     client
         .dag
-        .add_heads(
-            &parents,
-            &vec![VertexName::from("G"), VertexName::from("K")].into(),
-        )
+        .add_heads(&parents, &vec![Vertex::from("G"), Vertex::from("K")].into())
         .await
         .unwrap();
     assert_eq!(
@@ -532,7 +527,7 @@ async fn test_flush_no_over_fetch() {
     );
 
     // Flush with a master head. Should not fetch anything.
-    let heads = VertexListWithOptions::from(vec![VertexName::copy_from(b"E")])
+    let heads = VertexListWithOptions::from(vec![Vertex::copy_from(b"E")])
         .with_desired_group(Group::MASTER);
     client.dag.flush(&heads).await.unwrap();
     assert_eq!(client.output(), [] as [&str; 0]);
@@ -701,8 +696,8 @@ async fn test_resolve_mixed_result() {
             .with_remote(&server);
         let ids = client.dag.vertex_id_batch(&names).await;
         assert_eq!(
-            format!("{:?}", ids),
-            "Ok([Ok(0), Ok(1), Ok(2), Ok(3), Ok(4), Ok(5), Ok(6), Ok(7), Err(VertexNotFound(I)), Err(VertexNotFound(J)), Err(VertexNotFound(X))])",
+            dbg(ids),
+            "Ok([Ok(0), Ok(1), Ok(2), Ok(3), Ok(4), Ok(5), Ok(6), Ok(7), Err(VertexNotFound(I)), Err(VertexNotFound(J)), Err(VertexNotFound(X))])"
         );
         assert_eq!(
             client.output(),
@@ -724,7 +719,7 @@ async fn client_for_local_cache_test() -> TestDag {
     server.client_cloned_data().await
 }
 
-async fn check_local_cache(client: &TestDag, v: VertexName, id: Id) {
+async fn check_local_cache(client: &TestDag, v: Vertex, id: Id) {
     // Try looking up vertex using different APIs.
     assert_eq!(client.dag.vertex_id(v.clone()).await.unwrap(), id);
     assert!(client.output().is_empty());
@@ -785,7 +780,7 @@ async fn check_local_cache(client: &TestDag, v: VertexName, id: Id) {
 async fn test_local_cache_existing_vertex_to_id() {
     let client = client_for_local_cache_test().await;
 
-    let v: VertexName = "C".into();
+    let v: Vertex = "C".into();
     let id = client.dag.vertex_id(v.clone()).await.unwrap();
     assert_eq!(client.output(), ["resolve names: [C], heads: [G]"]);
 

@@ -406,37 +406,133 @@ class SuffixGlobRequestScope {
   SuffixGlobRequestScope(
       std::string globberLogString,
       const std::shared_ptr<ServerState>& serverState,
+      bool isLocal,
       const ObjectFetchContextPtr& context)
       : globberLogString_{std::move(globberLogString)},
         serverState_{serverState},
+        isLocal_{isLocal},
         context_{context} {}
 
   ~SuffixGlobRequestScope() {
     // Logging completion time for the request
     auto elapsed = itcTimer_.elapsed();
     auto duration = std::chrono::duration<double>{elapsed}.count();
-    std::string client_cmdline;
+    std::string client_cmdline = "<unknown>";
     if (auto clientPid = context_->getClientPid()) {
       // TODO: we should look up client scope here instead of command line
       // since it will give move context into the overarching process or
       // system producing the expensive query
-      client_cmdline = serverState_->getProcessInfoCache()
-                           ->lookup(clientPid.value().get())
-                           .get()
-                           .name;
-      std::replace(client_cmdline.begin(), client_cmdline.end(), '\0', ' ');
+      // To avoid waiting on retrieving the ProcessInfo, only get the
+      // client_commandline if it's immediately available
+      const ProcessInfo* processInfoPtr = serverState_->getProcessInfoCache()
+                                              ->lookup(clientPid.value().get())
+                                              .get_optional();
+      if (processInfoPtr) {
+        client_cmdline = processInfoPtr->name;
+        std::replace(client_cmdline.begin(), client_cmdline.end(), '\0', ' ');
+      }
     }
 
-    XLOG(WARN) << "EdenFS asked to evaluate suffix glob by caller "
-               << client_cmdline << ":" << globberLogString_
+    XLOG(DBG4) << "EdenFS asked to evaluate suffix glob by caller '"
+               << client_cmdline << "':" << globberLogString_
                << ": duration=" << duration << "s";
-    serverState_->getStructuredLogger()->logEvent(
-        SuffixGlob{duration, globberLogString_, std::move(client_cmdline)});
+    serverState_->getStructuredLogger()->logEvent(SuffixGlob{
+        duration, globberLogString_, std::move(client_cmdline), isLocal_});
   }
 
  private:
   std::string globberLogString_;
   const std::shared_ptr<ServerState>& serverState_;
+  bool isLocal_;
+  const ObjectFetchContextPtr& context_;
+  folly::stop_watch<std::chrono::microseconds> itcTimer_ = {};
+}; // namespace
+
+/**
+ * Lives as long as a glob files request and primarily exists to record logging
+ * and telemetry.
+ */
+class GlobFilesRequestScope {
+ public:
+  GlobFilesRequestScope(GlobFilesRequestScope&&) = delete;
+  GlobFilesRequestScope& operator=(GlobFilesRequestScope&&) = delete;
+
+  explicit GlobFilesRequestScope(
+      const std::shared_ptr<ServerState>& serverState,
+      bool isOffloadable,
+      std::string logString,
+      const ObjectFetchContextPtr& context)
+      : serverState_{serverState},
+        isOffloadable_{isOffloadable},
+        logString_{logString},
+        context_{context} {}
+
+  ~GlobFilesRequestScope() {
+    // Logging completion time for the request
+    auto elapsed = itcTimer_.elapsed();
+    auto duration = std::chrono::duration<double>{elapsed}.count();
+    XLOG(DBG4) << "EdenFS completed globFiles request in " << duration << "s"
+               << " using " << (local ? "Local" : "SaplingRemoteAPI")
+               << (fallback ? " Fallback" : "");
+
+    // Log if this request is an expensive request
+    if (duration >= EXPENSIVE_GLOB_FILES_DURATION) {
+      std::string client_cmdline = "<unknown>";
+      if (auto clientPid = context_->getClientPid()) {
+        // TODO: we should look up client scope here instead of command line
+        // since it will give move context into the overarching process or
+        // system producing the expensive query
+        const ProcessInfo* processInfoPtr =
+            serverState_->getProcessInfoCache()
+                ->lookup(clientPid.value().get())
+                .get_optional();
+        if (processInfoPtr) {
+          client_cmdline = processInfoPtr->name;
+          std::replace(client_cmdline.begin(), client_cmdline.end(), '\0', ' ');
+        }
+      }
+
+      serverState_->getStructuredLogger()->logEvent(ExpensiveGlob{
+          duration, logString_, std::move(client_cmdline), local});
+    }
+    if (local) {
+      if (isOffloadable_) {
+        serverState_->getStats()->addDuration(
+            &ThriftStats::globFilesLocalOffloadableDuration, elapsed);
+      } else {
+        serverState_->getStats()->addDuration(
+            &ThriftStats::globFilesLocalDuration, elapsed);
+      }
+      serverState_->getStats()->increment(&ThriftStats::globFilesLocal);
+    } else {
+      if (fallback) {
+        serverState_->getStats()->addDuration(
+            &ThriftStats::globFilesSaplingRemoteAPIFallbackDuration, elapsed);
+        serverState_->getStats()->increment(
+            &ThriftStats::globFilesSaplingRemoteAPIFallback);
+      } else {
+        serverState_->getStats()->addDuration(
+            &ThriftStats::globFilesSaplingRemoteAPISuccessDuration, elapsed);
+        serverState_->getStats()->increment(
+            &ThriftStats::globFilesSaplingRemoteAPISuccess);
+      }
+    }
+  }
+
+  void setLocal(bool isLocal) {
+    local = isLocal;
+  }
+
+  void setFallback(bool isFallback) {
+    fallback = isFallback;
+  }
+
+ private:
+  bool local = true;
+  bool fallback = false;
+  const std::shared_ptr<ServerState>& serverState_;
+  bool isOffloadable_;
+  std::string logString_;
   const ObjectFetchContextPtr& context_;
   folly::stop_watch<std::chrono::microseconds> itcTimer_ = {};
 }; // namespace
@@ -456,6 +552,51 @@ facebook::eden::InodePtr inodeFromUserPath(
     const ObjectFetchContextPtr& context) {
   auto relPath = relpathFromUserPath(rootRelativePath);
   return mount.getInodeSlow(relPath, context).get();
+}
+
+bool shouldUseSaplingRemoteAPI(
+    bool useSaplingRemoteAPISuffixes,
+    const GlobParams& params) {
+  // The following parameters will default to local lookup
+  // Commands related to prefetching or the working copy
+  //   - prefetchFiles
+  //   - suppressFileList
+  // - searchRoot - root is always the repository root
+  // - predictiveGlob - This pathway only accepts suffixes
+  // - listOnlyFiles - Only files will be returned
+  // Ignore
+  //   - prefetchMetadata, it is explicitly called
+  // out as having no effect
+  //   - sync, not used globFiles. If sync behavior is desired
+  //   use synchronizeWorkingCopy
+
+  // Handle unsupported flags
+  if (*params.prefetchFiles() || *params.suppressFileList()) {
+    XLOG(DBG3)
+        << "globFiles request cannot be offloaded to SaplingRemoteAPI due to prefetching: prefetchFiles="
+        << *params.prefetchFiles()
+        << ", suppressFileList=" << *params.suppressFileList()
+        << ". Falling back to local pathway";
+    useSaplingRemoteAPISuffixes = false;
+  } else if (
+      !((*params.searchRoot()).empty()) && !(*params.searchRoot() == ".")) {
+    // searchRoot is relative to root
+    XLOG(DBG3)
+        << "globFiles request cannot be offloaded to SaplingRemoteAPI due to searchRoot '"
+        << *params.searchRoot() << "'" << " not being mount root '.'"
+        << ", falling back to local pathway";
+    useSaplingRemoteAPISuffixes = false;
+  } else if (params.predictiveGlob()) {
+    XLOG(DBG3)
+        << "globFiles request cannot be offloaded to SaplingRemoteAPI due to predictiveGlob, falling back to local pathway";
+    useSaplingRemoteAPISuffixes = false;
+  } else if (!(*params.listOnlyFiles())) {
+    XLOG(DBG3)
+        << "globFiles request cannot be offloaded to SaplingRemoteAPI due to asking for files and directories, falling back to local pathway";
+    useSaplingRemoteAPISuffixes = false;
+  }
+
+  return useSaplingRemoteAPISuffixes;
 }
 
 } // namespace
@@ -1567,6 +1708,9 @@ void convertHgImportTraceEventToHgEvent(
     case HgImportTraceEvent::BLOBMETA:
       te.resourceType_ref() = HgResourceType::BLOBMETA;
       break;
+    case HgImportTraceEvent::TREEMETA:
+      te.resourceType_ref() = HgResourceType::TREEMETA;
+      break;
   }
 
   switch (event.importPriority) {
@@ -2381,15 +2525,16 @@ getAllEntryAttributes(
     EntryAttributeFlags requestedAttributes,
     const EdenMount& edenMount,
     std::string path,
-    const ObjectFetchContextPtr& fetchContext) {
+    const ObjectFetchContextPtr& fetchContext,
+    bool shouldFetchTreeMetadata) {
   auto virtualInode =
       edenMount.getVirtualInode(RelativePathPiece{path}, fetchContext);
   return std::move(virtualInode)
       .thenValue([path = std::move(path),
                   requestedAttributes,
                   objectStore = edenMount.getObjectStore(),
-                  fetchContext =
-                      fetchContext.copy()](VirtualInode tree) mutable {
+                  fetchContext = fetchContext.copy(),
+                  shouldFetchTreeMetadata](VirtualInode tree) mutable {
         if (!tree.isDirectory()) {
           return ImmediateFuture<std::vector<
               std::pair<PathComponent, folly::Try<EntryAttributes>>>>(
@@ -2399,7 +2544,11 @@ getAllEntryAttributes(
                   fmt::format("{}: path must be a directory", path)));
         }
         return tree.getChildrenAttributes(
-            requestedAttributes, RelativePath{path}, objectStore, fetchContext);
+            requestedAttributes,
+            RelativePath{path},
+            objectStore,
+            fetchContext,
+            shouldFetchTreeMetadata);
       });
 }
 
@@ -2528,6 +2677,9 @@ EdenServiceHandler::semifuture_readdir(std::unique_ptr<ReaddirParams> params) {
   auto& fetchContext = helper->getFetchContext();
   auto requestedAttributes =
       EntryAttributeFlags::raw(*params->requestedAttributes());
+  auto shouldFetchTreeMetadata = server_->getServerState()
+                                     ->getEdenConfig()
+                                     ->shouldFetchTreeMetadata.getValue();
   return wrapImmediateFuture(
              std::move(helper),
              waitForPendingWrites(mountHandle.getEdenMount(), *params->sync())
@@ -2535,7 +2687,8 @@ EdenServiceHandler::semifuture_readdir(std::unique_ptr<ReaddirParams> params) {
                      [mountHandle,
                       requestedAttributes,
                       paths = std::move(paths),
-                      fetchContext = fetchContext.copy()](auto&&) mutable
+                      fetchContext = fetchContext.copy(),
+                      shouldFetchTreeMetadata](auto&&) mutable
                      -> ImmediateFuture<
                          std::vector<DirListAttributeDataOrError>> {
                        std::vector<ImmediateFuture<DirListAttributeDataOrError>>
@@ -2547,7 +2700,8 @@ EdenServiceHandler::semifuture_readdir(std::unique_ptr<ReaddirParams> params) {
                                  requestedAttributes,
                                  mountHandle.getEdenMount(),
                                  std::move(path),
-                                 fetchContext)
+                                 fetchContext,
+                                 shouldFetchTreeMetadata)
                                  .thenTry([requestedAttributes, mountHandle](
                                               folly::Try<std::vector<std::pair<
                                                   PathComponent,
@@ -2582,18 +2736,27 @@ EdenServiceHandler::getEntryAttributes(
     const EdenMount& edenMount,
     const std::vector<std::string>& paths,
     EntryAttributeFlags reqBitmask,
+    AttributesRequestScope reqScope,
     SyncBehavior sync,
-    const ObjectFetchContextPtr& fetchContext) {
+    const ObjectFetchContextPtr& fetchContext,
+    bool shouldFetchTreeMetadata) {
   return waitForPendingWrites(edenMount, sync)
       .thenValue([this,
                   &edenMount,
                   &paths,
                   fetchContext = fetchContext.copy(),
-                  reqBitmask](auto&&) mutable {
+                  reqBitmask,
+                  reqScope,
+                  shouldFetchTreeMetadata](auto&&) mutable {
         vector<ImmediateFuture<EntryAttributes>> futures;
         for (const auto& path : paths) {
           futures.emplace_back(getEntryAttributesForPath(
-              edenMount, reqBitmask, path, fetchContext));
+              edenMount,
+              reqBitmask,
+              reqScope,
+              path,
+              fetchContext,
+              shouldFetchTreeMetadata));
         }
 
         // Collect all futures into a single tuple
@@ -2601,11 +2764,29 @@ EdenServiceHandler::getEntryAttributes(
       });
 }
 
+namespace {
+bool dtypeMatchesRequestScope(
+    VirtualInode inode,
+    AttributesRequestScope reqScope) {
+  if (reqScope == AttributesRequestScope::TREES_AND_FILES) {
+    return true;
+  }
+
+  if (inode.isDirectory()) {
+    return reqScope == AttributesRequestScope::TREES;
+  } else {
+    return reqScope == AttributesRequestScope::FILES;
+  }
+}
+} // namespace
+
 ImmediateFuture<EntryAttributes> EdenServiceHandler::getEntryAttributesForPath(
     const EdenMount& edenMount,
     EntryAttributeFlags reqBitmask,
+    AttributesRequestScope reqScope,
     std::string_view path,
-    const ObjectFetchContextPtr& fetchContext) {
+    const ObjectFetchContextPtr& fetchContext,
+    bool shouldFetchTreeMetadata) {
   if (path.empty()) {
     return ImmediateFuture<EntryAttributes>(newEdenError(
         EINVAL,
@@ -2619,14 +2800,21 @@ ImmediateFuture<EntryAttributes> EdenServiceHandler::getEntryAttributesForPath(
     return edenMount.getVirtualInode(relativePath, fetchContext)
         .thenValue([&edenMount,
                     reqBitmask,
+                    reqScope,
                     relativePath = relativePath.copy(),
-                    fetchContext =
-                        fetchContext.copy()](const VirtualInode& virtualInode) {
-          return virtualInode.getEntryAttributes(
-              reqBitmask,
-              relativePath,
-              edenMount.getObjectStore(),
-              fetchContext);
+                    fetchContext = fetchContext.copy(),
+                    shouldFetchTreeMetadata](const VirtualInode& virtualInode) {
+          if (dtypeMatchesRequestScope(virtualInode, reqScope)) {
+            return virtualInode.getEntryAttributes(
+                reqBitmask,
+                relativePath,
+                edenMount.getObjectStore(),
+                fetchContext,
+                shouldFetchTreeMetadata);
+          }
+          return makeImmediateFuture<EntryAttributes>(PathError(
+              reqScope == AttributesRequestScope::TREES ? ENOTDIR : EISDIR,
+              relativePath));
         });
   } catch (const std::exception& e) {
     return ImmediateFuture<EntryAttributes>(
@@ -2642,6 +2830,13 @@ constexpr EntryAttributeFlags kAllEntryAttributes = ENTRY_ATTRIBUTE_SIZE |
 folly::SemiFuture<std::unique_ptr<GetAttributesFromFilesResult>>
 EdenServiceHandler::semifuture_getAttributesFromFiles(
     std::unique_ptr<GetAttributesFromFilesParams> params) {
+  if (params->scope_ref().has_value()) {
+    return folly::SemiFuture<
+        std::unique_ptr<GetAttributesFromFilesResult>>(newEdenError(
+        EINVAL,
+        EdenErrorType::ARGUMENT_ERROR,
+        "scope is not supported by legacy getAttributesFromFiles endpoint"));
+  }
   auto mountPoint = *params->mountPoint();
   auto mountPath = absolutePathFromThrift(mountPoint);
   auto mountHandle = server_->getMount(mountPath);
@@ -2659,12 +2854,15 @@ EdenServiceHandler::semifuture_getAttributesFromFiles(
   // TODO(kmancini): When Buck2 migrates to our
   // explicit type information, we can get shape up
   // this API better.
+  auto config = server_->getServerState()->getEdenConfig();
   auto entryAttributesFuture = getEntryAttributes(
       mountHandle.getEdenMount(),
       paths,
       kAllEntryAttributes,
+      AttributesRequestScope::FILES,
       *params->sync(),
-      fetchContext);
+      fetchContext,
+      config->shouldFetchTreeMetadata.getValue());
 
   return wrapImmediateFuture(
              std::move(helper),
@@ -2753,6 +2951,8 @@ folly::SemiFuture<std::unique_ptr<GetAttributesFromFilesResultV2>>
 EdenServiceHandler::semifuture_getAttributesFromFilesV2(
     std::unique_ptr<GetAttributesFromFilesParams> params) {
   auto mountHandle = lookupMount(params->mountPoint());
+  auto reqScope =
+      params->scope().value_or(AttributesRequestScope::TREES_AND_FILES);
   auto reqBitmask = EntryAttributeFlags::raw(*params->requestedAttributes());
   std::vector<std::string>& paths = params->paths().value();
   auto helper = INSTRUMENT_THRIFT_CALL(
@@ -2762,12 +2962,15 @@ EdenServiceHandler::semifuture_getAttributesFromFilesV2(
       toLogArg(paths));
   auto& fetchContext = helper->getFetchContext();
 
+  auto config = server_->getServerState()->getEdenConfig();
   auto entryAttributesFuture = getEntryAttributes(
       mountHandle.getEdenMount(),
       paths,
       reqBitmask,
+      reqScope,
       *params->sync(),
-      fetchContext);
+      fetchContext,
+      config->shouldFetchTreeMetadata.getValue());
 
   return wrapImmediateFuture(
              std::move(helper),
@@ -2905,16 +3108,25 @@ ImmediateFuture<std::unique_ptr<ReturnType>> detachIfBackgrounded(
 template <typename ReturnType>
 folly::SemiFuture<std::unique_ptr<ReturnType>> serialDetachIfBackgrounded(
     ImmediateFuture<std::unique_ptr<ReturnType>> future,
-    const std::shared_ptr<apache::thrift::ThriftServer>& thriftServer,
-    const std::shared_ptr<const EdenConfig>& edenConfig,
+    EdenServer* const server,
     bool background) {
+  // If we're already using serial execution across the board, just do a normal
+  // detachIfBackgrounded
+  if (server->usingThriftSerialExecution()) {
+    return detachIfBackgrounded(
+               std::move(future), server->getServerState(), background)
+        .semi();
+  }
+
   folly::Executor::KeepAlive<> serial;
-  if (edenConfig->thriftUseSmallSerialExecutor.getValue()) {
+  if (server->getServerState()
+          ->getEdenConfig()
+          ->thriftUseSmallSerialExecutor.getValue()) {
     serial = folly::SmallSerialExecutor::create(
-        thriftServer->getThreadManager().get());
+        server->getServer()->getThreadManager().get());
   } else {
-    serial =
-        folly::SerialExecutor::create(thriftServer->getThreadManager().get());
+    serial = folly::SerialExecutor::create(
+        server->getServer()->getThreadManager().get());
   }
 
   if (background) {
@@ -2945,16 +3157,25 @@ ImmediateFuture<folly::Unit> detachIfBackgrounded(
 
 folly::SemiFuture<folly::Unit> serialDetachIfBackgrounded(
     ImmediateFuture<folly::Unit> future,
-    const std::shared_ptr<apache::thrift::ThriftServer>& thriftServer,
-    const std::shared_ptr<const EdenConfig>& edenConfig,
+    EdenServer* const server,
     bool background) {
+  // If we're already using serial execution across the board, just do a normal
+  // detachIfBackgrounded
+  if (server->usingThriftSerialExecution()) {
+    return detachIfBackgrounded(
+               std::move(future), server->getServerState(), background)
+        .semi();
+  }
+
   folly::Executor::KeepAlive<> serial;
-  if (edenConfig->thriftUseSmallSerialExecutor.getValue()) {
+  if (server->getServerState()
+          ->getEdenConfig()
+          ->thriftUseSmallSerialExecutor.getValue()) {
     serial = folly::SmallSerialExecutor::create(
-        thriftServer->getThreadManager().get());
+        server->getServer()->getThreadManager().get());
   } else {
-    serial =
-        folly::SerialExecutor::create(thriftServer->getThreadManager().get());
+    serial = folly::SerialExecutor::create(
+        server->getServer()->getThreadManager().get());
   }
 
   if (background) {
@@ -2987,16 +3208,18 @@ void maybeLogExpensiveGlob(
 
   if (shouldLogExpensiveGlob) {
     auto logString = globber.logString(globs);
-    std::string client_cmdline;
+    std::string client_cmdline = "<unknown>";
     if (auto clientPid = context->getClientPid()) {
       // TODO: we should look up client scope here instead of command line
       // since it will give move context into the overarching process or
       // system producing the expensive query
-      client_cmdline = serverState->getProcessInfoCache()
-                           ->lookup(clientPid.value().get())
-                           .get()
-                           .name;
-      std::replace(client_cmdline.begin(), client_cmdline.end(), '\0', ' ');
+      const ProcessInfo* processInfoPtr = serverState->getProcessInfoCache()
+                                              ->lookup(clientPid.value().get())
+                                              .get_optional();
+      if (processInfoPtr) {
+        client_cmdline = processInfoPtr->name;
+        std::replace(client_cmdline.begin(), client_cmdline.end(), '\0', ' ');
+      }
     }
 
     XLOG(WARN) << "EdenFS asked to evaluate expensive glob by caller "
@@ -3187,10 +3410,7 @@ EdenServiceHandler::semifuture_predictiveGlobFiles(
     // single thread by using `folly::SerialExecutor` so the glob queries will
     // not overload the executor.
     return serialDetachIfBackgrounded<Glob>(
-        std::move(future),
-        server_->getServer(),
-        server_->getServerState()->getEdenConfig(),
-        isBackground);
+        std::move(future), server_, isBackground);
   } else {
     return detachIfBackgrounded<Glob>(
                std::move(future), serverState, isBackground)
@@ -3230,56 +3450,77 @@ EdenServiceHandler::semifuture_globFiles(std::unique_ptr<GlobParams> params) {
   std::unique_ptr<SuffixGlobRequestScope> suffixGlobRequestScope;
   auto edenConfig = server_->getServerState()->getEdenConfig();
 
-  auto globFilesOrErrorFuture =
-      std::move(backgroundFuture).thenValue([](auto&&) {
-        return folly::Try<std::unique_ptr<Glob>>{newEdenError(
-            EINVAL,
-            EdenErrorType::ARGUMENT_ERROR,
-            "No suffix queries in input globs, using fallback.")};
-      });
-  if (edenConfig->enableEdenAPISuffixQuery.getValue()) {
-    // Matches **/*.suffix
-    // Captures the .suffix
-    static const re2::RE2 suffixRegex("\\*\\*/\\*(\\.[A-z0-9]+)");
-    std::vector<std::string> suffixGlobs;
-    std::vector<std::string> nonSuffixGlobs;
+  ImmediateFuture<unique_ptr<Glob>> globFut{std::in_place};
 
-    // Copying to new vectors, since we want to keep the original around
-    // in case we need to fall back to the legacy pathway
-    for (const auto& glob : *params->globs_ref()) {
-      std::string capture;
-      if (re2::RE2::FullMatch(glob, suffixRegex, &capture)) {
-        suffixGlobs.push_back(capture);
-      } else {
-        nonSuffixGlobs.push_back(glob);
-      }
+  // Offload suffix queries to EdenAPI
+  bool useSaplingRemoteAPISuffixes = shouldUseSaplingRemoteAPI(
+      edenConfig->enableEdenAPISuffixQuery.getValue(), *params);
+
+  // Matches **/*.suffix
+  // Captures the .suffix
+  static const re2::RE2 suffixRegex("\\*\\*/\\*(\\.[A-z0-9]+)");
+  std::vector<std::string> suffixGlobs;
+  std::vector<std::string> nonSuffixGlobs;
+
+  // Copying to new vectors, since we want to keep the original around
+  // in case we need to fall back to the legacy pathway
+  for (const auto& glob : *params->globs_ref()) {
+    std::string capture;
+    if (re2::RE2::FullMatch(glob, suffixRegex, &capture)) {
+      suffixGlobs.push_back(capture);
+    } else {
+      nonSuffixGlobs.push_back(glob);
     }
+  }
 
-    if (!suffixGlobs.empty() && nonSuffixGlobs.empty()) {
+  bool requestIsOffloadable = !suffixGlobs.empty() && nonSuffixGlobs.empty() &&
+      (((*params->searchRoot()).empty()) || (*params->searchRoot() == "."));
+
+  auto globFilesRequestScope = std::make_shared<GlobFilesRequestScope>(
+      server_->getServerState(),
+      requestIsOffloadable,
+      globber.logString(*params->globs()),
+      context);
+
+  if (requestIsOffloadable) {
+    XLOG(DBG5)
+        << "globFiles request is only suffix globs, can be offloaded to EdenAPI";
+    auto suffixGlobLogString = globber.logString(suffixGlobs);
+    suffixGlobRequestScope = std::make_unique<SuffixGlobRequestScope>(
+        suffixGlobLogString,
+        server_->getServerState(),
+        !useSaplingRemoteAPISuffixes,
+        context);
+  }
+
+  if (useSaplingRemoteAPISuffixes) {
+    if (requestIsOffloadable) {
+      XLOG(DBG5) << "globFiles request offloaded to EdenAPI";
       // Only use BSSM if there are only suffix queries
-      XLOG(DBG3)
-          << "globFiles request is only suffix globs, offloading to EdenAPI";
-      auto suffixGlobLogString = globber.logString(suffixGlobs);
-      suffixGlobRequestScope = std::make_unique<SuffixGlobRequestScope>(
-          suffixGlobLogString, server_->getServerState(), context);
-
-      // Do this again because the previous value has been consumed
-      ImmediateFuture<folly::Unit> backgroundFuture2{std::in_place};
-      if (isBackground) {
-        backgroundFuture2 = makeNotReadyImmediateFuture();
-      }
-
+      globFilesRequestScope->setLocal(false);
       // Attempt to resolve all EdenAPI futures. If any of
       // them result in an error we will fall back to local lookup
       auto combinedFuture =
-          std::move(backgroundFuture2)
+          std::move(backgroundFuture)
               .thenValue([revisions = params->revisions_ref().value(),
                           mountHandle,
                           suffixGlobs = std::move(suffixGlobs),
+                          serverState = server_->getServerState(),
+                          includeDotfiles = *params->includeDotfiles(),
                           context = context.copy()](auto&&) mutable {
                 auto& store = mountHandle.getObjectStore();
-                auto rootId =
-                    mountHandle.getEdenMountPtr()->getCheckedOutRootId();
+                const auto& edenMount = mountHandle.getEdenMountPtr();
+                const auto& rootInode = mountHandle.getRootInode();
+
+                if (revisions.empty()) {
+                  return getLocalGlobResults(
+                      edenMount,
+                      serverState,
+                      includeDotfiles,
+                      suffixGlobs,
+                      rootInode,
+                      context);
+                }
                 std::vector<ImmediateFuture<BackingStore::GetGlobFilesResult>>
                     globFilesResultFutures;
                 for (auto& id : revisions) {
@@ -3289,32 +3530,17 @@ EdenServiceHandler::semifuture_globFiles(std::unique_ptr<GlobParams> params) {
                   globFilesResultFutures.push_back(store.getGlobFiles(
                       store.parseRootId(id), suffixGlobs, context));
                 }
-                if (revisions.empty()) {
-                  // Use current commit hash
-                  XLOG(DBG3) << "No commit hash in input, using current hash";
-                  globFilesResultFutures.push_back(store.getGlobFiles(
-                      rootId, std::move(suffixGlobs), context));
-                }
                 return collectAllSafe(std::move(globFilesResultFutures));
               });
 
-      globFilesOrErrorFuture =
+      globFut =
           std::move(combinedFuture)
               .thenValue([mountHandle,
+                          rootInode = mountHandle.getRootInode(),
                           wantDtype = params->wantDtype_ref().value(),
                           includeDotfiles =
                               params->includeDotfiles_ref().value(),
                           &context](auto&& globResults) mutable {
-                // Offload suffix queries to EdenAPI
-                // params ignored in this pathway:
-                // Commands related to prefetching or the working copy
-                //   - prefetchFiles
-                //   - suppressFileList
-                //   - prefetchMetadata
-                //   - Sync
-                // - searchRoot - root is always the repository root
-                // - predictiveGlob - This pathway only accepts suffixes
-                // - listOnlyFiles - Only files will be returned
                 auto edenMount = mountHandle.getEdenMountPtr();
                 std::vector<ImmediateFuture<GlobEntry>> globEntryFuts;
                 for (auto& glob : globResults) {
@@ -3327,7 +3553,7 @@ EdenServiceHandler::semifuture_globFiles(std::unique_ptr<GlobParams> params) {
                       for (auto component : rp.components()) {
                         // Use facebook::eden string_view
                         if (string_view{component.view()}.starts_with(".")) {
-                          XLOG(DBG4) << "Skipping dotfile: " << component.view()
+                          XLOG(DBG5) << "Skipping dotfile: " << component.view()
                                      << " in " << entry;
                           skip_due_to_dotfile = true;
                           break;
@@ -3339,37 +3565,70 @@ EdenServiceHandler::semifuture_globFiles(std::unique_ptr<GlobParams> params) {
                     }
 
                     if (wantDtype) {
-                      // TODO(T192408118) get the root tree a single time per
-                      // glob instead of per-entry
-                      globEntryFuts.emplace_back(
-                          edenMount->getObjectStore()
-                              ->getRootTree(
-                                  std::move(glob.rootId), context.copy())
-                              .thenValue(
-                                  [entry, edenMount, context = context.copy()](
-                                      auto&& tree) mutable {
-                                    auto stringPiece =
-                                        folly::StringPiece{entry};
-                                    return ::facebook::eden::getTreeOrTreeEntry(
-                                        std::move(tree.tree),
-                                        RelativePath{stringPiece},
-                                        edenMount->getObjectStore(),
-                                        std::move(context));
-                                  })
-                              .thenValue([entry, originHash](
-                                             auto&& treeEntry) mutable {
-                                if (TreeEntry* treeEntryPtr =
-                                        std::get_if<TreeEntry>(&treeEntry)) {
-                                  auto dtype = treeEntryPtr->getDtype();
+                      ImmediateFuture<GlobEntry> entryFuture{std::in_place};
+                      if (glob.isLocal) {
+                        entryFuture =
+                            rootInode
+                                ->getChildRecursive(
+                                    RelativePathPiece{entry}, context)
+                                .thenValue([entry, originHash](
+                                               InodePtr child) mutable {
                                   return ImmediateFuture<GlobEntry>{GlobEntry{
                                       std::move(entry),
-                                      static_cast<OsDtype>(dtype),
+                                      static_cast<OsDtype>(child->getType()),
                                       std::move(originHash)}};
-                                } else {
-                                  EDEN_BUG()
-                                      << "Received a Tree when expecting TreeEntry for path "
-                                      << entry;
-                                }
+                                });
+                      } else {
+                        // TODO(T192408118) get the root tree a single time per
+                        // glob instead of per-entry
+                        entryFuture =
+                            edenMount->getObjectStore()
+                                ->getRootTree(
+                                    std::move(glob.rootId), context.copy())
+                                .thenValue([entry,
+                                            edenMount,
+                                            context = context.copy()](
+                                               auto&& tree) mutable {
+                                  auto stringPiece = folly::StringPiece{entry};
+                                  return ::facebook::eden::getTreeOrTreeEntry(
+                                      std::move(tree.tree),
+                                      RelativePath{stringPiece},
+                                      edenMount->getObjectStore(),
+                                      std::move(context));
+                                })
+                                .thenValue([entry, originHash](
+                                               auto&& treeEntry) mutable {
+                                  if (TreeEntry* treeEntryPtr =
+                                          std::get_if<TreeEntry>(&treeEntry)) {
+                                    auto dtype = treeEntryPtr->getDtype();
+                                    return ImmediateFuture<GlobEntry>{GlobEntry{
+                                        std::move(entry),
+                                        static_cast<OsDtype>(dtype),
+                                        std::move(originHash)}};
+                                  } else {
+                                    EDEN_BUG()
+                                        << "Received a Tree when expecting TreeEntry for path "
+                                        << entry;
+                                  }
+                                });
+                      }
+                      globEntryFuts.emplace_back(
+                          std::move(entryFuture)
+                              .thenError([entry,
+                                          originHash,
+                                          isLocal = glob.isLocal](
+                                             const folly::exception_wrapper&
+                                                 ex) mutable {
+                                XLOGF(
+                                    ERR,
+                                    "Error for getting file dtypes for {} file {}: {}",
+                                    isLocal ? "local" : "remote",
+                                    entry,
+                                    ex.what());
+                                return ImmediateFuture<GlobEntry>{GlobEntry{
+                                    std::move(entry),
+                                    DT_UNKNOWN,
+                                    std::move(originHash)}};
                               }));
                     } else {
                       globEntryFuts.emplace_back(ImmediateFuture<GlobEntry>{
@@ -3380,7 +3639,14 @@ EdenServiceHandler::semifuture_globFiles(std::unique_ptr<GlobParams> params) {
                 }
                 return collectAllSafe(std::move(globEntryFuts))
                     .thenValue([wantDtype](auto&& globEntries) {
+                      XLOG(DBG5) << "Building Glob";
                       auto glob = std::make_unique<Glob>();
+                      std::sort(
+                          globEntries.begin(),
+                          globEntries.end(),
+                          [](GlobEntry a, GlobEntry b) {
+                            return a.file < b.file;
+                          });
                       for (GlobEntry& globEntry : globEntries) {
                         glob->matchingFiles_ref().value().emplace_back(
                             globEntry.file);
@@ -3401,46 +3667,78 @@ EdenServiceHandler::semifuture_globFiles(std::unique_ptr<GlobParams> params) {
                         glob->originHashes_ref().value().emplace_back(
                             globEntry.originHash);
                       }
-                      return std::move(glob);
+                      XLOG(DBG5)
+                          << "Glob successfuly created, returning SaplingRemoteAPI results";
+                      return glob;
                     });
+              })
+              .thenError([mountHandle,
+                          globFilesRequestScope,
+                          serverState = server_->getServerState(),
+                          globs = std::move(*params->globs()),
+                          globber = std::move(globber),
+                          &context](
+                             const folly::exception_wrapper& ex) mutable {
+                // Fallback to local if an error was encountered while using the
+                // SaplingRemoteAPI method
+                XLOG(DBG3) << "Encountered error when evaluating globFiles: "
+                           << ex.what();
+                XLOG(DBG3) << "Using local globFiles";
+                globFilesRequestScope->setFallback(true);
+                return globber.glob(
+                    mountHandle.getEdenMountPtr(),
+                    serverState,
+                    std::move(globs),
+                    context);
               });
+    } else {
+      globFut = std::move(backgroundFuture)
+                    .thenValue([mountHandle,
+                                serverState = server_->getServerState(),
+                                globs = std::move(*params->globs()),
+                                globber = std::move(globber),
+                                &context](auto&&) mutable {
+                      XLOG(DBG3)
+                          << "No suffixes, or mixed suffixes and non-suffixes";
+                      XLOG(DBG3) << "Using local globFiles";
+                      // TODO: Insert ODS log for globs here
+                      return globber.glob(
+                          mountHandle.getEdenMountPtr(),
+                          serverState,
+                          std::move(globs),
+                          context);
+                    });
     }
+  } else {
+    globFut = std::move(backgroundFuture)
+                  .thenValue([mountHandle,
+                              serverState = server_->getServerState(),
+                              globs = std::move(*params->globs()),
+                              globber = std::move(globber),
+                              &context](auto&&) mutable {
+                    XLOG(DBG3) << "Using local globFiles";
+                    // TODO: Insert ODS log for globs here
+                    return globber.glob(
+                        mountHandle.getEdenMountPtr(),
+                        serverState,
+                        std::move(globs),
+                        context);
+                  });
   }
-  auto globFut = std::move(globFilesOrErrorFuture)
-                     .thenError([mountHandle,
-                                 serverState = server_->getServerState(),
-                                 globs = std::move(*params->globs()),
-                                 globber = std::move(globber),
-                                 &context](auto&&) mutable {
-                       // Fallback to local if
-                       // - No suffixes given, or the config is diabled
-                       // and globFilesOrErrorFuture is the default value
-                       // - An error was encountered while using the
-                       // SaplingRemoteAPI method
-                       XLOG(DBG3) << "Using local globFiles";
-                       // TODO: Insert ODS log for globs here
-                       return globber.glob(
-                           mountHandle.getEdenMountPtr(),
-                           serverState,
-                           std::move(globs),
-                           context);
-                     });
 
   globFut = std::move(globFut).ensure(
       [mountHandle,
        helper = std::move(helper),
        params = std::move(params),
-       suffixGlobRequestScope = std::move(suffixGlobRequestScope)] {});
+       suffixGlobRequestScope = std::move(suffixGlobRequestScope),
+       globFilesRequestScope = std::move(globFilesRequestScope)] {});
 
   // The glob code has a very large fan-out that can easily overload the Thrift
   // CPU worker pool. To combat with that, we limit the execution to a single
   // thread by using `folly::SerialExecutor` so the glob queries will not
   // overload the executor.
   return serialDetachIfBackgrounded<Glob>(
-      std::move(globFut),
-      server_->getServer(),
-      server_->getServerState()->getEdenConfig(),
-      isBackground);
+      std::move(globFut), server_, isBackground);
 }
 
 // DEPRECATED. Use semifuture_prefetchFilesV2 instead.
@@ -3499,10 +3797,7 @@ folly::SemiFuture<folly::Unit> EdenServiceHandler::semifuture_prefetchFiles(
     // single thread by using `folly::SerialExecutor` so the glob queries will
     // not overload the executor.
     return serialDetachIfBackgrounded(
-        std::move(globFut),
-        server_->getServer(),
-        server_->getServerState()->getEdenConfig(),
-        isBackground);
+        std::move(globFut), server_, isBackground);
   } else {
     return detachIfBackgrounded(
                std::move(globFut), server_->getServerState(), isBackground)
@@ -3579,10 +3874,7 @@ EdenServiceHandler::semifuture_prefetchFilesV2(
     // single thread by using `folly::SerialExecutor` so the glob queries will
     // not overload the executor.
     return serialDetachIfBackgrounded<PrefetchResult>(
-        std::move(prefetchResult),
-        server_->getServer(),
-        server_->getServerState()->getEdenConfig(),
-        isBackground);
+        std::move(prefetchResult), server_, isBackground);
   } else {
     return detachIfBackgrounded<PrefetchResult>(
                std::move(prefetchResult),

@@ -24,9 +24,8 @@ use blobstore::Blobstore;
 use bonsai_hg_mapping::BonsaiHgMappingRef;
 use bookmarks::BookmarksRef;
 use change_target_config::ChangeTargetConfig;
-use changeset_fetcher::ChangesetFetcherArc;
-use changesets::ChangesetsRef;
 use commit_graph::CommitGraphRef;
+use commit_graph::CommitGraphWriterRef;
 use context::CoreContext;
 use filestore::FilestoreConfigRef;
 use futures::future::try_join_all;
@@ -86,13 +85,13 @@ mod sync_changeset;
 
 pub trait Repo = BonsaiHgMappingRef
     + BookmarksRef
-    + ChangesetFetcherArc
-    + ChangesetsRef
     + CommitGraphRef
+    + CommitGraphWriterRef
     + FilestoreConfigRef
     + MutableRenamesRef
     + RepoBlobstoreArc
     + RepoBlobstoreRef
+    + RepoConfigArc
     + RepoConfigRef
     + RepoDerivedDataRef
     + RepoIdentityRef
@@ -147,35 +146,22 @@ pub struct MegarepoApi {
 }
 
 impl MegarepoApi {
-    pub async fn new(app: &MononokeApp, mononoke: Arc<Mononoke>) -> Result<Self, MegarepoError> {
+    pub fn new(app: &MononokeApp, mononoke: Arc<Mononoke>) -> Result<Self, MegarepoError> {
         let env = app.environment();
         let fb = env.fb;
         let logger = env.logger.new(o!("megarepo" => ""));
 
         let megarepo_configs: Arc<dyn MononokeMegarepoConfigs> = match &env.megarepo_configs_options
         {
-            MononokeMegarepoConfigsOptions::Prod => Arc::new(
-                CfgrMononokeMegarepoConfigs::new(
+            MononokeMegarepoConfigsOptions::Prod
+            | MononokeMegarepoConfigsOptions::IntegrationTest(_) => {
+                Arc::new(CfgrMononokeMegarepoConfigs::new(
                     fb,
                     &logger,
                     env.mysql_options.clone(),
                     env.readonly_storage,
-                    env.config_store.clone(),
-                    None,
-                )
-                .await?,
-            ),
-            MononokeMegarepoConfigsOptions::IntegrationTest(path) => Arc::new(
-                CfgrMononokeMegarepoConfigs::new(
-                    fb,
-                    &logger,
-                    env.mysql_options.clone(),
-                    env.readonly_storage,
-                    env.config_store.clone(),
-                    Some(path.clone()),
-                )
-                .await?,
-            ),
+                )?)
+            }
             MononokeMegarepoConfigsOptions::UnitTest => {
                 Arc::new(TestMononokeMegarepoConfigs::new(&logger))
             }

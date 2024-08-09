@@ -7,7 +7,6 @@
 
 #![feature(async_closure)]
 
-mod mem_writes_changesets;
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
@@ -24,7 +23,6 @@ use bonsai_hg_mapping::MemWritesBonsaiHgMapping;
 use cacheblob::dummy::DummyLease;
 use cacheblob::LeaseOps;
 use cacheblob::MemWritesBlobstore;
-use changesets::ArcChangesets;
 use clap::Parser;
 use clap::Subcommand;
 use clientinfo::ClientEntryPoint;
@@ -32,12 +30,17 @@ use clientinfo::ClientInfo;
 use context::CoreContext;
 use fbinit::FacebookInit;
 use futures::future;
+use import_tools::bookmark::BookmarkOperationErrorReporting;
 use import_tools::create_changeset_for_annotated_tag;
 use import_tools::import_tree_as_single_bonsai_changeset;
+use import_tools::set_bookmark;
 use import_tools::upload_git_tag;
 use import_tools::BackfillDerivation;
+use import_tools::BookmarkOperation;
+use import_tools::GitRepoReader;
 use import_tools::GitimportPreferences;
 use import_tools::GitimportTarget;
+use import_tools::ReuploadCommits;
 use linked_hash_map::LinkedHashMap;
 use mercurial_derivation::get_manifest_from_bonsai;
 use mercurial_derivation::DeriveHgChangeset;
@@ -58,8 +61,6 @@ use repo_derived_data::RepoDerivedDataRef;
 use repo_identity::RepoIdentityRef;
 use slog::info;
 use slog::warn;
-
-use crate::mem_writes_changesets::MemWritesChangesets;
 
 pub const HEAD_SYMREF: &str = "HEAD";
 
@@ -205,9 +206,9 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
     let path = Path::new(&args.git_repository_path);
 
     let reupload = if args.reupload_commits {
-        import_direct::ReuploadCommits::Always
+        ReuploadCommits::Always
     } else {
-        import_direct::ReuploadCommits::Never
+        ReuploadCommits::Never
     };
 
     let repo: BlobRepo = app.open_repo(&args.repo_args).await?;
@@ -222,9 +223,6 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
     let repo = if dry_run {
         repo.dangerous_override(|blobstore| -> Arc<dyn Blobstore> {
             Arc::new(MemWritesBlobstore::new(blobstore))
-        })
-        .dangerous_override(|changesets| -> ArcChangesets {
-            Arc::new(MemWritesChangesets::new(changesets))
         })
         .dangerous_override(|bonsai_hg_mapping| -> ArcBonsaiHgMapping {
             Arc::new(MemWritesBonsaiHgMapping::new(bonsai_hg_mapping))
@@ -249,7 +247,7 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
                 .filter(|ty| match ty {
                     // If we discard submodules, we can't derive the git data types since they are inconsistent
                     DerivableType::GitCommits
-                    | DerivableType::GitDeltaManifests
+                    | DerivableType::GitDeltaManifestsV2
                     | DerivableType::GitTrees => false,
                     _ => true,
                 })
@@ -273,7 +271,7 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
         prefs.git_command_path = PathBuf::from(path);
     }
 
-    let uploader = import_direct::DirectUploader::new(repo.clone(), reupload);
+    let uploader = Arc::new(import_direct::DirectUploader::new(repo.clone(), reupload));
 
     let target = match args.subcommand {
         GitimportSubcommand::FullRepo {} => GitimportTarget::full(),
@@ -289,9 +287,14 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
         }
         GitimportSubcommand::ImportTreeAsSingleBonsaiChangeset { git_commit } => {
             let commit = git_commit.parse()?;
-            let bcs_id =
-                import_tree_as_single_bonsai_changeset(&ctx, path, uploader, commit, &prefs)
-                    .await?;
+            let bcs_id = import_tree_as_single_bonsai_changeset(
+                &ctx,
+                path,
+                uploader.clone(),
+                commit,
+                &prefs,
+            )
+            .await?;
             info!(ctx.logger(), "imported as {}", bcs_id);
             if args.derive_hg {
                 derive_hg(&ctx, &repo, [(&commit, &bcs_id)].into_iter()).await?;
@@ -301,7 +304,7 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
     };
 
     let gitimport_result: LinkedHashMap<_, _> =
-        import_tools::gitimport(&ctx, path, &uploader, &target, &prefs)
+        import_tools::gitimport(&ctx, path, uploader.clone(), &target, &prefs)
             .await
             .context("gitimport failed")?;
     if args.derive_hg {
@@ -368,6 +371,7 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
                 .into_iter()
                 .map(|entry| (entry.tag_name, entry.tag_hash))
                 .collect::<HashMap<_, _>>();
+            let reader = Arc::new(GitRepoReader::new(&prefs.git_command_path, path).await?);
             for (maybe_tag_id, name, changeset) in
                 mapping
                     .iter()
@@ -383,13 +387,10 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
                     })
             {
                 let final_changeset = changeset.clone();
-                let mut name = name
+                let name = name
                     .strip_prefix("refs/")
                     .context("Ref does not start with refs/")?
                     .to_string();
-                if name.starts_with("remotes/origin/") {
-                    name = name.replacen("remotes/origin/", "heads/", 1);
-                };
                 if name.as_str() == "heads/HEAD" {
                     // Skip the HEAD revision: it shouldn't be imported as a bookmark in mononoke
                     continue;
@@ -405,13 +406,12 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
                     // Only upload the tag if it's new or has changed.
                     if new_or_updated_tag {
                         // The ref getting imported is a tag, so store the raw git Tag object.
-                        upload_git_tag(&ctx, &uploader, path, &prefs, tag_id).await?;
+                        upload_git_tag(&ctx, uploader.clone(), reader.clone(), tag_id).await?;
                         // Create the changeset corresponding to the commit pointed to by the tag.
                         create_changeset_for_annotated_tag(
                             &ctx,
-                            &uploader,
-                            path,
-                            &prefs,
+                            uploader.clone(),
+                            reader.clone(),
                             tag_id,
                             Some(name.clone()),
                             changeset,
@@ -434,52 +434,20 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
                     .await
                     .with_context(|| format!("failed to resolve bookmark {name}"))?
                     .map(|context| context.id());
-                match old_changeset {
-                    // The bookmark already exists. Instead of creating it, we need to move it.
-                    Some(old_changeset) => {
-                        if old_changeset != final_changeset {
-                            let allow_non_fast_forward = true;
-                            repo_context
-                                .move_bookmark(
-                                    &bookmark_key,
-                                    final_changeset,
-                                    Some(old_changeset),
-                                    allow_non_fast_forward,
-                                    pushvars.as_ref(),
-                                    Some(gitimport_result.len()),
-                                )
-                                .await
-                                .with_context(|| format!("failed to move bookmark {name} from {old_changeset:?} to {final_changeset:?}"))?;
-                            info!(
-                                ctx.logger(),
-                                "Bookmark: \"{name}\": {final_changeset:?} (moved from {old_changeset:?})"
-                            );
-                        } else {
-                            info!(
-                                ctx.logger(),
-                                "Bookmark: \"{name}\": {final_changeset:?} (already up-to-date)"
-                            );
-                        }
-                    }
-                    // The bookmark doesn't yet exist. Create it.
-                    None => {
-                        repo_context
-                            .create_bookmark(
-                                &bookmark_key,
-                                final_changeset,
-                                pushvars.as_ref(),
-                                Some(gitimport_result.len()),
-                            )
-                            .await
-                            .with_context(|| {
-                                format!("failed to create bookmark {name} during gitimport")
-                            })?;
-                        info!(
-                            ctx.logger(),
-                            "Bookmark: \"{name}\": {final_changeset:?} (created)"
-                        )
-                    }
-                }
+                let allow_non_fast_forward = true;
+                let affected_changesets_limit = Some(gitimport_result.len());
+                let operation =
+                    BookmarkOperation::new(bookmark_key, old_changeset, Some(final_changeset))?;
+                set_bookmark(
+                    &ctx,
+                    &repo_context,
+                    &operation,
+                    pushvars.as_ref(),
+                    allow_non_fast_forward,
+                    affected_changesets_limit,
+                    BookmarkOperationErrorReporting::WithContext,
+                )
+                .await?;
             }
         };
     }

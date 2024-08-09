@@ -44,7 +44,7 @@ use mononoke_types::MPathElement;
 use mononoke_types::MPathHash;
 use mononoke_types::ManifestUnodeId;
 use mononoke_types::NonRootMPath;
-use mononoke_types::TrieMap;
+use mononoke_types::SortedVectorTrieMap;
 use sorted_vector_map::SortedVectorMap;
 
 use crate::ErrorKind;
@@ -179,7 +179,7 @@ async fn create_unode_manifest(
         ManifestUnodeId,
         FileUnodeId,
         (),
-        TrieMap<Entry<ManifestUnodeId, FileUnodeId>>,
+        SortedVectorTrieMap<Entry<ManifestUnodeId, FileUnodeId>>,
     >,
 ) -> Result<((), ManifestUnodeId), Error> {
     let mut subentries = SortedVectorMap::new();
@@ -451,7 +451,6 @@ mod tests {
     use blobrepo::save_bonsai_changesets;
     use blobstore::Storable;
     use bytes::Bytes;
-    use derived_data::BonsaiDerived;
     use derived_data_test_utils::bonsai_changeset_from_hg;
     use derived_data_test_utils::iterate_all_manifest_entries;
     use fbinit::FacebookInit;
@@ -472,6 +471,7 @@ mod tests {
     use mononoke_types::DateTime;
     use mononoke_types::FileChange;
     use mononoke_types::FileContents;
+    use mononoke_types::GitLfs;
     use mononoke_types::RepoPath;
     use repo_derived_data::RepoDerivedDataRef;
     use test_repo_factory::TestRepoFactory;
@@ -491,7 +491,9 @@ mod tests {
 
         // Derive filenodes because they are going to be used in this test
         let master_cs_id = resolve_cs_id(&ctx, &repo, "master").await?;
-        FilenodesOnlyPublic::derive(&ctx, &repo, master_cs_id).await?;
+        repo.repo_derived_data()
+            .derive::<FilenodesOnlyPublic>(&ctx, master_cs_id)
+            .await?;
 
         let parent_unode_id = {
             let parent_hg_cs = "2d7d4ba9ce0a6ffd222de7785b249ead9c51c536";
@@ -687,7 +689,10 @@ mod tests {
 
         let find_unodes = {
             |ctx: CoreContext, repo: TestRepo| async move {
-                let p1_root_unode_mf_id = RootUnodeManifestId::derive(&ctx, &repo, p1).await?;
+                let p1_root_unode_mf_id = repo
+                    .repo_derived_data
+                    .derive::<RootUnodeManifestId>(&ctx, p1)
+                    .await?;
 
                 let mut p1_unodes: Vec<_> = p1_root_unode_mf_id
                     .manifest_unode_id()
@@ -701,8 +706,10 @@ mod tests {
                     .await?;
                 p1_unodes.sort_by_key(|(path, _)| path.clone());
 
-                let merge_root_unode_mf_id =
-                    RootUnodeManifestId::derive(&ctx, &repo, merge).await?;
+                let merge_root_unode_mf_id = repo
+                    .repo_derived_data()
+                    .derive::<RootUnodeManifestId>(&ctx, merge)
+                    .await?;
 
                 let mut merge_unodes: Vec<_> = merge_root_unode_mf_id
                     .manifest_unode_id()
@@ -955,7 +962,13 @@ mod tests {
                     let content =
                         FileContents::Bytes(Bytes::copy_from_slice(content.as_bytes())).into_blob();
                     let content_id = content.store(&ctx, &repo.repo_blobstore).await?;
-                    let file_change = FileChange::tracked(content_id, file_type, size as u64, None);
+                    let file_change = FileChange::tracked(
+                        content_id,
+                        file_type,
+                        size as u64,
+                        None,
+                        GitLfs::FullContent,
+                    );
                     res.insert(path, file_change);
                 }
                 None => {

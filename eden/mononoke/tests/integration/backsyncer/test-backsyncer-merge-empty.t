@@ -11,27 +11,19 @@ In this test we ensure that a merge into the large repo that doesn't involve
   $ export COMMIT_SCRIBE_CATEGORY=mononoke_commits
   $ export BOOKMARK_SCRIBE_CATEGORY=mononoke_bookmark
 
-  $ setup_configerator_configs
-  $ cat > "$PUSHREDIRECT_CONF/enable" <<EOF
-  > {
-  > "per_repo": {
-  >   "1": {
-  >      "draft_push": false,
-  >      "public_push": true
-  >    }
-  >   }
-  > }
-  > EOF
-
-  $ init_large_small_repo
+  $ create_large_small_repo
   Adding synced mapping entry
+  $ setup_configerator_configs
+  $ enable_pushredirect 1
+  $ start_large_small_repo
   Starting Mononoke server
+  $ init_local_large_small_clones
 
   $ testtool_drawdag --print-hg-hashes -R large-mon --no-default-files <<'EOF'
   >        M1
   >       /  \
   >     A1    |  # modify: A1 unrelatedfolder/newrepo "content"
-  >           E1 
+  >           E1
   > EOF
   A1=dc5b1bb7a82bef93a47a92b4f9ac5fb54597cd78
   E1=7614fd547c87f4952b0196834ce4dbee6eaf4eed

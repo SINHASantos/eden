@@ -5,9 +5,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import type {TypeaheadKind, TypeaheadResult} from './CommitInfoView/types';
+import type {TypeaheadKind} from './CommitInfoView/types';
 import type {InternalTypes} from './InternalTypes';
 import type {Serializable} from './serialize';
+import type {TypeaheadResult} from 'isl-components/Types';
 import type {TrackEventName} from 'isl-server/src/analytics/eventNames';
 import type {TrackDataWithEventName} from 'isl-server/src/analytics/types';
 import type {GitHubDiffSummary} from 'isl-server/src/github/githubCodeReviewProvider';
@@ -123,6 +124,7 @@ export type RepositoryError =
       command: string;
       path: string | undefined;
     }
+  | {type: 'edenFsUnhealthy'; cwd: string}
   | {type: 'cwdNotARepository'; cwd: string}
   | {type: 'cwdDoesNotExist'; cwd: string}
   | {
@@ -166,6 +168,21 @@ export type ApplicationInfo = {
   version: string;
   logFilePath: string;
 };
+
+/**
+ * Which "mode" for the App to run. Controls the basic rendering.
+ * Useful to render full-screen alternate views.
+ * isl => normal, full ISL
+ * comparison => just the comparison viewer is rendered, set to some specific comparison
+ */
+export type AppMode =
+  | {
+      mode: 'isl';
+    }
+  | {
+      mode: 'comparison';
+      comparison: Comparison;
+    };
 
 export type CodeReviewSystem =
   | {
@@ -296,6 +313,8 @@ export type ExactRevset = {type: 'exact-revset'; revset: Revset};
 /**
  * Most arguments to eden commands are literal `string`s, except:
  * - When specifying file paths, the server needs to know which args are files to convert them to be cwd-relative.
+ *     - For long file lists, we pass them in a single bulk arg, which will be passed via stdin instead
+ *       to avoid command line length limits.
  * - When specifying commit hashes, you may be acting on optimistic version of those hashes.
  *   The server can re-write hashes using a revset that transforms into the latest successor instead.
  *   This allows you to act on the optimistic versions of commits in queued commands,
@@ -307,6 +326,7 @@ export type ExactRevset = {type: 'exact-revset'; revset: Revset};
 export type CommandArg =
   | string
   | {type: 'repo-relative-file'; path: RepoRelativePath}
+  | {type: 'repo-relative-file-list'; paths: Array<RepoRelativePath>}
   | {type: 'config'; key: string; value: string}
   | ExactRevset
   | SucceedableRevset
@@ -532,6 +552,7 @@ export type PlatformSpecificClientToServerMessages =
   | {type: 'platform/openContainingFolder'; path: RepoRelativePath}
   | {type: 'platform/openDiff'; path: RepoRelativePath; comparison: Comparison}
   | {type: 'platform/openExternal'; url: string}
+  | {type: 'platform/changeTitle'; title: string}
   | {type: 'platform/confirm'; message: string; details?: string | undefined}
   | {type: 'platform/subscribeToAvailableCwds'}
   | {type: 'platform/subscribeToUnsavedFiles'}

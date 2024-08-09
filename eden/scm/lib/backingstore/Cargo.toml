@@ -20,12 +20,12 @@ edenapi = { version = "0.1.0", path = "../edenapi" }
 env_logger = "0.10"
 identity = { version = "0.1.0", path = "../identity" }
 indexedlog = { version = "0.1.0", path = "../indexedlog", features = ["configurable"] }
-log = { version = "0.4.17", features = ["kv_unstable", "kv_unstable_std"] }
+log = { version = "0.4.22", features = ["kv_unstable", "kv_unstable_std"] }
 manifest = { version = "0.1.0", path = "../manifest" }
 parking_lot = { version = "0.12.1", features = ["send_guard"] }
 repo = { version = "0.1.0", path = "../repo" }
 storemodel = { version = "0.1.0", path = "../storemodel" }
-tracing = { version = "0.1.40", features = ["attributes"] }
+tracing = { version = "0.1.40", features = ["attributes", "valuable"] }
 tracing-collector = { version = "0.1.0", path = "../tracing-collector" }
 tracing-subscriber = { version = "0.3.18", features = ["chrono", "env-filter", "json", "local-time", "parking_lot", "registry"] }
 types = { version = "0.1.0", path = "../types" }

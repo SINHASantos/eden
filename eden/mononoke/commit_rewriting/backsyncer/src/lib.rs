@@ -51,10 +51,10 @@ use bookmarks::BookmarkUpdateReason;
 use bookmarks::Bookmarks;
 use bookmarks::BookmarksArc;
 use bookmarks::Freshness;
-use changesets::Changesets;
 use cloned::cloned;
 use commit_graph::CommitGraph;
 use commit_graph::CommitGraphRef;
+use commit_graph::CommitGraphWriter;
 use context::CoreContext;
 use cross_repo_sync::find_toposorted_unsynced_ancestors;
 use cross_repo_sync::CandidateSelectionHint;
@@ -96,6 +96,7 @@ use slog::info;
 use slog::warn;
 use sql::Transaction;
 use sql_ext::TransactionResult;
+use sql_query_config::SqlQueryConfig;
 use synced_commit_mapping::SyncedCommitMapping;
 use thiserror::Error;
 use wireproto_handler::TargetRepoDbs;
@@ -111,7 +112,6 @@ pub struct Repo(
     RepoBookmarkAttrs,
     dyn Bookmarks,
     dyn BookmarkUpdateLog,
-    dyn Changesets,
     FilestoreConfig,
     dyn MutableCounters,
     dyn Phases,
@@ -120,7 +120,9 @@ pub struct Repo(
     RepoDerivedData,
     RepoIdentity,
     CommitGraph,
+    dyn CommitGraphWriter,
     dyn Filenodes,
+    SqlQueryConfig,
 );
 
 #[cfg(test)]
@@ -230,7 +232,7 @@ where
         BacksyncLimit::Limit(limit) => limit,
         BacksyncLimit::NoLimit => {
             // Set limit extremely high to read all new values
-            u64::max_value()
+            u64::MAX
         }
     };
     let next_entries: Vec<_> = commit_syncer
@@ -242,6 +244,7 @@ where
             log_entries_limit,
             Freshness::MostRecent,
         )
+        .boxed()
         .try_collect()
         .await?;
 
@@ -267,6 +270,7 @@ where
             disable_lease,
             commit_only_backsync_future,
         )
+        .boxed()
         .await
     }
 }
@@ -461,7 +465,7 @@ where
     );
     scuba_sample.add(
         "backsync_duration_ms",
-        u64::try_from(start_instant.elapsed().as_millis()).unwrap_or(u64::max_value()),
+        u64::try_from(start_instant.elapsed().as_millis()).unwrap_or(u64::MAX),
     );
     scuba_sample.add("backsync_previously_done", maybe_log_id.is_none());
 
@@ -729,7 +733,7 @@ where
             });
 
             let res = bookmark_txn
-                .commit_with_hook(txn_hook)
+                .commit_with_hooks(vec![txn_hook])
                 .await?
                 .map(|x| x.into());
             log_new_bonsai_changesets(

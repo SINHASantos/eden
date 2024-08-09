@@ -43,5 +43,8 @@ pub(crate) fn backingstore_global_init() {
         env_logger::init();
 
         edenapi::Builder::register_customize_build_func(eagerepo::edenapi_from_config);
+
+        #[cfg(feature = "cas")]
+        rich_cas_client::init();
     });
 }

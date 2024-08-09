@@ -12,27 +12,19 @@
   $ export COMMIT_SCRIBE_CATEGORY=mononoke_commits
   $ export BOOKMARK_SCRIBE_CATEGORY=mononoke_bookmark
 
-  $ setup_configerator_configs
-  $ cat > "$PUSHREDIRECT_CONF/enable" <<EOF
-  > {
-  > "per_repo": {
-  >   "1": {
-  >      "draft_push": false,
-  >      "public_push": true
-  >    }
-  >   }
-  > }
-  > EOF
-
-  $ init_large_small_repo
+  $ create_large_small_repo
   Adding synced mapping entry
+  $ setup_configerator_configs
+  $ enable_pushredirect 1
+  $ start_large_small_repo
   Starting Mononoke server
+  $ init_local_large_small_clones
 
 -- Empty commit sync
   $ cd "$TESTTMP"/large-hg-client
   $ REPONAME="$LARGE_REPO_NAME" quiet hgmn up master_bookmark
   $ hg commit --config ui.allowemptycommit=True -m "Empty1"
-  $ REPONAME="$LARGE_REPO_NAME" quiet hgmn push -r . --to master_bookmark 
+  $ REPONAME="$LARGE_REPO_NAME" quiet hgmn push -r . --to master_bookmark
 
   $ quiet_grep "syncing bookmark" -- backsync_large_to_small
   * syncing bookmark master_bookmark to * (glob)
@@ -67,7 +59,7 @@
   $ flush_mononoke_bookmarks
 
   $ cd "$TESTTMP/small-hg-client"
-  $ REPONAME="$SMALL_REPO_NAME" quiet hgmn pull 
+  $ REPONAME="$SMALL_REPO_NAME" quiet hgmn pull
   $ log -r master_bookmark^::master_bookmark
   o  non-empty after empty2 [public;rev=3;*] default/master_bookmark (glob)
   │
@@ -119,19 +111,10 @@ make it to the large repo.
   $ killandwait $MONONOKE_PID
   $ mononoke
   $ wait_for_mononoke
-  $ cat > "$PUSHREDIRECT_CONF/enable" <<EOF
-  > {
-  > "per_repo": {
-  >   "0": {
-  >      "draft_push": false,
-  >      "public_push": false
-  >    }
-  >   }
-  > }
-  > EOF
+  $ reset_pushredirect && enable_pushredirect 0 false false
 
   $ cd "$TESTTMP/small-hg-client"
-  $ hg commit --config ui.allowemptycommit=True -m "Empty5"
+  $ hg commit --config ui.allowemptycommit=True -m "Empty5" || exit 1
 This time pushing empty commit shouldn't fail as there is no pushredirection.
   $ REPONAME="$SMALL_REPO_NAME" quiet hgmn push -r . --to master_bookmark
 

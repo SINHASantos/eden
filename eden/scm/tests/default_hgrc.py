@@ -53,9 +53,11 @@ use-rust=True
 [status]
 use-rust=True
 
+[workingcopy]
+rust-checkout=True
+
 [extensions]
 treemanifest=
-copytrace=
 
 [treemanifest]
 sendtrees=True
@@ -75,6 +77,7 @@ httpcommitgraph2=true
 
 [hint]
 ack-match-full-traversal=True
+ack = smartlog-default-command
 
 [scmstore]
 contentstorefallback=True
@@ -82,7 +85,6 @@ contentstorefallback=True
 [experimental]
 use-rust-changelog=True
 windows-symlinks=True
-copytrace=off
 
 [tweakdefaults]
 graftkeepdate=True

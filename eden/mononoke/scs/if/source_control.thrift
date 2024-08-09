@@ -7,13 +7,14 @@
 
 include "fb303/thrift/fb303_core.thrift"
 include "thrift/annotation/thrift.thrift"
-include "configerator/structs/scm/mononoke/megarepo/megarepo_configs.thrift"
+include "eden/mononoke/megarepo_api/if/megarepo_configs.thrift"
 include "eden/mononoke/derived_data/if/derived_data_type.thrift"
 
 namespace cpp2 facebook.scm.service
 namespace php SourceControlService
 namespace py scm.service.thrift.source_control
 namespace py3 scm.service.thrift
+namespace java.swift com.facebook.scm.service
 
 typedef binary (rust.type = "Bytes") binary_bytes
 typedef binary small_binary (
@@ -216,6 +217,13 @@ struct CommitInfo {
 
   /// The identity of the person who committed this commit, as opposed to authored it (if available - commit comes from Git).
   12: optional string committer;
+
+  /// The linear depth of the commit. It's calculated as the number of ancestors of the commit if the commit
+  /// graph consisted only of the first parents (i.e. if merges were ignored).
+  ///
+  /// This can be useful when using the commit_linear_history method. For example commit_linear_history(commit.id, skip=commit.linear_depth, limit=1)
+  /// will return the root commit of the repository.
+  13: optional i64 linear_depth;
 }
 
 struct BookmarkInfo {
@@ -869,6 +877,15 @@ struct RepoCreateCommitParamsFileCopyInfo {
   2: i32 parent_index;
 }
 
+union RepoCreateCommitParamsGitLfs {
+  // File should be served as full text (bool val is ignored)
+  1: bool full_content;
+  // A canonical LFS pointer should be generated (bool val is ignored)
+  2: bool lfs_pointer;
+  // A non-canonical LFS pointer is provided
+  3: RepoCreateCommitParamsFileContent non_canonical_lfs_pointer;
+}
+
 struct RepoCreateCommitParamsFileChanged {
   /// The new type of the file.
   1: RepoCreateCommitParamsFileType type;
@@ -878,6 +895,10 @@ struct RepoCreateCommitParamsFileChanged {
 
   /// The file was copied from another file.
   3: optional RepoCreateCommitParamsFileCopyInfo copy_info;
+
+  /// Controls Git LFS representation of change in Git clones of this repo.
+  /// (omitting this field lets server make the decision)
+  4: optional RepoCreateCommitParamsGitLfs git_lfs;
 }
 
 struct RepoCreateCommitParamsFileDeleted {}
@@ -1276,6 +1297,41 @@ struct CommitHistoryParams {
   /// the commit itself)
   7: optional CommitId descendants_of;
   /// Exclude commit and all of its ancestor from results.
+  8: optional CommitId exclude_changeset_and_ancestors;
+}
+
+/// Parameters for the `commit_linear_history` method.
+///
+/// By default, this will include all commits that are linear ancestors of
+/// the target commit. Linear ancestors are commits that can be reached by
+/// following by following the first parent of the commit (including the
+/// commit itself). This can be filtered in a number of ways:
+///
+/// * `descendants_of` will restrict traversal to only those commits which
+///   are linear descendants of the given commit, i.e. commits that can
+///   reach the given commit by following the first parent.
+///
+/// * `exclude_changeset_and_ancestors` will prune traversal at the given
+///   commit and any of its linear ancestors.
+///
+/// These options can be combined.  In particular, since `descendants_of`
+/// is an inclusive range of commits, and `exclude_changeset_and_ancestors`
+/// excludes the target commits, a half-open range of commits
+/// `(ancestor, descendant]` can be obtained by setting both of these to
+/// the ancestor commit.
+struct CommitLinearHistoryParams {
+  /// Return history in the given format.
+  1: HistoryFormat format;
+  /// Number of commits to return in the history.
+  2: i32 limit;
+  /// Number of commits to skip before listing the history.
+  3: i64 skip;
+  /// Commit identity schemes to return in the commit information.
+  6: set<CommitIdentityScheme> identity_schemes;
+  /// Include only commits that are linear descendants of the given commit
+  /// (including the commit itself)
+  7: optional CommitId descendants_of;
+  /// Exclude commit and all of its linear ancestor from results.
   8: optional CommitId exclude_changeset_and_ancestors;
 }
 
@@ -1828,6 +1884,10 @@ struct CommitFindFilesResponse {
 }
 
 struct CommitHistoryResponse {
+  1: History history;
+}
+
+struct CommitLinearHistoryResponse {
   1: History history;
 }
 
@@ -2418,6 +2478,15 @@ service SourceControlService extends fb303_core.BaseService {
   CommitHistoryResponse commit_history(
     1: CommitSpecifier commit,
     2: CommitHistoryParams params,
+  ) throws (
+    1: RequestError request_error,
+    2: InternalError internal_error,
+    3: OverloadError overload_error,
+  );
+
+  CommitLinearHistoryResponse commit_linear_history(
+    1: CommitSpecifier commit,
+    2: CommitLinearHistoryParams params,
   ) throws (
     1: RequestError request_error,
     2: InternalError internal_error,

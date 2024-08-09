@@ -32,6 +32,7 @@ use storemodel::BoxIterator;
 use storemodel::Bytes;
 use storemodel::FileAuxData;
 use storemodel::FileStore;
+use storemodel::TreeAuxData;
 use storemodel::TreeEntry;
 use storemodel::TreeStore;
 use tracing::instrument;
@@ -234,6 +235,19 @@ impl BackingStore {
             .batch_with_callback(keys, fetch_mode, resolve)
     }
 
+    pub fn get_tree_aux(&self, node: &[u8], fetch_mode: FetchMode) -> Result<Option<TreeAuxData>> {
+        self.maybe_reload().treestore.single(node, fetch_mode)
+    }
+
+    pub fn get_tree_aux_batch<F>(&self, keys: Vec<Key>, fetch_mode: FetchMode, resolve: F)
+    where
+        F: Fn(usize, Result<Option<TreeAuxData>>),
+    {
+        self.maybe_reload()
+            .treestore
+            .batch_with_callback(keys, fetch_mode, resolve)
+    }
+
     /// Forces backing store to rescan pack files or local indexes
     #[instrument(level = "debug", skip(self))]
     pub fn refresh(&self) {
@@ -263,16 +277,16 @@ impl BackingStore {
         // the Response, probably by implementing map similar to how then is currently implemented.
         // Another option is to hand down the async object through to C++ when the FFI layer supports
         // it more robustly.
-        let result = BlockingResponse::from_async(
-            self.maybe_reload()
-                .repo
-                .eden_api()?
-                .suffix_query(CommitId::Hg(HgId::from_hex(commit_id)?), suffixes),
-        )?
-        .entries
-        .iter()
-        .map(|res| res.file_path.to_string())
-        .collect();
+        let result =
+            BlockingResponse::from_async(self.maybe_reload().repo.eden_api()?.suffix_query(
+                CommitId::Hg(HgId::from_hex(commit_id)?),
+                suffixes,
+                None,
+            ))?
+            .entries
+            .iter()
+            .map(|res| res.file_path.to_string())
+            .collect();
         Ok(Some(result))
     }
 
@@ -597,6 +611,23 @@ impl LocalRemoteImpl<Box<dyn TreeEntry>> for Arc<dyn TreeStore> {
         fetch_mode: FetchMode,
     ) -> Result<BoxIterator<Result<(Key, Box<dyn TreeEntry>)>>> {
         self.get_tree_iter(keys, fetch_mode)
+    }
+}
+
+/// Read tree aux.
+impl LocalRemoteImpl<TreeAuxData> for Arc<dyn TreeStore> {
+    fn get_local_single(&self, path: &RepoPath, id: HgId) -> Result<Option<TreeAuxData>> {
+        self.get_local_tree_aux_data(path, id)
+    }
+    fn get_single(&self, path: &RepoPath, id: HgId, fetch_mode: FetchMode) -> Result<TreeAuxData> {
+        self.get_tree_aux_data(path, id, fetch_mode)
+    }
+    fn get_batch_iter(
+        &self,
+        keys: Vec<Key>,
+        fetch_mode: FetchMode,
+    ) -> Result<BoxIterator<Result<(Key, TreeAuxData)>>> {
+        self.get_tree_aux_data_iter(keys, fetch_mode)
     }
 }
 

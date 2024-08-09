@@ -14,10 +14,10 @@ import {RenderMarkup} from './RenderMarkup';
 import {SeeMoreContainer} from './SeeMoreContainer';
 import {CommitInfoTextArea} from './TextArea';
 import {CommitInfoTextField} from './TextField';
-import {extractTokens, TokensList} from './Tokens';
 import {getOnClickToken, Section, SmallCapsTitle} from './utils';
+import {Icon} from 'isl-components/Icon';
+import {extractTokens, TokensList} from 'isl-components/Tokens';
 import {Fragment} from 'react';
-import {Icon} from 'shared/Icon';
 
 export function CommitInfoField({
   field,

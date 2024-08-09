@@ -188,6 +188,13 @@ impl From<MononokeError> for ServiceError {
                 reason: error.to_string(),
                 ..Default::default()
             }),
+            error @ MononokeError::NonFastForwardMove { .. } => {
+                Self::Request(thrift::RequestError {
+                    kind: thrift::RequestErrorKind::INVALID_REQUEST,
+                    reason: error.to_string(),
+                    ..Default::default()
+                })
+            }
             error @ MononokeError::PushrebaseConflicts(_) => Self::Request(thrift::RequestError {
                 kind: thrift::RequestErrorKind::INVALID_REQUEST,
                 reason: error.to_string(),
@@ -263,6 +270,7 @@ impl_into_thrift_error!(service::CommitCompareExn);
 impl_into_thrift_error!(service::CommitIsAncestorOfExn);
 impl_into_thrift_error!(service::CommitFindFilesExn);
 impl_into_thrift_error!(service::CommitHistoryExn);
+impl_into_thrift_error!(service::CommitLinearHistoryExn);
 impl_into_thrift_error!(service::CommitListDescendantBookmarksExn);
 impl_into_thrift_error!(service::CommitRunHooksExn);
 impl_into_thrift_error!(service::CommitPathExistsExn);

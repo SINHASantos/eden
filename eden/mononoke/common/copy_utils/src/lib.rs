@@ -15,7 +15,6 @@ use blobrepo::save_bonsai_changesets;
 use blobrepo::BlobRepo;
 use commit_transformation::copy_file_contents;
 use context::CoreContext;
-use derived_data::BonsaiDerived;
 use fsnodes::RootFsnodeId;
 use futures::future::try_join;
 use futures::TryStreamExt;
@@ -27,9 +26,11 @@ use mononoke_types::BonsaiChangesetMut;
 use mononoke_types::ChangesetId;
 use mononoke_types::DateTime;
 use mononoke_types::FileChange;
+use mononoke_types::GitLfs;
 use mononoke_types::NonRootMPath;
 use regex::Regex;
 use repo_blobstore::RepoBlobstoreRef;
+use repo_derived_data::RepoDerivedDataRef;
 use repo_identity::RepoIdentityRef;
 use slog::debug;
 use slog::info;
@@ -196,6 +197,7 @@ async fn create_changesets(
                         *fsnode_file.file_type(),
                         fsnode_file.size(),
                         copy_from,
+                        GitLfs::FullContent,
                     )
                 }
                 None => FileChange::Deletion,
@@ -280,7 +282,10 @@ async fn list_directory(
     cs_id: ChangesetId,
     path: &NonRootMPath,
 ) -> Result<Option<BTreeMap<NonRootMPath, FsnodeFile>>, Error> {
-    let root = RootFsnodeId::derive(ctx, repo, cs_id).await?;
+    let root = repo
+        .repo_derived_data()
+        .derive::<RootFsnodeId>(ctx, cs_id)
+        .await?;
 
     let entries = root
         .fsnode_id()
@@ -341,7 +346,7 @@ fn create_bonsai_changeset(
 #[cfg(test)]
 mod test {
     use blobstore::StoreLoadable;
-    use changeset_fetcher::ChangesetFetcherRef;
+    use commit_graph::CommitGraphRef;
     use fbinit::FacebookInit;
     use maplit::hashmap;
     use mononoke_types::RepositoryId;
@@ -1011,9 +1016,10 @@ mod test {
 
         assert_eq!(
             target_repo
-                .changeset_fetcher()
-                .get_parents(&ctx, *cs_ids.first().unwrap())
-                .await?,
+                .commit_graph()
+                .changeset_parents(&ctx, *cs_ids.first().unwrap())
+                .await?
+                .to_vec(),
             vec![target_cs_id],
         );
 

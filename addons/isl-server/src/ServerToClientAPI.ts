@@ -12,7 +12,7 @@ import type {Logger} from './logger';
 import type {ServerPlatform} from './serverPlatform';
 import type {RepositoryContext} from './serverTypes';
 import type {ExecaError} from 'execa';
-import type {TypeaheadResult} from 'isl/src/CommitInfoView/types';
+import type {TypeaheadResult} from 'isl-components/Types';
 import type {Serializable} from 'isl/src/serialize';
 import type {
   ServerToClientMessage,
@@ -246,14 +246,14 @@ export default class ServerToClientAPI {
         }
         this.tracker
           .operation('UploadImage', 'UploadImageError', {}, () =>
-            uploadFile(nullthrows(this.connection.logger), {filename, data: payload}),
+            uploadFile(this.logger, {filename, data: payload}),
           )
           .then((result: string) => {
-            this.connection.logger?.info('sucessfully uploaded file', filename, result);
+            this.logger.info('sucessfully uploaded file', filename, result);
             this.postMessage({type: 'uploadFileResult', id, result: {value: result}});
           })
           .catch((error: Error) => {
-            this.connection.logger?.info('error uploading file', filename, error);
+            this.logger.info('error uploading file', filename, error);
             this.postMessage({type: 'uploadFileResult', id, result: {error}});
           });
         break;

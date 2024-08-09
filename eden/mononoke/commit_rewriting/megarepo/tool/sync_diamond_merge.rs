@@ -24,7 +24,6 @@ use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateReason;
 use bookmarks::BookmarksRef;
 use cacheblob::LeaseOps;
-use changeset_fetcher::ChangesetFetcherRef;
 use cloned::cloned;
 use commit_graph::CommitGraphRef;
 use commit_transformation::upload_commits;
@@ -38,7 +37,6 @@ use cross_repo_sync::CommitSyncContext;
 use cross_repo_sync::CommitSyncOutcome;
 use cross_repo_sync::CommitSyncer;
 use cross_repo_sync::InMemoryRepo;
-use cross_repo_sync::Large;
 use cross_repo_sync::SubmoduleDeps;
 use cross_repo_sync::SubmoduleExpansionData;
 use cross_repo_sync::Syncers;
@@ -136,11 +134,11 @@ pub async fn do_sync_diamond_merge(
     );
 
     let parents = small_repo
-        .changeset_fetcher()
-        .get_parents(ctx, small_merge_cs_id)
+        .commit_graph()
+        .changeset_parents(ctx, small_merge_cs_id)
         .await?;
 
-    let (p1, p2) = validate_parents(parents)?;
+    let (p1, p2) = validate_parents(parents.to_vec())?;
 
     let new_branch = find_new_branch_oldest_first(ctx.clone(), small_repo, p1, p2).await?;
 
@@ -303,7 +301,7 @@ async fn create_rewritten_merge_commit(
 
     let submodule_deps = syncers.small_to_large.get_submodule_deps();
 
-    let large_repo_id = Large(large_repo.repo_identity().id());
+    let small_repo_id = small_repo.repo_identity().id();
     let fallback_repos = vec![Arc::new(small_repo.clone())]
         .into_iter()
         .chain(submodule_deps.repos())
@@ -313,7 +311,7 @@ async fn create_rewritten_merge_commit(
         SubmoduleDeps::ForSync(deps) => Some(SubmoduleExpansionData {
             submodule_deps: deps,
             x_repo_submodule_metadata_file_prefix: x_repo_submodule_metadata_file_prefix.as_str(),
-            large_repo_id,
+            small_repo_id,
             large_repo: large_in_memory_repo,
             dangling_submodule_pointers,
         }),
@@ -327,7 +325,7 @@ async fn create_rewritten_merge_commit(
         &remapped_parents,
         syncers
             .small_to_large
-            .get_mover_by_version(&version_p1)
+            .get_movers_by_version(&version_p1)
             .await?,
         source_repo,
         Default::default(),
@@ -378,7 +376,8 @@ async fn generate_additional_file_changes(
             BonsaiDiffFileChange::Changed(ref path, ..)
             | BonsaiDiffFileChange::ChangedReusedId(ref path, ..)
             | BonsaiDiffFileChange::Deleted(ref path) => {
-                let maybe_new_path = large_to_small.get_mover_by_version(version).await?(path)?;
+                let mover = large_to_small.get_movers_by_version(version).await?.mover;
+                let maybe_new_path = mover(path)?;
                 if maybe_new_path.is_some() {
                     continue;
                 }

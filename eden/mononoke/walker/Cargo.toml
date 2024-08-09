@@ -22,11 +22,9 @@ blobstore_factory = { version = "0.1.0", path = "../blobstore/factory" }
 bonsai_hg_mapping = { version = "0.1.0", path = "../bonsai_hg_mapping" }
 bookmarks = { version = "0.1.0", path = "../bookmarks" }
 bounded_traversal = { version = "0.1.0", path = "../common/bounded_traversal" }
-bulkops = { version = "0.1.0", path = "../bulkops" }
 bytes = { version = "1.6.0", features = ["serde"] }
 changeset_info = { version = "0.1.0", path = "../derived_data/changeset_info" }
-changesets = { version = "0.1.0", path = "../changesets" }
-clap = { version = "4.5.6", features = ["derive", "env", "string", "unicode", "wrap_help"] }
+clap = { version = "4.5.11", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 clientinfo = { version = "0.1.0", path = "../../scm/lib/clientinfo" }
 cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 cmdlib_caching = { version = "0.1.0", path = "../cmdlib/caching" }
@@ -35,7 +33,6 @@ context = { version = "0.1.0", path = "../server/context" }
 dashmap = { version = "5.5.3", features = ["rayon", "serde"] }
 deleted_manifest = { version = "0.1.0", path = "../derived_data/deleted_manifest" }
 derive_more = "0.99.17"
-derived_data = { version = "0.1.0", path = "../derived_data" }
 derived_data_manager = { version = "0.1.0", path = "../derived_data/manager" }
 executor_lib = { version = "0.1.0", path = "../cmdlib/sharding" }
 fastlog = { version = "0.1.0", path = "../derived_data/fastlog" }
@@ -65,6 +62,7 @@ percent-encoding = "2.1"
 phases = { version = "0.1.0", path = "../phases" }
 regex = "1.9.2"
 repo_blobstore = { version = "0.1.0", path = "../blobrepo/repo_blobstore" }
+repo_derived_data = { version = "0.1.0", path = "../repo_attributes/repo_derived_data" }
 repo_factory = { version = "0.1.0", path = "../repo_factory" }
 repo_identity = { version = "0.1.0", path = "../repo_attributes/repo_identity" }
 samplingblob = { version = "0.1.0", path = "../blobstore/samplingblob" }
@@ -73,6 +71,7 @@ scuba_ext = { version = "0.1.0", path = "../common/scuba_ext" }
 sharding_ext = { version = "0.1.0", path = "../cmdlib/sharding_ext" }
 skeleton_manifest = { version = "0.1.0", path = "../derived_data/skeleton_manifest" }
 slog = { version = "2.7", features = ["max_level_trace", "nested-values"] }
+sql_commit_graph_storage = { version = "0.1.0", path = "../repo_attributes/commit_graph/sql_commit_graph_storage" }
 sql_construct = { version = "0.1.0", path = "../common/sql_construct" }
 sql_ext = { version = "0.1.0", path = "../common/rust/sql_ext" }
 stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }

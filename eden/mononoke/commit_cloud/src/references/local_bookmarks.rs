@@ -26,22 +26,18 @@ pub struct WorkspaceLocalBookmark {
     pub commit: HgChangesetId,
 }
 
+pub type LocalBookmarksMap = HashMap<HgChangesetId, Vec<String>>;
+
 pub async fn update_bookmarks(
     sql_commit_cloud: &SqlCommitCloud,
     mut txn: Transaction,
     cri: Option<&ClientRequestInfo>,
-    ctx: CommitCloudContext,
+    ctx: &CommitCloudContext,
     updated_bookmarks: HashMap<String, HgId>,
-    removed_bookmarks: Vec<HgId>,
+    removed_bookmarks: Vec<String>,
 ) -> anyhow::Result<Transaction> {
     if !removed_bookmarks.is_empty() {
-        let removed_commits = removed_bookmarks
-            .into_iter()
-            .map(|id| id.into())
-            .collect::<Vec<HgChangesetId>>();
-        let delete_args = DeleteArgs {
-            removed_bookmarks: removed_commits,
-        };
+        let delete_args = DeleteArgs { removed_bookmarks };
 
         txn = Delete::<WorkspaceLocalBookmark>::delete(
             sql_commit_cloud,

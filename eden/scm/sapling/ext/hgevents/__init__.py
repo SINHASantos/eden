@@ -145,6 +145,8 @@ def wrapgoto(
     orig,
     repo,
     node,
+    force=False,
+    updatecheck=None,
     **kwargs,
 ):
     distance = 0
@@ -160,11 +162,7 @@ def wrapgoto(
         distance=distance,
         metadata={"merge": False},
     ):
-        return orig(
-            repo,
-            node,
-            **kwargs,
-        )
+        return orig(repo, node, force=force, updatecheck=updatecheck, **kwargs)
 
 
 def _xmerge(origfunc, repo, mynode, orig, fcd, fco, fca, toolconf, files, labels=None):

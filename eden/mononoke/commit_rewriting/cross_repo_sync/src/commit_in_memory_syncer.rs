@@ -19,20 +19,19 @@ use commit_transformation::CommitRewrittenToEmpty;
 use commit_transformation::EmptyCommitFromLargeRepo;
 use commit_transformation::RewriteOpts;
 use context::CoreContext;
-use derived_data::BonsaiDerived;
 use live_commit_sync_config::LiveCommitSyncConfig;
 use metaconfig_types::CommitSyncConfigVersion;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::BonsaiChangesetMut;
 use mononoke_types::ChangesetId;
 use mononoke_types::RepositoryId;
-use movers::Mover;
+use movers::Movers;
 use synced_commit_mapping::SyncedCommitMapping;
 
 use crate::commit_sync_config_utils::get_git_submodule_action_by_version;
 use crate::commit_sync_outcome::CommitSyncOutcome;
 use crate::commit_syncer::CommitSyncer;
-use crate::commit_syncers_lib::get_mover_by_version;
+use crate::commit_syncers_lib::get_movers_by_version;
 use crate::commit_syncers_lib::rewrite_commit;
 use crate::commit_syncers_lib::strip_removed_parents;
 use crate::commit_syncers_lib::submodule_metadata_file_prefix_and_dangling_pointers;
@@ -46,7 +45,6 @@ use crate::sync_config_version_utils::get_mapping_change_version_from_hg_extra;
 use crate::sync_config_version_utils::get_version;
 use crate::sync_config_version_utils::get_version_for_merge;
 use crate::types::ErrorKind;
-use crate::types::Large;
 use crate::types::Repo;
 use crate::types::Source;
 use crate::types::SubmoduleDeps;
@@ -150,23 +148,35 @@ impl<'a, R: Repo> CommitInMemorySyncer<'a, R> {
     // TODO(T182311609): add docs
     pub(crate) async fn unsafe_sync_commit_in_memory(
         self,
+        ctx: &CoreContext,
         cs: BonsaiChangeset,
         commit_sync_context: CommitSyncContext,
         expected_version: Option<CommitSyncConfigVersion>,
     ) -> Result<CommitSyncInMemoryResult, Error> {
         let maybe_mapping_change_version = get_mapping_change_version(
-            &ChangesetInfo::derive(self.ctx, self.source_repo.0, cs.get_changeset_id()).await?,
+            &self
+                .source_repo
+                .0
+                .repo_derived_data()
+                .derive::<ChangesetInfo>(self.ctx, cs.get_changeset_id())
+                .await?,
         )?;
 
         let commit_rewritten_to_empty = self
-            .get_empty_rewritten_commit_action(&maybe_mapping_change_version, commit_sync_context);
+            .get_empty_rewritten_commit_action(
+                ctx,
+                &maybe_mapping_change_version,
+                commit_sync_context,
+            )
+            .await?;
 
         // We are using the state of pushredirection to determine which repo is "source of truth" for the contents
         // if it's the small repo we can't be rewriting the "mapping change" commits as even if we
         // do they won't be synced back.
         let pushredirection_disabled = !self
             .live_commit_sync_config
-            .push_redirector_enabled_for_public(self.target_repo_id.0);
+            .push_redirector_enabled_for_public(ctx, self.target_repo_id.0)
+            .await?;
 
         // During backsyncing we provide an option to skip empty commits but we
         // can only do that when they're not changing the mapping.
@@ -205,7 +215,7 @@ impl<'a, R: Repo> CommitInMemorySyncer<'a, R> {
                 .await
         } else {
             // Syncing merge doesn't take rewrite_opts because merges are always rewritten.
-            self.sync_merge_in_memory(cs, commit_sync_context, expected_version)
+            self.sync_merge_in_memory(ctx, cs, commit_sync_context, expected_version)
                 .await
         }
     }
@@ -229,7 +239,7 @@ impl<'a, R: Repo> CommitInMemorySyncer<'a, R> {
             }
         }
 
-        let mover = get_mover_by_version(
+        let movers = get_movers_by_version(
             &expected_version,
             Arc::clone(&self.live_commit_sync_config),
             self.source_repo_id(),
@@ -258,7 +268,7 @@ impl<'a, R: Repo> CommitInMemorySyncer<'a, R> {
                 submodule_deps: deps,
                 x_repo_submodule_metadata_file_prefix: x_repo_submodule_metadata_file_prefix
                     .as_str(),
-                large_repo_id: Large(self.large_repo_id()),
+                small_repo_id: self.small_repo_id(),
                 large_repo: self.large_repo,
                 dangling_submodule_pointers,
             }),
@@ -269,7 +279,7 @@ impl<'a, R: Repo> CommitInMemorySyncer<'a, R> {
             self.ctx,
             cs.into_mut(),
             &HashMap::new(),
-            mover,
+            movers,
             self.source_repo.0,
             rewrite_opts,
             git_submodules_action,
@@ -337,7 +347,7 @@ impl<'a, R: Repo> CommitInMemorySyncer<'a, R> {
                     }
                 }
 
-                let rewrite_paths = get_mover_by_version(
+                let movers = get_movers_by_version(
                     &version,
                     Arc::clone(&self.live_commit_sync_config),
                     self.source_repo_id(),
@@ -370,7 +380,7 @@ impl<'a, R: Repo> CommitInMemorySyncer<'a, R> {
                         submodule_deps: deps,
                         x_repo_submodule_metadata_file_prefix:
                             x_repo_submodule_metadata_file_prefix.as_str(),
-                        large_repo_id: Large(self.large_repo_id()),
+                        small_repo_id: self.small_repo_id(),
                         large_repo: self.large_repo,
                         dangling_submodule_pointers,
                     }),
@@ -380,7 +390,7 @@ impl<'a, R: Repo> CommitInMemorySyncer<'a, R> {
                     self.ctx,
                     cs,
                     &remapped_parents,
-                    rewrite_paths,
+                    movers,
                     self.source_repo.0,
                     rewrite_opts,
                     git_submodules_action,
@@ -418,6 +428,7 @@ impl<'a, R: Repo> CommitInMemorySyncer<'a, R> {
     ///    source of truth otherwise it would break forward syncer.
     async fn sync_merge_in_memory(
         self,
+        ctx: &CoreContext,
         cs: BonsaiChangeset,
         commit_sync_context: CommitSyncContext,
         expected_version: Option<CommitSyncConfigVersion>,
@@ -492,8 +503,8 @@ impl<'a, R: Repo> CommitInMemorySyncer<'a, R> {
                 .map(|(_, outcome)| outcome)
                 .collect::<Vec<_>>();
 
-            let (mover, version) = self
-                .get_mover_to_use_for_merge(source_cs_id, outcomes)
+            let (movers, version) = self
+                .get_movers_to_use_for_merge(source_cs_id, outcomes)
                 .await
                 .context("failed getting a mover to use for merge rewriting")?;
 
@@ -530,7 +541,7 @@ impl<'a, R: Repo> CommitInMemorySyncer<'a, R> {
                     submodule_deps: deps,
                     x_repo_submodule_metadata_file_prefix: x_repo_submodule_metadata_file_prefix
                         .as_str(),
-                    large_repo_id: Large(self.large_repo_id()),
+                    small_repo_id: self.small_repo_id(),
                     large_repo: self.large_repo,
                     dangling_submodule_pointers,
                 }),
@@ -543,12 +554,13 @@ impl<'a, R: Repo> CommitInMemorySyncer<'a, R> {
             let is_backsync_when_small_is_source_of_truth = !self.small_to_large
                 && !self
                     .live_commit_sync_config
-                    .push_redirector_enabled_for_public(self.target_repo_id.0);
+                    .push_redirector_enabled_for_public(ctx, self.target_repo_id.0)
+                    .await?;
             let rewrite_res = rewrite_commit(
                 self.ctx,
                 cs,
                 &new_parents,
-                mover,
+                movers,
                 self.source_repo.0,
                 Default::default(),
                 git_submodules_action,
@@ -619,14 +631,16 @@ impl<'a, R: Repo> CommitInMemorySyncer<'a, R> {
 
     /// Determine what should happen to commits that would be empty when synced
     /// to the target repo.
-    fn get_empty_rewritten_commit_action(
+    async fn get_empty_rewritten_commit_action(
         &self,
+        ctx: &CoreContext,
         maybe_mapping_change_version: &Option<CommitSyncConfigVersion>,
         commit_sync_context: CommitSyncContext,
-    ) -> CommitRewrittenToEmpty {
+    ) -> Result<CommitRewrittenToEmpty> {
         let pushredirection_disabled = !self
             .live_commit_sync_config
-            .push_redirector_enabled_for_public(self.target_repo_id.0);
+            .push_redirector_enabled_for_public(ctx, self.target_repo_id.0)
+            .await?;
         // If a commit is changing mapping let's always rewrite it to
         // small repo regardless if outcome is empty. This is to ensure
         // that efter changing mapping there's a commit in small repo
@@ -638,10 +652,10 @@ impl<'a, R: Repo> CommitInMemorySyncer<'a, R> {
              // These commits should still be written to the large repo.
              commit_sync_context == CommitSyncContext::ForwardSyncerInitialImport
         {
-            return CommitRewrittenToEmpty::Keep;
+            Ok(CommitRewrittenToEmpty::Keep)
+        } else {
+            Ok(CommitRewrittenToEmpty::Discard)
         }
-
-        CommitRewrittenToEmpty::Discard
     }
 
     /// Get `CommitSyncConfigVersion` to use while remapping a
@@ -651,16 +665,16 @@ impl<'a, R: Repo> CommitInMemorySyncer<'a, R> {
     /// - all `NotSyncCandidate` parents are ignored
     /// - all `RewrittenAs` and `EquivalentWorkingCopyAncestor`
     ///   parents have the same (non-None) version associated
-    async fn get_mover_to_use_for_merge(
+    async fn get_movers_to_use_for_merge(
         &self,
         source_cs_id: ChangesetId,
         parent_outcomes: Vec<&CommitSyncOutcome>,
-    ) -> Result<(Mover, CommitSyncConfigVersion), Error> {
+    ) -> Result<(Movers, CommitSyncConfigVersion), Error> {
         let version =
             get_version_for_merge(self.ctx, self.source_repo.0, source_cs_id, parent_outcomes)
                 .await?;
 
-        let mover = get_mover_by_version(
+        let movers = get_movers_by_version(
             &version,
             Arc::clone(&self.live_commit_sync_config),
             self.source_repo_id(),
@@ -668,7 +682,7 @@ impl<'a, R: Repo> CommitInMemorySyncer<'a, R> {
         )
         .await
         .with_context(|| format!("failed getting a mover of version {}", version))?;
-        Ok((mover, version))
+        Ok((movers, version))
     }
 
     fn source_repo_id(&self) -> Source<RepositoryId> {
@@ -684,14 +698,6 @@ impl<'a, R: Repo> CommitInMemorySyncer<'a, R> {
             self.source_repo.0.repo_identity().id()
         } else {
             self.target_repo_id.0
-        }
-    }
-
-    fn large_repo_id(&self) -> RepositoryId {
-        if self.small_to_large {
-            self.target_repo_id.0
-        } else {
-            self.source_repo.0.repo_identity().id()
         }
     }
 }

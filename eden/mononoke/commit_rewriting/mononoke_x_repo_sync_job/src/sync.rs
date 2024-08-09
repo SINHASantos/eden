@@ -19,7 +19,6 @@ use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateLogEntry;
 use bookmarks::BookmarkUpdateReason;
 use bookmarks::BookmarksRef;
-use borrowed::borrowed;
 use bulk_derivation::BulkDerivation;
 use commit_graph::CommitGraphRef;
 use context::CoreContext;
@@ -39,15 +38,12 @@ use cross_repo_sync::CommitSyncer;
 use cross_repo_sync::PushrebaseRewriteDates;
 use cross_repo_sync::Source;
 use cross_repo_sync::Target;
-use derived_data_utils::derived_data_utils;
 use fsnodes::RootFsnodeId;
 use futures::future::try_join_all;
-use futures::stream;
 use futures::stream::TryStreamExt;
 use futures::try_join;
-use futures::StreamExt;
+use futures::FutureExt;
 use futures_stats::TimedFutureExt;
-use futures_stats::TimedTryFutureExt;
 use indicatif::ProgressBar;
 use indicatif::ProgressStyle;
 use metaconfig_types::CommitSyncConfigVersion;
@@ -101,7 +97,7 @@ where
     log_info(ctx, format!("processing log entry #{}", entry.id));
     let source_bookmark = Source(entry.bookmark_name);
     let target_bookmark = Target(
-        commit_syncer.get_bookmark_renamer().await?(&source_bookmark)
+        commit_syncer.get_bookmark_renamer().boxed().await?(&source_bookmark)
             .ok_or_else(|| format_err!("unexpected empty bookmark rename"))?,
     );
     scuba_sample
@@ -122,6 +118,7 @@ where
                 common_pushrebase_bookmarks,
                 Some(entry.timestamp),
             )
+            .boxed()
             .await?;
 
             return Ok(SyncResult::Synced(vec![]));
@@ -141,6 +138,7 @@ where
         &None,
         false,
     )
+    .boxed()
     .await
     // Note: counter update might fail after a successful sync
 }
@@ -190,6 +188,7 @@ where
                 Target(commit_syncer.get_target_repo().clone()),
             )
             .try_into_desired_relationship(ctx)
+            .boxed()
             .await?
             .ok_or_else(||
                 anyhow!(
@@ -202,7 +201,9 @@ where
     log_debug(ctx, "finding unsynced ancestors from source repo...");
 
     let (unsynced_ancestors, synced_ancestors_versions) =
-        find_toposorted_unsynced_ancestors(ctx, commit_syncer, to_cs_id.clone(), hint).await?;
+        find_toposorted_unsynced_ancestors(ctx, commit_syncer, to_cs_id.clone(), hint)
+            .boxed()
+            .await?;
 
     let version = if !synced_ancestors_versions.has_ancestor_with_a_known_outcome() {
         return Ok(SyncResult::SkippedNoKnownVersion);
@@ -252,6 +253,7 @@ where
                         target_bookmark,
                         &synced_ancestors_versions,
                     )
+                    .boxed()
                     .await?;
                     (new_version.clone(), parent_map)
                 }
@@ -263,6 +265,7 @@ where
                         version,
                         &synced_ancestors_versions,
                     )
+                    .boxed()
                     .await?
                 }
             };
@@ -280,6 +283,7 @@ where
                 unsafe_change_mapping_version_during_pushrebase,
                 parent_mapping,
             )
+            .boxed()
             .await
             .map(SyncResult::Synced);
         }
@@ -296,6 +300,7 @@ where
             &version,
             bookmark_update_timestamp,
         )
+        .boxed()
         .await?;
         res.extend(synced);
     }
@@ -309,6 +314,7 @@ where
             target_bookmark,
             remapped_cs_id,
         )
+        .boxed()
         .await?;
     }
     Ok(SyncResult::Synced(res))
@@ -585,7 +591,7 @@ where
     // All the synced ancestors of the provided commit should have been synced
     // using the config version that was provided manually, or we can create
     // a broken set of commits.
-    let (unsynced_ancestors, synced_ancestors_versions, last_synced_ancestors) =
+    let (unsynced_ancestors, synced_ancestors_versions, _last_synced_ancestors) =
         run_and_log_stats_to_scuba(
             ctx,
             "Finding toposorted unsynced ancestors with commit graph",
@@ -640,51 +646,6 @@ where
 
     let large_repo = commit_syncer.get_target_repo();
 
-    if !no_automatic_derivation {
-        // Data derivation during the import uses `derive_bulk` to derive the
-        // changetsets in batches, which expects the ancestors of all commits
-        // in a batch to be derived.
-        // If an import is interrupted or crashes, the latest synced changesets
-        // might not have been derived, which leads to crashing the first batch
-        // of the next run.
-        // To avoid this, we derive all the types for the latest synced changeset
-        // before starting the import.
-        for synced_ancestor in last_synced_ancestors {
-            log_info(
-                ctx,
-                format!("Backfilling derived data for latest synced ancestor {synced_ancestor}"),
-            );
-            let derived_data_types = large_repo
-                .repo_derived_data()
-                .active_config()
-                .types
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>();
-            stream::iter(derived_data_types).map(anyhow::Ok)
-                .try_for_each_concurrent(10, |ddt| {
-                    borrowed!(ctx, large_repo);
-                    async move {
-                        let derived_utils = derived_data_utils(ctx.fb, large_repo, ddt)?;
-                        let (stats, _res) = derived_utils
-                            .derive(ctx.clone(), large_repo.repo_derived_data_arc(), synced_ancestor)
-                            .try_timed()
-                            .await?;
-                        log_info(
-                            ctx,
-                            format!(
-                                "Backfilled {0} derivation for synced ancestor {synced_ancestor} in {1:.3}s",
-                                ddt.name(),
-                                stats.completion_time.as_secs(),
-                            ),
-                        );
-                        Ok(())
-                    }
-                })
-                .await?;
-        }
-    };
-
     let mut res = vec![];
     let mut changesets_to_derive = vec![];
 
@@ -699,6 +660,7 @@ where
                 Some(config_version.clone()),
             )
             .timed()
+            .boxed()
             .await;
         let mb_synced = mb_synced?;
         let synced = mb_synced
@@ -760,6 +722,7 @@ where
             Some(config_version),
         )
         .timed()
+        .boxed()
         .await;
 
     let maybe_cs_id: Option<ChangesetId> = result?;
@@ -1057,23 +1020,17 @@ async fn derive_initial_import_batch<R: Repo>(
         .collect::<Vec<_>>();
 
     // Derive all the data types in bulk to speed up the overall import process
-    let duration = large_repo
+    large_repo
         .repo_derived_data()
         .manager()
-        .derive_bulk(
-            ctx,
-            changesets_to_derive.to_vec(),
-            None,
-            &derived_data_types,
-        )
+        .derive_bulk(ctx, changesets_to_derive, None, &derived_data_types, None)
         .await?;
 
     log_debug(
         ctx,
         format!(
-            "Finished bulk derivation of {0} changesets in {1:.3} seconds",
+            "Finished bulk derivation of {0} changesets",
             changesets_to_derive.len(),
-            duration.as_secs_f64()
         ),
     );
     Ok(())

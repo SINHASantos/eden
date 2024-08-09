@@ -2,11 +2,17 @@
 
 #require no-eden
 
-#inprocess-hg-incompatible
-  $ setconfig format.use-segmented-changelog=true
   $ setconfig devel.segmented-changelog-rev-compat=true
   $ setconfig experimental.allowfilepeer=True
   $ setconfig clone.use-rust=1
+
+#testcases rustcheckout pythoncheckout
+
+#if rustcheckout
+  $ setconfig workingcopy.rust-checkout=true
+#else
+  $ setconfig workingcopy.rust-checkout=false
+#endif
 
   $ configure dummyssh
 
@@ -621,7 +627,7 @@ Warning not printed if working directory isn't empty
 
 #if linuxormacos no-fsmonitor
   $ hg up cf0fe1914066
-  (warning: large working directory being used without fsmonitor enabled; enable fsmonitor to improve performance; see "hg help -e fsmonitor")
+  (warning: large working directory being used without fsmonitor enabled; enable fsmonitor to improve performance; see "hg help -e fsmonitor") (?)
   2 files updated, 0 files merged, 0 files removed, 0 files unresolved
 #else
   $ hg up cf0fe1914066

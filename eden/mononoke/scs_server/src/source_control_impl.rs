@@ -92,6 +92,9 @@ define_stats! {
 
     // Duration per method
     method_completion_time_ms: dynamic_histogram("method.{}.completion_time_ms", (method: String); 10, 0, 1_000, Average, Sum, Count; P 5; P 50 ; P 90),
+    total_method_requests:  dynamic_timeseries("method.{}.total_method_requests", (method: String); Rate, Sum),
+    total_method_internal_failure:  dynamic_timeseries("method.{}.total_method_internal_failure", (method: String); Rate, Sum),
+
 }
 
 #[derive(Clone)]
@@ -309,14 +312,19 @@ impl SourceControlServiceImpl {
                 return Ok(metadata);
             }
         }
+
         let mut metadata = Metadata::new(
             None,
             tls_identities.union(&cats_identities).cloned().collect(),
             false,
             metadata::security::is_client_untrusted(|h| req_ctxt.header(h))
                 .map_err(errors::invalid_request)?,
-            None,
-            None,
+            Some(
+                req_ctxt
+                    .get_peer_ip_address()
+                    .map_err(errors::internal_error)?,
+            ),
+            Some(req_ctxt.get_peer_port().map_err(errors::internal_error)?),
         )
         .await;
 
@@ -636,6 +644,14 @@ fn log_result<T: AddScubaResponse>(
             }
         }
     };
+    if let Ok(true) = justknobs::eval("scm/mononoke:scs_alert_on_methods", None, Some(method)) {
+        STATS::total_method_requests.add_value(0, (method.to_string(),));
+        if status == "INTERNAL_ERROR" {
+            STATS::total_method_internal_failure.add_value(1, (method.to_string(),));
+        } else {
+            STATS::total_method_internal_failure.add_value(0, (method.to_string(),));
+        }
+    }
     let success = if error.is_none() { 1 } else { 0 };
 
     STATS::total_request_success.add_value(success);
@@ -879,6 +895,11 @@ impl SourceControlService for SourceControlServiceThriftImpl {
             commit: thrift::CommitSpecifier,
             params: thrift::CommitHistoryParams,
         ) -> Result<thrift::CommitHistoryResponse, service::CommitHistoryExn>;
+
+        async fn commit_linear_history(
+            commit: thrift::CommitSpecifier,
+            params: thrift::CommitLinearHistoryParams,
+        ) -> Result<thrift::CommitLinearHistoryResponse, service::CommitLinearHistoryExn>;
 
         async fn commit_list_descendant_bookmarks(
             commit: thrift::CommitSpecifier,

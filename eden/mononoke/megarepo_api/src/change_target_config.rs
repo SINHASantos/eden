@@ -10,12 +10,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::anyhow;
-use changeset_fetcher::ChangesetFetcherRef;
+use bulk_derivation::BulkDerivation;
 use context::CoreContext;
-use derived_data_utils::derived_data_utils;
-use futures::future;
-use futures::stream::FuturesUnordered;
-use futures::TryStreamExt;
 use itertools::EitherOrBoth;
 use itertools::Itertools;
 use megarepo_config::MononokeMegarepoConfigs;
@@ -26,11 +22,11 @@ use megarepo_config::Target;
 use megarepo_error::MegarepoError;
 use megarepo_mapping::CommitRemappingState;
 use megarepo_mapping::SourceName;
+use metaconfig_types::RepoConfigArc;
 use mononoke_api::Mononoke;
 use mononoke_api::RepoContext;
 use mononoke_types::ChangesetId;
 use mutable_renames::MutableRenames;
-use repo_derived_data::RepoDerivedDataArc;
 use repo_derived_data::RepoDerivedDataRef;
 
 use crate::common::find_target_bookmark_and_value;
@@ -221,12 +217,19 @@ impl<'a> ChangeTargetConfig<'a> {
         )
         .await?;
 
+        let repo = self.find_repo_by_id(ctx, target.repo_id).await?;
+        let repo_config = repo.repo().repo_config_arc();
+
         // Contruct the new config structure and the remapping state
-        let new_config = self.megarepo_configs.get_config_by_version(
-            ctx.clone(),
-            target.clone(),
-            new_version.clone(),
-        )?;
+        let new_config = self
+            .megarepo_configs
+            .get_config_by_version(
+                ctx.clone(),
+                repo_config,
+                target.clone(),
+                new_version.clone(),
+            )
+            .await?;
         let new_remapping_state = CommitRemappingState::new(
             changesets_to_merge.clone(),
             new_version,
@@ -295,18 +298,15 @@ impl<'a> ChangeTargetConfig<'a> {
             .repo_derived_data()
             .active_config()
             .types
-            .iter();
-
-        let derivers = FuturesUnordered::new();
-        for ty in derived_data_types {
-            let utils = derived_data_utils(ctx.fb, target_repo.inner_repo(), *ty)?;
-            derivers.push(utils.derive(
-                ctx.clone(),
-                target_repo.inner_repo().repo_derived_data_arc(),
-                final_merge,
-            ));
-        }
-        derivers.try_for_each(|_| future::ready(Ok(()))).await?;
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        target_repo
+            .inner_repo()
+            .repo_derived_data()
+            .manager()
+            .derive_bulk(ctx, &[final_merge], None, &derived_data_types, None)
+            .await?;
 
         // Move bookmark
         self.move_bookmark_conditionally(
@@ -390,9 +390,8 @@ impl<'a> ChangeTargetConfig<'a> {
 
         // Check that first parent is a target location
         let parents = repo
-            .inner_repo()
-            .changeset_fetcher()
-            .get_parents(ctx, actual_target_location)
+            .commit_graph()
+            .changeset_parents(ctx, actual_target_location)
             .await?;
         if parents.first() != Some(&expected_target_location) {
             return Err(MegarepoError::request(anyhow!(

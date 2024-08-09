@@ -3,11 +3,14 @@
 
 load("@fbcode_macros//build_defs:custom_rule.bzl", "custom_rule")
 load("@fbcode_macros//build_defs:custom_unittest.bzl", "custom_unittest")
-load("@fbcode_macros//build_defs:native_rules.bzl", "buck_filegroup")
 load("@fbcode_macros//build_defs/lib:rust_common.bzl", "rust_common")
 load("@fbcode_macros//build_defs/lib:rust_oss.bzl", "rust_oss")
 load("@fbcode_macros//build_defs/lib:test_utils.bzl", "test_utils")
 load("@fbsource//tools/build_defs/buck2:is_buck2.bzl", "is_buck2")
+load(
+    "//eden/mononoke/tests/integration/facebook:symlink.bzl",
+    "symlink",
+)
 
 MONONOKE_TARGETS_TO_ENV = {
     "//common/tools/thriftdbg:thriftdbg": "THRIFTDBG",  # Used for verify_integrity_service health check
@@ -28,10 +31,12 @@ MONONOKE_TARGETS_TO_ENV = {
     "//eden/mononoke/git/facebook/remote_gitimport:remote_gitimport": "MONONOKE_REMOTE_GITIMPORT",
     "//eden/mononoke/git/gitexport:gitexport": "MONONOKE_GITEXPORT",
     "//eden/mononoke/git/gitimport:gitimport": "MONONOKE_GITIMPORT",
+    "//eden/mononoke/git/pushrebase:git_pushrebase": "GIT_PUSHREBASE",
     "//eden/mononoke/git_server:git_server": "MONONOKE_GIT_SERVER",
-    "//eden/mononoke/land_service:land_service": "LAND_SERVICE",
+    "//eden/mononoke/land_service/facebook/server:land_service": "LAND_SERVICE",
     "//eden/mononoke/lfs_server:lfs_server": "LFS_SERVER",
     "//eden/mononoke/microwave:builder": "MONONOKE_MICROWAVE_BUILDER",
+    "//eden/mononoke/mononoke_cas_sync_job:mononoke_cas_sync_job": "MONONOKE_CAS_SYNC",
     "//eden/mononoke/mononoke_hg_sync_job:mononoke_hg_sync_job": "MONONOKE_HG_SYNC",
     "//eden/mononoke/repo_import:repo_import": "MONONOKE_REPO_IMPORT",
     "//eden/mononoke/scs/client:scsc": "SCS_CLIENT",
@@ -40,13 +45,13 @@ MONONOKE_TARGETS_TO_ENV = {
     "//eden/mononoke/tools/admin:newadmin": "MONONOKE_NEWADMIN",
     "//eden/mononoke/tools/example:example": "MONONOKE_EXAMPLE",
     "//eden/mononoke/tools/facebook/backfill_bonsai_blob_mapping:backfill_bonsai_blob_mapping": "MONONOKE_BACKFILL_BONSAI_BLOB_MAPPING",
+    "//eden/mononoke/tools/facebook/derived_data_tailer:derived_data_tailer": "DERIVED_DATA_TAILER",
     "//eden/mononoke/tools/facebook/repo_metadata_logger:repo_metadata_logger": "REPO_METADATA_LOGGER",
     "//eden/mononoke/tools/import:import": "MONONOKE_IMPORT",
     "//eden/mononoke/tools/testtool:testtool": "MONONOKE_TESTTOOL",
     "//eden/mononoke/walker:walker": "MONONOKE_WALKER",
     "//eden/mononoke:admin": "MONONOKE_ADMIN",
     "//eden/mononoke:aliasverify": "MONONOKE_ALIAS_VERIFY",
-    "//eden/mononoke:backfill_derived_data": "MONONOKE_BACKFILL_DERIVED_DATA",
     "//eden/mononoke:backfill_mapping": "MONONOKE_BACKFILL_MAPPING",
     "//eden/mononoke:blobimport": "MONONOKE_BLOBIMPORT",
     "//eden/mononoke:blobstore_healer": "MONONOKE_BLOBSTORE_HEALER",
@@ -54,8 +59,6 @@ MONONOKE_TARGETS_TO_ENV = {
     "//eden/mononoke:check_git_wc": "MONONOKE_CHECK_GIT_WC",
     "//eden/mononoke:mononoke": "MONONOKE_SERVER",
     "//eden/mononoke:packer": "MONONOKE_PACKER",
-    "//eden/mononoke:segmented_changelog_seeder": "MONONOKE_SEGMENTED_CHANGELOG_SEEDER",
-    "//eden/mononoke:segmented_changelog_tailer": "MONONOKE_SEGMENTED_CHANGELOG_TAILER",
     "//eden/mononoke:sqlblob_gc": "MONONOKE_SQLBLOB_GC",
     "//security/source_control/verify_integrity/service:verify_integrity_service": "VERIFY_INTEGRITY_SERVICE",
     "//security/source_control/verify_integrity:verify_integrity": "VERIFY_INTEGRITY",
@@ -68,11 +71,8 @@ DOTT_DEPS = {
     "//eden/mononoke/tests/integration/certs/facebook:test_certs": "TEST_CERTS",
     # fixtures
     "//eden/mononoke/tests/integration/facebook:facebook_test_fixtures": "FB_TEST_FIXTURES",
-    # Location ofthe .t tests
-    "//eden/mononoke/tests/integration/facebook:facebook_tests": "TEST_ROOT_FACEBOOK",
     # Test utils
     "//eden/mononoke/tests/integration:get_free_socket": "GET_FREE_SOCKET",
-    "//eden/mononoke/tests/integration:public_tests": "TEST_ROOT_PUBLIC",
     "//eden/mononoke/tests/integration:test_fixtures": "TEST_FIXTURES",
     "//eden/mononoke/tests/integration:urlencode": "URLENCODE",
     "//eden/scm/tests:dummyssh3": "DUMMYSSH",
@@ -227,17 +227,16 @@ def _dott_test(name, dott_files, deps, use_mysql = False, disable_all_network_ac
             if t not in targets:
                 targets[e] = t
 
-    # the custom_manifest_rule replaces some deps, e.g. for OSS builds
-    resolved_deps = custom_manifest_rule(manifest_target, name + "-manifest.json", targets)
-    resolved_deps.append(":" + manifest_target)
-
     dott_files_target = name + "-dott"
-
-    buck_filegroup(
+    symlink(
         name = dott_files_target,
         srcs = dott_files,
     )
+    targets["TEST_ROOT"] = ":%s" % dott_files_target
 
+    # the custom_manifest_rule replaces some deps, e.g. for OSS builds
+    resolved_deps = custom_manifest_rule(manifest_target, name + "-manifest.json", targets)
+    resolved_deps.append(":" + manifest_target)
     resolved_deps.append(":" + dott_files_target)
 
     extra_args = [

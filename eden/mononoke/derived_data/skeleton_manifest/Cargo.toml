@@ -31,7 +31,6 @@ thiserror = "1.0.49"
 [dev-dependencies]
 bonsai_hg_mapping = { version = "0.1.0", path = "../../bonsai_hg_mapping" }
 bookmarks = { version = "0.1.0", path = "../../bookmarks" }
-changesets = { version = "0.1.0", path = "../../changesets" }
 commit_graph = { version = "0.1.0", path = "../../repo_attributes/commit_graph/commit_graph" }
 derived_data_test_utils = { version = "0.1.0", path = "../test_utils" }
 facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
@@ -44,6 +43,7 @@ mercurial_types = { version = "0.1.0", path = "../../mercurial/types" }
 pretty_assertions = { version = "1.2", features = ["alloc"], default-features = false }
 repo_blobstore = { version = "0.1.0", path = "../../blobrepo/repo_blobstore" }
 repo_derived_data = { version = "0.1.0", path = "../../repo_attributes/repo_derived_data" }
+repo_identity = { version = "0.1.0", path = "../../repo_attributes/repo_identity" }
 test_repo_factory = { version = "0.1.0", path = "../../repo_factory/test_repo_factory" }
 tests_utils = { version = "0.1.0", path = "../../tests/utils" }
 tokio = { version = "1.37.0", features = ["full", "test-util", "tracing"] }

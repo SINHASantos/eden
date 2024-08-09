@@ -534,14 +534,14 @@ mod test {
     use bonsai_hg_mapping::BonsaiHgMapping;
     use bookmarks::BookmarkUpdateLogId;
     use bookmarks::Bookmarks;
-    use changeset_fetcher::ChangesetFetcher;
-    use changesets::Changesets;
+    use commit_graph::CommitGraphWriter;
     use fbinit::FacebookInit;
     use filestore::FilestoreConfig;
     use maplit::hashmap;
     use mononoke_types::RepositoryId;
     use repo_blobstore::RepoBlobstore;
     use repo_derived_data::RepoDerivedData;
+    use repo_identity::RepoIdentity;
     use tests_utils::drawdag::create_from_dag;
 
     use super::*;
@@ -551,12 +551,6 @@ mod test {
     pub struct TestRepo {
         #[facet]
         pub repo_blobstore: RepoBlobstore,
-
-        #[facet]
-        pub changesets: dyn Changesets,
-
-        #[facet]
-        pub changeset_fetcher: dyn ChangesetFetcher,
 
         #[facet]
         pub bonsai_hg_mapping: dyn BonsaiHgMapping,
@@ -572,6 +566,12 @@ mod test {
 
         #[facet]
         pub commit_graph: CommitGraph,
+
+        #[facet]
+        pub commit_graph_writer: dyn CommitGraphWriter,
+
+        #[facet]
+        pub repo_identity: RepoIdentity,
     }
 
     #[fbinit::test]

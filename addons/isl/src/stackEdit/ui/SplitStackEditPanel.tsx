@@ -23,22 +23,23 @@ import {useTokenizedContentsOnceVisible} from '../../ComparisonView/SplitDiffVie
 import {Column, Row, ScrollX, ScrollY} from '../../ComponentUtils';
 import {EmptyState} from '../../EmptyState';
 import {useGeneratedFileStatuses} from '../../GeneratedFile';
-import {Subtle} from '../../Subtle';
-import {Tooltip} from '../../Tooltip';
 import {tracker} from '../../analytics';
-import {Button} from '../../components/Button';
-import {TextField} from '../../components/TextField';
 import {t, T} from '../../i18n';
+import {readAtom} from '../../jotaiUtils';
 import {GeneratedStatus} from '../../types';
 import {isAbsent} from '../commitStackState';
 import {computeLinesForFileStackEditor} from './FileStackEditorLines';
 import {bumpStackEditMetric, SplitRangeRecord, useStackEditState} from './stackEditState';
 import * as stylex from '@stylexjs/stylex';
 import {Set as ImSet, Range} from 'immutable';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
+import {Subtle} from 'isl-components/Subtle';
+import {TextField} from 'isl-components/TextField';
+import {Tooltip} from 'isl-components/Tooltip';
 import {useAtomValue} from 'jotai';
 import {useRef, useState, useEffect, useMemo} from 'react';
 import {useContextMenu} from 'shared/ContextMenu';
-import {Icon} from 'shared/Icon';
 import {type LineIdx, splitLines, diffBlocks} from 'shared/diff';
 import {useThrottledEffect} from 'shared/hooks';
 import {firstLine, nullthrows} from 'shared/utils';
@@ -281,11 +282,7 @@ function SplitColumn(props: SplitColumnProps) {
           <span className="split-commit-header-stack-number">
             {rev + 1} / {subStack.size}
           </span>
-          <EditableCommitTitle
-            commitMessage={commitMessage}
-            commitKey={commit?.key}
-            readOnly={editors.isEmpty()}
-          />
+          <EditableCommitTitle commitMessage={commitMessage} commitKey={commit?.key} />
           <Button icon onClick={e => showExtraCommitActionsContextMenu(e)}>
             <Icon icon="ellipsis" />
           </Button>
@@ -656,7 +653,6 @@ function StackRangeSelector() {
 type MaybeEditableCommitTitleProps = {
   commitMessage: string;
   commitKey?: string;
-  readOnly: boolean;
 };
 
 function EditableCommitTitle(props: MaybeEditableCommitTitleProps) {
@@ -676,14 +672,42 @@ function EditableCommitTitle(props: MaybeEditableCommitTitleProps) {
         const newFullText = newTitle + '\n' + existingDescription;
         const newStack = commitStack.stack.setIn([commit.rev, 'text'], newFullText);
         const newCommitStack = commitStack.set('stack', newStack);
-        stackEdit.push(newCommitStack, {name: 'metaedit', commit});
+
+        const previous = stackEdit.undoOperationDescription();
+        if (previous != null && previous.name == 'metaedit' && previous.commit.rev === commit.rev) {
+          // the last operation was also editing this same message, let's re-use the history instead of growing it
+          stackEdit.replaceTopOperation(newCommitStack, {name: 'metaedit', commit});
+        } else {
+          stackEdit.push(newCommitStack, {name: 'metaedit', commit});
+        }
+      } else {
+        // If we don't have a real commit for this editor, it's the "fake" blank commit added to the top of the dense stack.
+        // We need a real commit to associate the newly edited title to, so it can be persisted/is part of the undo stack.
+        // So we make the fake blank commit into a real blank commit by inserting at the end.
+        // Note that this will create another fake blank commit AFTER the new real blank commit.
+
+        const [, endRev] = findStartEndRevs(stackEdit);
+
+        const messageTemplate = readAtom(commitMessageTemplate);
+        const schema = readAtom(commitMessageFieldsSchema);
+        const fields: CommitMessageFields = {...messageTemplate, Title: newTitle};
+        const message = commitMessageFieldsToString(schema, fields);
+        if (endRev != null) {
+          const newStack = commitStack.insertEmpty(endRev + 1, message);
+
+          const newEnd = newStack.get(endRev + 1);
+          if (newEnd != null) {
+            let {splitRange} = stackEdit;
+            splitRange = splitRange.set('endKey', newEnd.key);
+            stackEdit.push(newStack, {name: 'insertBlankCommit'}, splitRange);
+          }
+        }
       }
     }
   };
   return (
     <TextField
       containerXstyle={styles.full}
-      readOnly={props.readOnly}
       value={existingTitle}
       title={t('Edit commit title')}
       style={{width: 'calc(100% - var(--pad))'}}

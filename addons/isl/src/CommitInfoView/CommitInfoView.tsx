@@ -9,7 +9,6 @@ import type {CommitInfo, DiffId} from '../types';
 import type {CommitInfoMode, EditedMessage} from './CommitInfoState';
 import type {CommitMessageFields, FieldConfig, FieldsBeingEdited} from './types';
 
-import {Banner, BannerKind, BannerTooltip} from '../Banner';
 import {ChangedFilesWithFetching} from '../ChangedFilesWithFetching';
 import serverAPI from '../ClientToServerAPI';
 import {Commit} from '../Commit';
@@ -22,10 +21,7 @@ import {Link} from '../Link';
 import {OperationDisabledButton} from '../OperationDisabledButton';
 import {SubmitSelectionButton} from '../SubmitSelectionButton';
 import {SubmitUpdateMessageInput} from '../SubmitUpdateMessageInput';
-import {Subtle} from '../Subtle';
-import {latestSuccessorUnlessExplicitlyObsolete} from '../SuccessionTracker';
 import {SuggestedRebaseButton} from '../SuggestedRebase';
-import {Tooltip} from '../Tooltip';
 import {UncommittedChanges} from '../UncommittedChanges';
 import {confirmUnsavedFiles} from '../UnsavedFiles';
 import {tracker} from '../analytics';
@@ -36,11 +32,7 @@ import {
 } from '../codeReview/CodeReviewInfo';
 import {submitAsDraft, SubmitAsDraftCheckbox} from '../codeReview/DraftCheckbox';
 import {overrideDisabledSubmitModes} from '../codeReview/github/branchPrState';
-import {Badge} from '../components/Badge';
-import {Button} from '../components/Button';
-import {Divider} from '../components/Divider';
 import GatedComponent from '../components/GatedComponent';
-import {RadioGroup} from '../components/Radio';
 import {FoldButton, useRunFoldPreview} from '../fold';
 import {t, T} from '../i18n';
 import {readAtom, writeAtom} from '../jotaiUtils';
@@ -58,6 +50,7 @@ import platform from '../platform';
 import {CommitPreview, uncommittedChangesWithPreviews} from '../previews';
 import {selectedCommits} from '../selection';
 import {commitByHash, latestHeadCommit, repositoryInfo} from '../serverAPIState';
+import {latestSuccessorUnlessExplicitlyObsolete} from '../successionUtils';
 import {GeneratedStatus, succeedableRevset} from '../types';
 import {useModal} from '../useModal';
 import {firstOfIterable} from '../utils';
@@ -86,12 +79,19 @@ import {FillCommitMessage} from './FillCommitMessage';
 import SplitSuggestion from './SplitSuggestion';
 import {CommitTitleByline, getFieldToAutofocus, Section, SmallCapsTitle} from './utils';
 import deepEqual from 'fast-deep-equal';
+import {Badge} from 'isl-components/Badge';
+import {Banner, BannerKind, BannerTooltip} from 'isl-components/Banner';
+import {Button} from 'isl-components/Button';
+import {Divider} from 'isl-components/Divider';
+import {Icon} from 'isl-components/Icon';
+import {RadioGroup} from 'isl-components/Radio';
+import {Subtle} from 'isl-components/Subtle';
+import {Tooltip} from 'isl-components/Tooltip';
 import {useAtom, useAtomValue} from 'jotai';
 import {useAtomCallback} from 'jotai/utils';
 import {useCallback, useEffect, useMemo} from 'react';
 import {ComparisonType} from 'shared/Comparison';
 import {useContextMenu} from 'shared/ContextMenu';
-import {Icon} from 'shared/Icon';
 import {usePrevious} from 'shared/hooks';
 import {firstLine, notEmpty, nullthrows} from 'shared/utils';
 
@@ -325,7 +325,7 @@ export function CommitInfoDetails({commit}: {commit: CommitInfo}) {
             </SmallCapsTitle>
             {uncommittedChanges.length > 0 ? (
               <GatedComponent featureFlag={Internal.featureFlags?.ShowSplitSuggestion}>
-                <PendingDiffStats commit={commit} />
+                <PendingDiffStats />
               </GatedComponent>
             ) : null}
             {uncommittedChanges.length === 0 ? (
@@ -651,7 +651,7 @@ function ActionsBar({
   const forceEnableSubmit = useAtomValue(overrideDisabledSubmitModes);
   const submitDisabledReason = forceEnableSubmit ? undefined : provider?.submitDisabledReason?.();
 
-  const ongoingImageUploads = useAtomValue(numPendingImageUploads);
+  const ongoingImageUploads = useAtomValue(numPendingImageUploads(undefined));
   const areImageUploadsOngoing = ongoingImageUploads > 0;
 
   // Generally "Amend"/"Commit" for head commit, but if there's no changes while amending, just use "Amend message"

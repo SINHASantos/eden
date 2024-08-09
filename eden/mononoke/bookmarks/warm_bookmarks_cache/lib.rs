@@ -13,7 +13,6 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Duration;
 
-use anyhow::anyhow;
 use anyhow::Context as _;
 use anyhow::Error;
 use async_trait::async_trait;
@@ -56,11 +55,12 @@ use futures::stream::TryStreamExt;
 use futures_stats::TimedFutureExt;
 use futures_watchdog::WatchdogExt;
 use git_types::MappedGitCommitId;
-use git_types::RootGitDeltaManifestId;
+use git_types::RootGitDeltaManifestV2Id;
 use git_types::TreeHandle;
 use itertools::Itertools;
 use lock_ext::RwLockExt;
 use mercurial_derivation::MappedHgChangesetId;
+use mercurial_derivation::RootHgAugmentedManifestId;
 use mononoke_types::ChangesetId;
 use mononoke_types::DerivableType;
 use mononoke_types::Timestamp;
@@ -169,7 +169,11 @@ impl WarmBookmarksCacheBuilder {
         phases: &ArcPhases,
     ) -> Result<(), Error> {
         self.add_derived_data_warmers(
-            &[MappedHgChangesetId::VARIANT, FilenodesOnlyPublic::VARIANT],
+            &[
+                MappedHgChangesetId::VARIANT,
+                FilenodesOnlyPublic::VARIANT,
+                RootHgAugmentedManifestId::VARIANT,
+            ],
             repo_derived_data,
         )?;
         self.add_public_phase_warmer(phases);
@@ -185,7 +189,7 @@ impl WarmBookmarksCacheBuilder {
             &[
                 MappedGitCommitId::VARIANT,
                 TreeHandle::VARIANT,
-                RootGitDeltaManifestId::VARIANT,
+                RootGitDeltaManifestV2Id::VARIANT,
             ],
             repo_derived_data,
         )?;
@@ -202,98 +206,84 @@ impl WarmBookmarksCacheBuilder {
 
         let config = repo_derived_data.config();
         for ty in types.iter() {
-            if !config.is_enabled(**ty) {
-                return Err(anyhow!(
-                    "{} is not enabled for {}",
-                    ty.name(),
-                    self.repo_identity.name()
-                ));
+            if config.is_enabled(**ty) {
+                self.warmers
+                    .extend(self.derived_data_warmer(ty, repo_derived_data));
             }
         }
 
-        if types.contains(&MappedHgChangesetId::VARIANT) {
-            self.warmers
-                .push(create_derived_data_warmer::<MappedHgChangesetId>(
-                    &self.ctx,
-                    repo_derived_data.clone(),
-                ));
-        }
-
-        if types.contains(&RootUnodeManifestId::VARIANT) {
-            self.warmers
-                .push(create_derived_data_warmer::<RootUnodeManifestId>(
-                    &self.ctx,
-                    repo_derived_data.clone(),
-                ));
-        }
-        if types.contains(&RootFsnodeId::VARIANT) {
-            self.warmers
-                .push(create_derived_data_warmer::<RootFsnodeId>(
-                    &self.ctx,
-                    repo_derived_data.clone(),
-                ));
-        }
-        if types.contains(&RootSkeletonManifestId::VARIANT) {
-            self.warmers
-                .push(create_derived_data_warmer::<RootSkeletonManifestId>(
-                    &self.ctx,
-                    repo_derived_data.clone(),
-                ));
-        }
-        if types.contains(&RootBlameV2::VARIANT) {
-            self.warmers.push(create_derived_data_warmer::<RootBlameV2>(
-                &self.ctx,
-                repo_derived_data.clone(),
-            ));
-        }
-        if types.contains(&ChangesetInfo::VARIANT) {
-            self.warmers
-                .push(create_derived_data_warmer::<ChangesetInfo>(
-                    &self.ctx,
-                    repo_derived_data.clone(),
-                ));
-        }
-        if types.contains(&RootDeletedManifestV2Id::VARIANT) {
-            self.warmers
-                .push(create_derived_data_warmer::<RootDeletedManifestV2Id>(
-                    &self.ctx,
-                    repo_derived_data.clone(),
-                ));
-        }
-        if types.contains(&RootFastlog::VARIANT) {
-            self.warmers.push(create_derived_data_warmer::<RootFastlog>(
-                &self.ctx,
-                repo_derived_data.clone(),
-            ));
-        }
-        if types.contains(&RootBssmV3DirectoryId::VARIANT) {
-            self.warmers
-                .push(create_derived_data_warmer::<RootBssmV3DirectoryId>(
-                    &self.ctx,
-                    repo_derived_data.clone(),
-                ));
-        }
-        if types.contains(&TreeHandle::VARIANT) {
-            self.warmers.push(create_derived_data_warmer::<TreeHandle>(
-                &self.ctx,
-                repo_derived_data.clone(),
-            ));
-        }
-        if types.contains(&MappedGitCommitId::VARIANT) {
-            self.warmers
-                .push(create_derived_data_warmer::<MappedGitCommitId>(
-                    &self.ctx,
-                    repo_derived_data.clone(),
-                ));
-        }
-        if types.contains(&RootGitDeltaManifestId::VARIANT) {
-            self.warmers
-                .push(create_derived_data_warmer::<RootGitDeltaManifestId>(
-                    &self.ctx,
-                    repo_derived_data.clone(),
-                ));
-        }
         Ok(())
+    }
+
+    fn derived_data_warmer(
+        &self,
+        derivable_type: &DerivableType,
+        repo_derived_data: &ArcRepoDerivedData,
+    ) -> Option<Warmer> {
+        match derivable_type {
+            DerivableType::Unodes => Some(create_derived_data_warmer::<RootUnodeManifestId>(
+                &self.ctx,
+                repo_derived_data.clone(),
+            )),
+            DerivableType::BlameV2 => Some(create_derived_data_warmer::<RootBlameV2>(
+                &self.ctx,
+                repo_derived_data.clone(),
+            )),
+            DerivableType::FileNodes => {
+                // TODO: add warmer for filenodes
+                None
+            }
+            DerivableType::HgChangesets => Some(create_derived_data_warmer::<MappedHgChangesetId>(
+                &self.ctx,
+                repo_derived_data.clone(),
+            )),
+            DerivableType::HgAugmentedManifests => Some(create_derived_data_warmer::<
+                RootHgAugmentedManifestId,
+            >(
+                &self.ctx, repo_derived_data.clone()
+            )),
+            DerivableType::Fsnodes => Some(create_derived_data_warmer::<RootFsnodeId>(
+                &self.ctx,
+                repo_derived_data.clone(),
+            )),
+            DerivableType::Fastlog => Some(create_derived_data_warmer::<RootFastlog>(
+                &self.ctx,
+                repo_derived_data.clone(),
+            )),
+            DerivableType::DeletedManifests => Some(create_derived_data_warmer::<
+                RootDeletedManifestV2Id,
+            >(
+                &self.ctx, repo_derived_data.clone()
+            )),
+            DerivableType::SkeletonManifests => Some(create_derived_data_warmer::<
+                RootSkeletonManifestId,
+            >(
+                &self.ctx, repo_derived_data.clone()
+            )),
+            DerivableType::ChangesetInfo => Some(create_derived_data_warmer::<ChangesetInfo>(
+                &self.ctx,
+                repo_derived_data.clone(),
+            )),
+            DerivableType::GitTrees => Some(create_derived_data_warmer::<TreeHandle>(
+                &self.ctx,
+                repo_derived_data.clone(),
+            )),
+            DerivableType::GitDeltaManifestsV2 => Some(create_derived_data_warmer::<
+                RootGitDeltaManifestV2Id,
+            >(
+                &self.ctx, repo_derived_data.clone()
+            )),
+            DerivableType::BssmV3 => Some(create_derived_data_warmer::<RootBssmV3DirectoryId>(
+                &self.ctx,
+                repo_derived_data.clone(),
+            )),
+            DerivableType::GitCommits => Some(create_derived_data_warmer::<MappedGitCommitId>(
+                &self.ctx,
+                repo_derived_data.clone(),
+            )),
+            DerivableType::TestManifests => None,
+            DerivableType::TestShardedManifests => None,
+        }
     }
 
     fn add_public_phase_warmer(&mut self, phases: &ArcPhases) {
@@ -359,7 +349,7 @@ impl BookmarksCache for NoopBookmarksCache {
                 BookmarkCategory::ALL,
                 BookmarkKind::ALL_PUBLISHING,
                 pagination,
-                limit.unwrap_or(std::u64::MAX),
+                limit.unwrap_or(u64::MAX),
             )
             .map_ok(|(book, cs_id)| {
                 let kind = *book.kind();
@@ -1160,7 +1150,6 @@ mod tests {
     use bookmarks::BookmarksMaybeStaleExt;
     use cloned::cloned;
     use delayblob::DelayedBlobstore;
-    use derived_data::BonsaiDerived;
     use fbinit::FacebookInit;
     use fixtures::Linear;
     use fixtures::TestRepoFixture;
@@ -1169,6 +1158,7 @@ mod tests {
     use mononoke_api_types::InnerRepo;
     use mononoke_types::RepositoryId;
     use repo_derived_data::RepoDerivedDataArc;
+    use repo_derived_data::RepoDerivedDataRef;
     use repo_identity::RepoIdentityArc;
     use sql_ext::mononoke_queries;
     use test_repo_factory::TestRepoFactory;
@@ -1210,7 +1200,9 @@ mod tests {
         assert_eq!(bookmarks, HashMap::new());
 
         let master_cs_id = resolve_cs_id(&ctx, &repo.blob_repo, "master").await?;
-        RootUnodeManifestId::derive(&ctx, &repo.blob_repo, master_cs_id).await?;
+        repo.repo_derived_data()
+            .derive::<RootUnodeManifestId>(&ctx, master_cs_id)
+            .await?;
 
         let bookmarks = init_bookmarks(
             &ctx,
@@ -1263,7 +1255,9 @@ mod tests {
                 .await?;
             master = new_master;
         }
-        RootUnodeManifestId::derive(&ctx, &repo.blob_repo, master).await?;
+        repo.repo_derived_data()
+            .derive::<RootUnodeManifestId>(&ctx, master)
+            .await?;
         let derived_master = master;
 
         info!(ctx.logger(), "creating 5 more underived commits");
@@ -1297,7 +1291,9 @@ mod tests {
             hashmap! {BookmarkKey::new("master")? => (derived_master, BookmarkKind::PullDefaultPublishing)}
         );
 
-        RootUnodeManifestId::derive(&ctx, &repo.blob_repo, master).await?;
+        repo.repo_derived_data()
+            .derive::<RootUnodeManifestId>(&ctx, master)
+            .await?;
         let bookmarks = init_bookmarks(
             &ctx,
             &*sub,
@@ -1328,7 +1324,9 @@ mod tests {
         let warmers = Arc::new(warmers);
 
         let derived_master = resolve_cs_id(&ctx, &repo.blob_repo, "master").await?;
-        RootUnodeManifestId::derive(&ctx, &repo.blob_repo, derived_master).await?;
+        repo.repo_derived_data()
+            .derive::<RootUnodeManifestId>(&ctx, derived_master)
+            .await?;
 
         for i in 1..50 {
             let new_master = CreateCommitContext::new(&ctx, &repo.blob_repo, vec!["master"])
@@ -1380,7 +1378,9 @@ mod tests {
             .add_file("somefile", "content")
             .commit()
             .await?;
-        RootUnodeManifestId::derive(&ctx, &repo.blob_repo, derived_master).await?;
+        repo.repo_derived_data()
+            .derive::<RootUnodeManifestId>(&ctx, derived_master)
+            .await?;
         bookmark(&ctx, &repo.blob_repo, "master")
             .set_to(derived_master)
             .await?;
@@ -1622,7 +1622,9 @@ mod tests {
                     } else {
                         cloned!(repo);
                         async move {
-                            RootUnodeManifestId::derive(ctx, &repo.blob_repo, cs_id).await?;
+                            repo.repo_derived_data()
+                                .derive::<RootUnodeManifestId>(ctx, cs_id)
+                                .await?;
                             Ok(())
                         }
                         .boxed()
@@ -1634,9 +1636,11 @@ mod tests {
                 move |ctx, cs_id| {
                     cloned!(repo);
                     async move {
-                        let res =
-                            RootUnodeManifestId::is_derived(ctx, &repo.blob_repo, &cs_id).await?;
-                        Ok(res)
+                        let res = repo
+                            .repo_derived_data()
+                            .fetch_derived::<RootUnodeManifestId>(ctx, cs_id)
+                            .await?;
+                        Ok(res.is_some())
                     }
                     .boxed()
                 }
@@ -1713,16 +1717,16 @@ mod tests {
         let repo = Linear::get_inner_repo(fb).await;
         let ctx = CoreContext::test_mock(fb);
 
-        RootUnodeManifestId::derive(
-            &ctx,
-            &repo.blob_repo,
-            repo.blob_repo
-                .bookmarks()
-                .get(ctx.clone(), &BookmarkKey::new("master")?)
-                .await?
-                .unwrap(),
-        )
-        .await?;
+        repo.repo_derived_data()
+            .derive::<RootUnodeManifestId>(
+                &ctx,
+                repo.blob_repo
+                    .bookmarks()
+                    .get(ctx.clone(), &BookmarkKey::new("master")?)
+                    .await?
+                    .unwrap(),
+            )
+            .await?;
 
         let derive_sleep_time_ms = 100;
         let how_many_derived = Arc::new(RwLock::new(HashMap::new()));
@@ -1736,7 +1740,9 @@ mod tests {
                     cloned!(repo);
                     async move {
                         tokio::time::sleep(Duration::from_millis(derive_sleep_time_ms)).await;
-                        RootUnodeManifestId::derive(ctx, &repo.blob_repo, cs_id).await?;
+                        repo.repo_derived_data()
+                            .derive::<RootUnodeManifestId>(ctx, cs_id)
+                            .await?;
                         Ok(())
                     }
                     .boxed()
@@ -1747,8 +1753,11 @@ mod tests {
                 move |ctx, cs_id| {
                     cloned!(repo);
                     async move {
-                        let res =
-                            RootUnodeManifestId::is_derived(ctx, &repo.blob_repo, &cs_id).await?;
+                        let res = repo
+                            .repo_derived_data()
+                            .fetch_derived::<RootUnodeManifestId>(ctx, cs_id)
+                            .await?
+                            .is_some();
                         Ok(res)
                     }
                     .boxed()

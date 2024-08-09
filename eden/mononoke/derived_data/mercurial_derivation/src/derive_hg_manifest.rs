@@ -43,8 +43,8 @@ use mononoke_types::ChangesetId;
 use mononoke_types::FileType;
 use mononoke_types::NonRootMPath;
 use mononoke_types::RepoPath;
+use mononoke_types::SortedVectorTrieMap;
 use mononoke_types::TrackedFileChange;
-use mononoke_types::TrieMap;
 use sorted_vector_map::SortedVectorMap;
 
 use crate::derive_hg_changeset::store_file_change;
@@ -189,7 +189,7 @@ async fn create_hg_manifest(
         Traced<ParentIndex, HgManifestId>,
         Traced<ParentIndex, (FileType, HgFileNodeId)>,
         (),
-        TrieMap<
+        SortedVectorTrieMap<
             Entry<Traced<ParentIndex, HgManifestId>, Traced<ParentIndex, (FileType, HgFileNodeId)>>,
         >,
     >,

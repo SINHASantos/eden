@@ -48,7 +48,10 @@ use edenfs_utils::path_from_bytes;
 use serde::Serialize;
 use subprocess::Exec;
 use subprocess::Redirection as SubprocessRedirection;
+use thrift_types::edenfs::GetCurrentSnapshotInfoRequest;
 use thrift_types::edenfs::GetScmStatusParams;
+use thrift_types::edenfs::MountId;
+use thrift_types::edenfs::RootIdOptions;
 
 use crate::ExitCode;
 
@@ -265,6 +268,26 @@ async fn ignored_usage_counts_for_mount(
     checkout: &EdenFsCheckout,
     client: &EdenFsClient,
 ) -> Result<u64> {
+    let mount_point = bytes_from_path(checkout.path())?;
+
+    // FilteredFS mounts require a filterId to be passed into status calls
+    let mut root_id_options = RootIdOptions {
+        filterId: None,
+        ..Default::default()
+    };
+    let snapshot_info_params = GetCurrentSnapshotInfoRequest {
+        mountId: MountId {
+            mountPoint: mount_point,
+            ..Default::default()
+        },
+        cri: None,
+        ..Default::default()
+    };
+    let snapshot_info = client.getCurrentSnapshotInfo(&snapshot_info_params).await;
+    if let Ok(snapshot_info) = snapshot_info {
+        root_id_options.filterId = snapshot_info.filterId;
+    }
+
     let scm_status = client
         .getScmStatusV2(&GetScmStatusParams {
             mountPoint: bytes_from_path(checkout.path())?,
@@ -274,6 +297,7 @@ async fn ignored_usage_counts_for_mount(
                 .as_bytes()
                 .to_vec(),
             listIgnored: true,
+            rootIdOptions: Some(root_id_options),
             ..Default::default()
         })
         .await?
@@ -735,13 +759,6 @@ impl crate::Subcommand for DiskUsageCmd {
                 get_purgeable_size().with_context(|| "Failed to get purgeable space")?;
         }
 
-        // Make immutable
-        let backing_failed_file_checks = backing_failed_file_checks;
-        let mount_failed_file_checks = mount_failed_file_checks;
-        let redirection_failed_file_checks = redirect_usage_count.failed_file_checks;
-        let redirection_path_usage_count = redirect_usage_count.path_usage;
-        let buck_redirections = buck_redirections;
-
         // GET SUMMARY INFO for shared usage
         let mut shared_failed_file_checks = HashSet::new();
         let (logs_dir_usage, failed_logs_dir_file_checks) =
@@ -808,7 +825,7 @@ impl crate::Subcommand for DiskUsageCmd {
                     println!("{}", redir.display());
                 }
             }
-            write_failed_to_check_files_message(&redirection_failed_file_checks);
+            write_failed_to_check_files_message(&redirect_usage_count.failed_file_checks);
 
             if !buck_redirections.is_empty() {
                 if self.should_clean() {
@@ -922,9 +939,9 @@ impl crate::Subcommand for DiskUsageCmd {
             }
 
             // PRINT DETAILS
-            if !redirection_path_usage_count.is_empty() {
+            if !redirect_usage_count.path_usage.is_empty() {
                 write_title("Redirections Details");
-                for (usage_count, redirect) in redirection_path_usage_count {
+                for (usage_count, redirect) in redirect_usage_count.path_usage {
                     println!("{: >10}: {}", format_size(usage_count), redirect.display());
                 }
             }

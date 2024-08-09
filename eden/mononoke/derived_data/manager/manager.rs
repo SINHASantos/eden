@@ -11,11 +11,12 @@ use anyhow::Result;
 use bonsai_git_mapping::BonsaiGitMapping;
 use bonsai_hg_mapping::BonsaiHgMapping;
 use cacheblob::LeaseOps;
-use changesets::Changesets;
 use commit_graph::CommitGraph;
 use context::CoreContext;
 use derived_data_remote::DerivationClient;
+use ephemeral_blobstore::BubbleId;
 use filenodes::Filenodes;
+use filestore::FilestoreConfig;
 use metaconfig_types::DerivedDataTypesConfig;
 use mononoke_types::ChangesetId;
 use mononoke_types::RepositoryId;
@@ -44,7 +45,7 @@ pub struct DerivedDataManager {
 pub struct DerivedDataManagerInner {
     repo_id: RepositoryId,
     repo_name: String,
-    changesets: Arc<dyn Changesets>,
+    bubble_id: Option<BubbleId>,
     commit_graph: Arc<CommitGraph>,
     repo_blobstore: RepoBlobstore,
     lease: DerivedDataLease,
@@ -85,12 +86,12 @@ impl DerivedDataManager {
     pub fn new(
         repo_id: RepositoryId,
         repo_name: String,
-        changesets: Arc<dyn Changesets>,
         commit_graph: Arc<CommitGraph>,
         bonsai_hg_mapping: Arc<dyn BonsaiHgMapping>,
         bonsai_git_mapping: Arc<dyn BonsaiGitMapping>,
         filenodes: Arc<dyn Filenodes>,
         repo_blobstore: RepoBlobstore,
+        filestore_config: FilestoreConfig,
         lease: Arc<dyn LeaseOps>,
         scuba: MononokeScubaSampleBuilder,
         config_name: String,
@@ -102,7 +103,7 @@ impl DerivedDataManager {
             inner: Arc::new(DerivedDataManagerInner {
                 repo_id,
                 repo_name,
-                changesets,
+                bubble_id: None,
                 commit_graph,
                 repo_blobstore: repo_blobstore.clone(),
                 lease,
@@ -116,7 +117,20 @@ impl DerivedDataManager {
                     config_name,
                     config,
                     repo_blobstore.boxed(),
+                    filestore_config,
                 ),
+            }),
+        }
+    }
+
+    pub fn with_mutated_scuba(
+        &self,
+        mutator: impl FnOnce(MononokeScubaSampleBuilder) -> MononokeScubaSampleBuilder + Clone,
+    ) -> Self {
+        Self {
+            inner: Arc::new(DerivedDataManagerInner {
+                scuba: mutator(self.inner.scuba.clone()),
+                ..self.inner.as_ref().clone()
             }),
         }
     }
@@ -145,16 +159,6 @@ impl DerivedDataManager {
         }
     }
 
-    // For dangerous-override: allow replacement of changesets
-    pub fn with_replaced_changesets(&self, changesets: Arc<dyn Changesets>) -> Self {
-        Self {
-            inner: Arc::new(DerivedDataManagerInner {
-                changesets,
-                ..self.inner.as_ref().clone()
-            }),
-        }
-    }
-
     // For dangerous-override: allow replacement of commit graph
     pub fn with_replaced_commit_graph(&self, commit_graph: Arc<CommitGraph>) -> Self {
         Self {
@@ -176,6 +180,22 @@ impl DerivedDataManager {
                     .inner
                     .derivation_context
                     .with_replaced_bonsai_hg_mapping(bonsai_hg_mapping),
+                ..self.inner.as_ref().clone()
+            }),
+        }
+    }
+
+    // For dangerous-override: allow replacement of bonsai-git-mapping
+    pub fn with_replaced_bonsai_git_mapping(
+        &self,
+        bonsai_git_mapping: Arc<dyn BonsaiGitMapping>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(DerivedDataManagerInner {
+                derivation_context: self
+                    .inner
+                    .derivation_context
+                    .with_replaced_bonsai_git_mapping(bonsai_git_mapping),
                 ..self.inner.as_ref().clone()
             }),
         }
@@ -210,6 +230,18 @@ impl DerivedDataManager {
         }
     }
 
+    pub fn with_replaced_derivation_service_client(
+        &self,
+        derivation_service_client: Option<Arc<dyn DerivationClient>>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(DerivedDataManagerInner {
+                derivation_service_client,
+                ..self.inner.as_ref().clone()
+            }),
+        }
+    }
+
     pub fn repo_id(&self) -> RepositoryId {
         self.inner.repo_id
     }
@@ -218,12 +250,8 @@ impl DerivedDataManager {
         self.inner.repo_name.as_str()
     }
 
-    pub fn changesets(&self) -> &dyn Changesets {
-        self.inner.changesets.as_ref()
-    }
-
-    pub fn changesets_arc(&self) -> Arc<dyn Changesets> {
-        self.inner.changesets.clone()
+    pub fn bubble_id(&self) -> Option<BubbleId> {
+        self.inner.bubble_id
     }
 
     pub fn commit_graph(&self) -> &CommitGraph {

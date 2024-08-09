@@ -9,23 +9,14 @@
   $ . "${TEST_FIXTURES}/library.sh"
   $ . "${TEST_FIXTURES}/library-push-redirector.sh"
 
-Setup configuration
-  $ setup_configerator_configs
-  $ cat > "$PUSHREDIRECT_CONF/enable" <<EOF
-  > {
-  > "per_repo": {
-  >   "1": {
-  >      "draft_push": false,
-  >      "public_push": false
-  >    }
-  >   }
-  > }
-  > EOF
-
 -- Init Mononoke thingies
-  $ XREPOSYNC=1 init_large_small_repo
+  $ create_large_small_repo
   Adding synced mapping entry
+  $ setup_configerator_configs
+  $ enable_pushredirect 1 false false
+  $ XREPOSYNC=1 start_large_small_repo
   Starting Mononoke server
+  $ init_local_large_small_clones
 
 -- Start up the sync job in the background
   $ mononoke_x_repo_sync_forever $REPOIDSMALL $REPOIDLARGE
@@ -39,7 +30,7 @@ Before the change
   $ echo b > non_path_shifting/bar
   $ hg ci -Aqm "before config change"
   $ REPONAME=small-mon hgmn push -r . --to master_bookmark -q
-  $ log 
+  $ log
   @  before config change [public;rev=2;bc6a206054d0] default/master_bookmark
   │
   o  first post-move commit [public;rev=1;11f848659bfc]

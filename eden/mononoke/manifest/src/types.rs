@@ -44,6 +44,7 @@ use mononoke_types::FsnodeId;
 use mononoke_types::MPathElement;
 use mononoke_types::ManifestUnodeId;
 use mononoke_types::SkeletonManifestId;
+use mononoke_types::SortedVectorTrieMap;
 use mononoke_types::TrieMap;
 use serde_derive::Deserialize;
 use serde_derive::Serialize;
@@ -86,6 +87,29 @@ impl<Store, V: Send> TrieMapOps<Store, V> for TrieMap<V> {
 
     fn is_empty(&self) -> bool {
         self.is_empty()
+    }
+}
+
+#[async_trait]
+impl<Store, V: Clone + Send + Sync> TrieMapOps<Store, V> for SortedVectorTrieMap<V> {
+    async fn expand(
+        self,
+        _ctx: &CoreContext,
+        _blobstore: &Store,
+    ) -> Result<(Option<V>, Vec<(u8, Self)>)> {
+        SortedVectorTrieMap::expand(self)
+    }
+
+    async fn into_stream(
+        self,
+        _ctx: &CoreContext,
+        _blobstore: &Store,
+    ) -> Result<BoxStream<'async_trait, Result<(SmallVec<[u8; 24]>, V)>>> {
+        Ok(stream::iter(self).map(Ok).boxed())
+    }
+
+    fn is_empty(&self) -> bool {
+        SortedVectorTrieMap::is_empty(self)
     }
 }
 
@@ -237,7 +261,7 @@ pub trait Manifest: Sync + Sized + 'static {
 impl<M: Manifest + Send, Store: Send + Sync> AsyncManifest<Store> for M {
     type TreeId = <Self as Manifest>::TreeId;
     type LeafId = <Self as Manifest>::LeafId;
-    type TrieMapType = TrieMap<Entry<Self::TreeId, Self::LeafId>>;
+    type TrieMapType = SortedVectorTrieMap<Entry<Self::TreeId, Self::LeafId>>;
 
     async fn list(
         &self,
@@ -308,7 +332,10 @@ impl<M: Manifest + Send, Store: Send + Sync> AsyncManifest<Store> for M {
         _ctx: &CoreContext,
         _blobstore: &Store,
     ) -> Result<Self::TrieMapType> {
-        Ok(Manifest::list(&self).collect())
+        let entries = Manifest::list(&self)
+            .map(|(k, v)| (k.to_smallvec(), v))
+            .collect();
+        Ok(SortedVectorTrieMap::new(entries))
     }
 }
 

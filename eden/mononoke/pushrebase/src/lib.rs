@@ -67,8 +67,8 @@ use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateLogId;
 use bookmarks::BookmarkUpdateReason;
 use bookmarks::BookmarksRef;
-use changesets::ChangesetsRef;
 use commit_graph::CommitGraphRef;
+use commit_graph::CommitGraphWriterRef;
 use context::CoreContext;
 use filenodes_derivation::FilenodesOnlyPublic;
 use futures::future;
@@ -95,7 +95,7 @@ use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
 use mononoke_types::DateTime;
 use mononoke_types::FileChange;
-use mononoke_types::Generation;
+use mononoke_types::GitLfs;
 use mononoke_types::Timestamp;
 use pushrebase_hook::PushrebaseCommitHook;
 use pushrebase_hook::PushrebaseHook;
@@ -238,11 +238,11 @@ pub struct PushrebaseOutcome {
 
 pub trait Repo = BonsaiHgMappingRef
     + BookmarksRef
-    + ChangesetsRef
     + RepoBlobstoreArc
     + RepoDerivedDataRef
     + RepoIdentityRef
     + CommitGraphRef
+    + CommitGraphWriterRef
     + Send
     + Sync;
 
@@ -577,11 +577,13 @@ async fn find_closest_root(
         let repo = &repo;
 
         async move {
-            let entry = repo.changesets().get(ctx, *root).await?.ok_or_else(|| {
-                PushrebaseError::from(PushrebaseInternalError::RootNotFound(*root))
-            })?;
+            let root_gen = repo
+                .commit_graph()
+                .changeset_generation(ctx, *root)
+                .await
+                .map_err(|_| PushrebaseError::from(PushrebaseInternalError::RootNotFound(*root)))?;
 
-            Result::<_, PushrebaseError>::Ok((*root, Generation::new(entry.gen)))
+            Result::<_, PushrebaseError>::Ok((*root, root_gen))
         }
     });
 
@@ -611,7 +613,7 @@ async fn find_closest_ancestor_root(
 
     loop {
         if depth > 0 && depth % 1000 == 0 {
-            info!(ctx.logger(), "pushrebase recursion depth: {}", depth);
+            info!(ctx.logger(), "pushrebase depth: {}", depth);
         }
 
         if let Some(recursion_limit) = config.recursion_limit {
@@ -643,12 +645,7 @@ async fn find_closest_ancestor_root(
             return Ok(id);
         }
 
-        let parents = repo
-            .changesets()
-            .get(ctx, id)
-            .await?
-            .ok_or_else(|| format_err!("Commit {} does not exist in the repo", id))?
-            .parents;
+        let parents = repo.commit_graph().changeset_parents(ctx, id).await?;
 
         queue.extend(parents.into_iter().filter(|p| queued.insert(*p)));
     }
@@ -985,6 +982,7 @@ async fn rebase_changeset(
                             remapping.get(cs).map(|(cs, _)| cs).cloned().unwrap_or(*cs),
                         )
                     }),
+                    GitLfs::FullContent,
                 );
             }
             FileChange::Deletion
@@ -1233,7 +1231,7 @@ async fn try_move_bookmark(
     };
 
     let maybe_log_id = txn
-        .commit_with_hook(Arc::new(sql_txn_hook))
+        .commit_with_hooks(vec![Arc::new(sql_txn_hook)])
         .await?
         .map(BookmarkUpdateLogId::from);
 
@@ -1259,9 +1257,9 @@ mod tests {
     use bonsai_hg_mapping::BonsaiHgMapping;
     use bookmarks::BookmarkTransactionError;
     use bookmarks::Bookmarks;
-    use changesets::Changesets;
     use cloned::cloned;
     use commit_graph::CommitGraph;
+    use commit_graph::CommitGraphWriter;
     use fbinit::FacebookInit;
     use filestore::FilestoreConfig;
     use filestore::FilestoreConfigRef;
@@ -1280,6 +1278,7 @@ mod tests {
     use maplit::hashset;
     use mononoke_types::BonsaiChangesetMut;
     use mononoke_types::FileType;
+    use mononoke_types::GitLfs;
     use mononoke_types::PrefixTrie;
     use mononoke_types::RepositoryId;
     use mutable_counters::MutableCounters;
@@ -1303,9 +1302,6 @@ mod tests {
     #[derive(Clone)]
     struct PushrebaseTestRepo {
         #[facet]
-        changesets: dyn Changesets,
-
-        #[facet]
         bonsai_hg_mapping: dyn BonsaiHgMapping,
 
         #[facet]
@@ -1328,6 +1324,9 @@ mod tests {
 
         #[facet]
         commit_graph: CommitGraph,
+
+        #[facet]
+        commit_graph_writer: dyn CommitGraphWriter,
     }
 
     async fn fetch_bonsai_changesets(
@@ -2339,6 +2338,7 @@ mod tests {
                 FileType::Executable,
                 file_1.size(),
                 /* copy_from */ None,
+                GitLfs::FullContent,
             );
 
             let bcs = CreateCommitContext::new(&ctx, &repo, vec![root])

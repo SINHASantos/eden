@@ -12,18 +12,14 @@ use blobrepo_hg::BlobRepoHg;
 use blobstore::Loadable;
 use bookmarks::BookmarkKey;
 use bookmarks::BookmarksRef;
-use changeset_fetcher::ChangesetFetcherArc;
 use cloned::cloned;
 use commit_graph::CommitGraphRef;
 use context::CoreContext;
 use context::PerfCounterType;
-use derived_data::BonsaiDerived;
 use filenodes::FilenodeResult;
 use filenodes_derivation::FilenodesOnlyPublic;
-use futures::compat::Stream01CompatExt;
 use futures::future;
 use futures::future::TryFutureExt;
-use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
 use futures_stats::TimedFutureExt;
 use manifest::Entry;
@@ -36,8 +32,8 @@ use metaconfig_types::CacheWarmupParams;
 use microwave::SnapshotLocation;
 use mononoke_types::ChangesetId;
 use repo_blobstore::RepoBlobstoreRef;
+use repo_derived_data::RepoDerivedDataRef;
 use repo_identity::RepoIdentityRef;
-use revset::AncestorsNodeStream;
 use slog::debug;
 use slog::info;
 use slog::warn;
@@ -107,7 +103,8 @@ async fn blobstore_and_filenodes_warmup(
         hg_cs_id
             .load(ctx, repo.repo_blobstore())
             .map_err(Error::from),
-        FilenodesOnlyPublic::derive(ctx, repo, bcs_id)
+        repo.repo_derived_data()
+            .derive::<FilenodesOnlyPublic>(ctx, bcs_id)
             .map_err(Error::from)
             .map_ok(|_| ()),
     )
@@ -172,35 +169,6 @@ async fn blobstore_and_filenodes_warmup(
     Ok(())
 }
 
-// Iterate over first parents, and fetch them
-async fn changesets_warmup(
-    ctx: &CoreContext,
-    repo: &BlobRepo,
-    bcs_id: ChangesetId,
-    cs_limit: usize,
-) -> Result<(), Error> {
-    info!(ctx.logger(), "about to start warming up changesets cache");
-
-    AncestorsNodeStream::new(ctx.clone(), &repo.changeset_fetcher_arc(), bcs_id)
-        .compat()
-        .take(cs_limit)
-        .try_for_each({
-            let mut i = 0;
-            move |_: ChangesetId| {
-                i += 1;
-                if i % 10000 == 0 {
-                    debug!(ctx.logger(), "changesets warmup: fetched {}th entry", i);
-                }
-                future::ready(Ok(()))
-            }
-        })
-        .await?;
-
-    debug!(ctx.logger(), "finished changesets warmup");
-
-    Ok(())
-}
-
 async fn commit_graph_segments_warmup(
     ctx: &CoreContext,
     repo: &BlobRepo,
@@ -224,7 +192,6 @@ async fn do_cache_warmup(
     ctx: &CoreContext,
     repo: &BlobRepo,
     target: CacheWarmupTarget,
-    commit_limit: usize,
     cache_warmup_kind: CacheWarmupKind,
 ) -> Result<(), Error> {
     let ctx = ctx.clone_and_reset();
@@ -260,15 +227,6 @@ async fn do_cache_warmup(
         }
     });
 
-    let cs_warmup = task::spawn({
-        cloned!(ctx, repo);
-        async move {
-            changesets_warmup(&ctx, &repo, bcs_id, commit_limit)
-                .await
-                .context("While warming up changesets")
-        }
-    });
-
     let commit_graph_segments_warmup = task::spawn({
         cloned!(ctx, repo);
         async move {
@@ -278,12 +236,11 @@ async fn do_cache_warmup(
         }
     });
 
-    let (stats, res) = future::try_join3(blobstore_warmup, cs_warmup, commit_graph_segments_warmup)
+    let (stats, res) = future::try_join(blobstore_warmup, commit_graph_segments_warmup)
         .timed()
         .await;
-    let (blobstore_warmup, cs_warmup, commit_graph_segments_warmup) = res?;
+    let (blobstore_warmup, commit_graph_segments_warmup) = res?;
     blobstore_warmup?;
-    cs_warmup?;
     commit_graph_segments_warmup?;
 
     info!(ctx.logger(), "finished initial warmup");
@@ -321,7 +278,7 @@ pub async fn cache_warmup<T: Into<CacheWarmupRequest>>(
 
         microwave_preload(ctx, repo, &req).await;
 
-        do_cache_warmup(ctx, repo, req.target, req.commit_limit, cache_warmup_kind)
+        do_cache_warmup(ctx, repo, req.target, cache_warmup_kind)
             .await
             .with_context(|| format!("while warming up repo {}", repo.repo_identity().id()))?;
     }

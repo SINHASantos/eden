@@ -14,13 +14,16 @@ use std::sync::Arc;
 use anyhow::Error;
 use blame::BlameError;
 use blobstore::LoadableError;
+use bookmarks::BookmarkKey;
 use bookmarks_movement::describe_hook_rejections;
 use bookmarks_movement::BookmarkMovementError;
 use bookmarks_movement::HookRejection;
 use derived_data::DerivationError;
+use derived_data::SharedDerivationError;
 use itertools::Itertools;
 use megarepo_error::MegarepoError;
 use mononoke_types::path::MPath;
+use mononoke_types::ChangesetId;
 use pushrebase::PushrebaseError;
 use repo_authorization::AuthorizationError;
 use thiserror::Error;
@@ -75,6 +78,12 @@ pub enum MononokeError {
     MergeConflicts { conflict_paths: Vec<MPath> },
     #[error("Conflicts while pushrebasing: {0:?}")]
     PushrebaseConflicts(Vec<pushrebase::PushrebaseConflict>),
+    #[error("Non fast-forward bookmark move of '{bookmark}' from {from} to {to}")]
+    NonFastForwardMove {
+        bookmark: BookmarkKey,
+        from: ChangesetId,
+        to: ChangesetId,
+    },
     #[error(
         "permission denied: access to repo {reponame} on behalf of {service_identity} not permitted for {identities}"
     )]
@@ -120,6 +129,15 @@ impl From<DerivationError> for MononokeError {
     }
 }
 
+impl From<SharedDerivationError> for MononokeError {
+    fn from(e: SharedDerivationError) -> Self {
+        match e.inner() {
+            inner @ DerivationError::Disabled(..) => MononokeError::NotAvailable(inner.to_string()),
+            _ => MononokeError::from(anyhow::Error::from(e)),
+        }
+    }
+}
+
 impl From<BookmarkMovementError> for MononokeError {
     fn from(e: BookmarkMovementError) -> Self {
         match e {
@@ -131,6 +149,9 @@ impl From<BookmarkMovementError> for MononokeError {
             }
             BookmarkMovementError::PushrebaseError(PushrebaseError::Conflicts(conflicts)) => {
                 MononokeError::PushrebaseConflicts(conflicts)
+            }
+            BookmarkMovementError::NonFastForwardMove { bookmark, from, to } => {
+                MononokeError::NonFastForwardMove { bookmark, from, to }
             }
             BookmarkMovementError::Error(e) => MononokeError::InternalError(InternalError::from(e)),
             _ => MononokeError::InvalidRequest(e.to_string()),
@@ -171,15 +192,7 @@ impl From<MononokeError> for edenapi_types::ServerError {
 impl From<&MononokeError> for edenapi_types::ServerError {
     fn from(e: &MononokeError) -> Self {
         let message = format!("{:?}", e);
-        let code = match e {
-            MononokeError::InternalError(e)
-                if e.0.is::<segmented_changelog::MismatchedHeadsError>() =>
-            {
-                1
-            }
-            _ => 0,
-        };
-        Self::new(message, code)
+        Self::new(message, 1)
     }
 }
 

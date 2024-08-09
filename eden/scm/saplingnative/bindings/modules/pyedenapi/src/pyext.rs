@@ -21,7 +21,7 @@ use cpython_ext::PyCell;
 use cpython_ext::PyPathBuf;
 use cpython_ext::ResultPyErrExt;
 use dag_types::Location;
-use dag_types::VertexName;
+use dag_types::Vertex;
 use edenapi::Response;
 use edenapi::SaplingRemoteApi;
 use edenapi::SaplingRemoteApiError;
@@ -59,6 +59,7 @@ use edenapi_types::UpdateReferencesParams;
 use edenapi_types::UploadHgChangeset;
 use edenapi_types::UploadToken;
 use edenapi_types::WorkspaceDataResponse;
+use edenapi_types::WorkspacesDataResponse;
 use futures::prelude::*;
 use hgstore::split_hg_file_metadata;
 use progress_model::ProgressBar;
@@ -344,7 +345,7 @@ pub trait SaplingRemoteApiPyExt: SaplingRemoteApi {
             .allow_threads(|| {
                 block_unless_interrupted(async move {
                     self.clone_data().await.map(|data| {
-                        data.convert_vertex(|hgid| VertexName(hgid.as_ref().to_vec().into()))
+                        data.convert_vertex(|hgid| Vertex(hgid.as_ref().to_vec().into()))
                     })
                 })
             })
@@ -365,9 +366,8 @@ pub trait SaplingRemoteApiPyExt: SaplingRemoteApi {
                 block_unless_interrupted(async move {
                     match self.pull_fast_forward_master(old_master, new_master).await {
                         Err(e) => Err(e),
-                        Ok(data) => Ok(data.convert_vertex(|hgid| {
-                            VertexName(hgid.into_byte_array().to_vec().into())
-                        })),
+                        Ok(data) => Ok(data
+                            .convert_vertex(|hgid| Vertex(hgid.into_byte_array().to_vec().into()))),
                     }
                 })
             })
@@ -383,9 +383,8 @@ pub trait SaplingRemoteApiPyExt: SaplingRemoteApi {
                 block_unless_interrupted(async move {
                     match self.pull_lazy(common, missing).await {
                         Err(e) => Err(e),
-                        Ok(data) => Ok(data.convert_vertex(|hgid| {
-                            VertexName(hgid.into_byte_array().to_vec().into())
-                        })),
+                        Ok(data) => Ok(data
+                            .convert_vertex(|hgid| Vertex(hgid.into_byte_array().to_vec().into()))),
                     }
                 })
             })
@@ -538,8 +537,7 @@ pub trait SaplingRemoteApiPyExt: SaplingRemoteApi {
                 match content {
                     StoreResult::Found(raw_content) => {
                         let raw_content = raw_content.into();
-                        let (raw_data, copy_from) =
-                            split_hg_file_metadata(&raw_content).map_pyerr(py)?;
+                        let (raw_data, copy_from) = split_hg_file_metadata(&raw_content);
                         let content_id = file_content_id(&raw_data);
                         Ok((
                             (content_id, raw_data),
@@ -722,6 +720,19 @@ pub trait SaplingRemoteApiPyExt: SaplingRemoteApi {
     ) -> PyResult<Serde<WorkspaceDataResponse>> {
         let responses = py
             .allow_threads(|| block_unless_interrupted(self.cloud_workspace(workspace, reponame)))
+            .map_pyerr(py)?
+            .map_pyerr(py)?;
+        Ok(Serde(responses))
+    }
+
+    fn cloud_workspaces_py(
+        &self,
+        prefix: String,
+        reponame: String,
+        py: Python,
+    ) -> PyResult<Serde<WorkspacesDataResponse>> {
+        let responses = py
+            .allow_threads(|| block_unless_interrupted(self.cloud_workspaces(prefix, reponame)))
             .map_pyerr(py)?
             .map_pyerr(py)?;
         Ok(Serde(responses))

@@ -9,19 +9,19 @@ import type {Heartbeat} from './heartbeat';
 
 import {Copyable} from './Copyable';
 import {DropdownFields} from './DropdownFields';
-import {ErrorBoundary, ErrorNotice} from './ErrorNotice';
 import {Internal} from './Internal';
-import {Tooltip} from './Tooltip';
-import {Button} from './components/Button';
-import {Divider} from './components/Divider';
 import {DEFAULT_HEARTBEAT_TIMEOUT_MS, useHeartbeat} from './heartbeat';
 import {t, T} from './i18n';
 import platform from './platform';
 import {applicationinfo} from './serverAPIState';
 import * as stylex from '@stylexjs/stylex';
+import {Button} from 'isl-components/Button';
+import {Divider} from 'isl-components/Divider';
+import {ErrorBoundary, ErrorNotice} from 'isl-components/ErrorNotice';
+import {Icon} from 'isl-components/Icon';
+import {Tooltip} from 'isl-components/Tooltip';
 import {useAtomValue} from 'jotai';
 import {Suspense} from 'react';
-import {Icon} from 'shared/Icon';
 
 import './BugButton.css';
 

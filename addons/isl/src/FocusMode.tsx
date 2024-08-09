@@ -5,18 +5,18 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+import {colors} from '../../components/theme/tokens.stylex';
 import {Column} from './ComponentUtils';
 import {useCommand} from './ISLShortcuts';
-import {Kbd} from './Kbd';
-import {Tooltip} from './Tooltip';
 import {tracker} from './analytics';
 import {focusMode} from './atoms/FocusModeState';
-import {Button} from './components/Button';
 import {T} from './i18n';
-import {colors} from './tokens.stylex';
 import * as stylex from '@stylexjs/stylex';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
+import {Kbd} from 'isl-components/Kbd';
+import {Tooltip} from 'isl-components/Tooltip';
 import {useAtom} from 'jotai';
-import {Icon} from 'shared/Icon';
 import {KeyCode, Modifier} from 'shared/KeyboardShortcuts';
 
 const styles = stylex.create({

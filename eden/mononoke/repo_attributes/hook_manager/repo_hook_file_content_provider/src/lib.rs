@@ -14,6 +14,8 @@ use anyhow::format_err;
 use anyhow::Context as _;
 use async_trait::async_trait;
 use blobstore::Loadable;
+use bonsai_tag_mapping::ArcBonsaiTagMapping;
+use bonsai_tag_mapping::BonsaiTagMappingArc;
 use bookmarks::ArcBookmarks;
 use bookmarks::BookmarkKey;
 use bookmarks::BookmarksArc;
@@ -23,9 +25,11 @@ use context::CoreContext;
 use futures::future;
 use futures::stream::TryStreamExt;
 use futures_util::future::TryFutureExt;
+use hook_manager::provider::BookmarkState;
+use hook_manager::provider::TagType;
 use hook_manager::FileChange;
-use hook_manager::HookFileContentProvider;
-use hook_manager::HookFileContentProviderError;
+use hook_manager::HookStateProvider;
+use hook_manager::HookStateProviderError;
 use hook_manager::PathContent;
 use manifest::Diff;
 use manifest::Entry;
@@ -36,6 +40,7 @@ use mercurial_types::HgFileNodeId;
 use mercurial_types::HgManifestId;
 use mononoke_types::ChangesetId;
 use mononoke_types::ContentId;
+use mononoke_types::ContentMetadataV2;
 use mononoke_types::MPath;
 use mononoke_types::ManifestUnodeId;
 use mononoke_types::NonRootMPath;
@@ -48,24 +53,24 @@ use repo_derived_data::RepoDerivedDataArc;
 use skeleton_manifest::RootSkeletonManifestId;
 use unodes::RootUnodeManifestId;
 
-pub struct RepoHookFileContentProvider {
+pub struct RepoHookStateProvider {
     repo_blobstore: ArcRepoBlobstore,
     bookmarks: ArcBookmarks,
     repo_derived_data: ArcRepoDerivedData,
+    bonsai_tag_mapping: ArcBonsaiTagMapping,
 }
 
 #[async_trait]
-impl HookFileContentProvider for RepoHookFileContentProvider {
-    async fn get_file_size<'a>(
+impl HookStateProvider for RepoHookStateProvider {
+    async fn get_file_metadata<'a>(
         &'a self,
         ctx: &'a CoreContext,
         id: ContentId,
-    ) -> Result<u64, HookFileContentProviderError> {
+    ) -> Result<ContentMetadataV2, HookStateProviderError> {
         Ok(
             filestore::get_metadata(&self.repo_blobstore, ctx, &id.into())
                 .await?
-                .ok_or(HookFileContentProviderError::ContentIdNotFound(id))?
-                .total_size,
+                .ok_or(HookStateProviderError::ContentIdNotFound(id))?,
         )
     }
 
@@ -73,10 +78,10 @@ impl HookFileContentProvider for RepoHookFileContentProvider {
         &'a self,
         ctx: &'a CoreContext,
         id: ContentId,
-    ) -> Result<Option<Bytes>, HookFileContentProviderError> {
+    ) -> Result<Option<Bytes>, HookStateProviderError> {
         filestore::fetch_concat_opt(&self.repo_blobstore, ctx, &id.into())
             .await?
-            .ok_or(HookFileContentProviderError::ContentIdNotFound(id))
+            .ok_or(HookStateProviderError::ContentIdNotFound(id))
             .map(Option::Some)
     }
 
@@ -85,7 +90,7 @@ impl HookFileContentProvider for RepoHookFileContentProvider {
         ctx: &'a CoreContext,
         bookmark: BookmarkKey,
         paths: Vec<NonRootMPath>,
-    ) -> Result<HashMap<NonRootMPath, PathContent>, HookFileContentProviderError> {
+    ) -> Result<HashMap<NonRootMPath, PathContent>, HookStateProviderError> {
         let changeset_id = self
             .bookmarks
             .get(ctx.clone(), &bookmark)
@@ -113,7 +118,7 @@ impl HookFileContentProvider for RepoHookFileContentProvider {
             .try_buffer_unordered(100)
             .try_filter_map(future::ok)
             .try_collect::<HashMap<_, _>>()
-            .map_err(HookFileContentProviderError::from)
+            .map_err(HookStateProviderError::from)
             .await
     }
 
@@ -122,7 +127,7 @@ impl HookFileContentProvider for RepoHookFileContentProvider {
         ctx: &'a CoreContext,
         new_cs_id: ChangesetId,
         old_cs_id: ChangesetId,
-    ) -> Result<Vec<(NonRootMPath, FileChange)>, HookFileContentProviderError> {
+    ) -> Result<Vec<(NonRootMPath, FileChange)>, HookStateProviderError> {
         let new_mf_fut = derive_hg_manifest(
             ctx,
             &self.repo_derived_data,
@@ -139,7 +144,7 @@ impl HookFileContentProvider for RepoHookFileContentProvider {
 
         old_mf
             .diff(ctx.clone(), self.repo_blobstore.clone(), new_mf)
-            .map_err(HookFileContentProviderError::from)
+            .map_err(HookStateProviderError::from)
             .map_ok(move |diff| async move {
                 match diff {
                     Diff::Added(path, entry) => match Option::<NonRootMPath>::from(path) {
@@ -198,7 +203,7 @@ impl HookFileContentProvider for RepoHookFileContentProvider {
         ctx: &'a CoreContext,
         bookmark: BookmarkKey,
         paths: Vec<NonRootMPath>,
-    ) -> Result<HashMap<NonRootMPath, ChangesetInfo>, HookFileContentProviderError> {
+    ) -> Result<HashMap<NonRootMPath, ChangesetInfo>, HookStateProviderError> {
         let changeset_id = self
             .bookmarks
             .get(ctx.clone(), &bookmark)
@@ -236,7 +241,7 @@ impl HookFileContentProvider for RepoHookFileContentProvider {
             .try_buffer_unordered(100)
             .try_filter_map(future::ok)
             .try_collect::<HashMap<_, _>>()
-            .map_err(HookFileContentProviderError::from)
+            .map_err(HookStateProviderError::from)
             .await
     }
 
@@ -245,7 +250,7 @@ impl HookFileContentProvider for RepoHookFileContentProvider {
         ctx: &'a CoreContext,
         changeset_id: ChangesetId,
         paths: Vec<MPath>,
-    ) -> Result<HashMap<MPath, u64>, HookFileContentProviderError> {
+    ) -> Result<HashMap<MPath, u64>, HookStateProviderError> {
         let sk_mf = self
             .repo_derived_data
             .derive::<RootSkeletonManifestId>(ctx, changeset_id)
@@ -270,22 +275,59 @@ impl HookFileContentProvider for RepoHookFileContentProvider {
             })
             .try_collect()
             .await
-            .map_err(HookFileContentProviderError::from)
+            .map_err(HookStateProviderError::from)
+    }
+
+    async fn get_bookmark_state<'a, 'b>(
+        &'a self,
+        ctx: &'a CoreContext,
+        bookmark: &'b BookmarkKey,
+    ) -> Result<BookmarkState, HookStateProviderError> {
+        let maybe_bookmark_val = self
+            .bookmarks
+            .get(ctx.clone(), bookmark)
+            .await
+            .with_context(|| format!("Error fetching bookmark: {}", bookmark))?;
+        if let Some(cs_id) = maybe_bookmark_val {
+            Ok(BookmarkState::Existing(cs_id))
+        } else {
+            Ok(BookmarkState::New)
+        }
+    }
+
+    async fn get_tag_type<'a, 'b>(
+        &'a self,
+        _ctx: &'a CoreContext,
+        bookmark: &'b BookmarkKey,
+    ) -> Result<TagType, HookStateProviderError> {
+        if !bookmark.is_tag() {
+            return Ok(TagType::NotATag);
+        }
+        match self
+            .bonsai_tag_mapping
+            .get_entry_by_tag_name(bookmark.to_string())
+            .await?
+        {
+            Some(entry) => Ok(TagType::AnnotatedTag(entry.tag_hash)),
+            None => Ok(TagType::LightweightTag),
+        }
     }
 }
 
-impl RepoHookFileContentProvider {
+impl RepoHookStateProvider {
     pub fn new(
-        container: &(impl RepoBlobstoreArc + BookmarksArc + RepoDerivedDataArc),
-    ) -> RepoHookFileContentProvider {
+        container: &(impl RepoBlobstoreArc + BookmarksArc + RepoDerivedDataArc + BonsaiTagMappingArc),
+    ) -> RepoHookStateProvider {
         let repo_blobstore = container.repo_blobstore_arc();
         let bookmarks = container.bookmarks_arc();
         let repo_derived_data = container.repo_derived_data_arc();
+        let bonsai_tag_mapping = container.bonsai_tag_mapping_arc();
 
-        RepoHookFileContentProvider {
+        RepoHookStateProvider {
             repo_blobstore,
             bookmarks,
             repo_derived_data,
+            bonsai_tag_mapping,
         }
     }
 
@@ -293,11 +335,13 @@ impl RepoHookFileContentProvider {
         bookmarks: ArcBookmarks,
         repo_blobstore: ArcRepoBlobstore,
         repo_derived_data: ArcRepoDerivedData,
+        bonsai_tag_mapping: ArcBonsaiTagMapping,
     ) -> Self {
-        RepoHookFileContentProvider {
+        RepoHookStateProvider {
             repo_blobstore,
             bookmarks,
             repo_derived_data,
+            bonsai_tag_mapping,
         }
     }
 }
@@ -307,7 +351,7 @@ async fn derive_hg_manifest(
     repo_derived_data: &RepoDerivedData,
     blobstore: &RepoBlobstore,
     changeset_id: ChangesetId,
-) -> Result<HgManifestId, HookFileContentProviderError> {
+) -> Result<HgManifestId, HookStateProviderError> {
     let hg_changeset_id = repo_derived_data
         .derive::<MappedHgChangesetId>(ctx, changeset_id)
         .await
@@ -326,7 +370,7 @@ async fn derive_unode_manifest(
     ctx: &CoreContext,
     repo_derived_data: &RepoDerivedData,
     changeset_id: ChangesetId,
-) -> Result<ManifestUnodeId, HookFileContentProviderError> {
+) -> Result<ManifestUnodeId, HookStateProviderError> {
     let unode_mf = repo_derived_data
         .derive::<RootUnodeManifestId>(ctx, changeset_id.clone())
         .await
@@ -340,7 +384,7 @@ async fn resolve_content_id(
     ctx: &CoreContext,
     blobstore: &RepoBlobstore,
     entry: Entry<HgManifestId, (FileType, HgFileNodeId)>,
-) -> Result<PathContent, HookFileContentProviderError> {
+) -> Result<PathContent, HookStateProviderError> {
     match entry {
         Entry::Tree(_tree) => {
             // there is no content for trees
@@ -351,6 +395,6 @@ async fn resolve_content_id(
             .map_ok(|file_env| PathContent::File(file_env.content_id()))
             .await
             .with_context(|| format!("Error loading filenode: {}", file_node_id))
-            .map_err(HookFileContentProviderError::from),
+            .map_err(HookStateProviderError::from),
     }
 }

@@ -6,11 +6,9 @@
 
   $ . "${TEST_FIXTURES}/library.sh"
   $ REPOTYPE="blob_files"
-  $ ENABLED_DERIVED_DATA='["git_commits", "git_trees", "git_delta_manifests", "unodes", "filenodes", "hgchangesets"]' setup_common_config $REPOTYPE
+  $ setup_common_config $REPOTYPE
   $ GIT_REPO_ORIGIN="${TESTTMP}/origin/repo-git"
   $ GIT_REPO="${TESTTMP}/repo-git"
-  $ HG_REPO="${TESTTMP}/repo-hg"
-  $ BUNDLE_PATH="${TESTTMP}/repo_bundle.bundle"
   $ cat >> repos/repo/server.toml <<EOF
   > [source_control_service]
   > permit_writes = true
@@ -46,6 +44,6 @@
 # Attempt to Clone the Git repo from Mononoke as "localhost" who does NOT have read access. This should fail with 403 unauthorized error
   $ git_client_as localhost clone $MONONOKE_GIT_SERVICE_BASE_URL/$REPONAME.git
   Cloning into 'repo'...
-  error: RPC failed; HTTP 403 curl 22 The requested URL returned error: 403
-  fatal: expected flush after ref listing
+  remote: Operation not permitted
+  fatal: unable to access 'https://*/repos/git/ro/repo.git/': The requested URL returned error: 403 (glob)
   [128]

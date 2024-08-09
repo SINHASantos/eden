@@ -55,6 +55,7 @@ fn actionmap_from_eden_conflicts(
     let mut modified = Vec::new();
     let mut removed = Vec::new();
     let mut added = Vec::new();
+    let mut missing = Vec::new();
     let mut unknown = Vec::new();
     let treestate_binding = wc.treestate();
     let mut treestate = treestate_binding.lock();
@@ -122,7 +123,12 @@ fn actionmap_from_eden_conflicts(
                 ))?;
                 changed_metadata_to_action(old_meta, new_meta)
             }
-            ConflictType::MissingRemoved | ConflictType::DirectoryNotEmpty => None,
+            ConflictType::MissingRemoved => {
+                let conflict_path = conflict.path.as_repo_path();
+                missing.push(conflict_path.to_owned());
+                Some(Action::Remove)
+            }
+            ConflictType::DirectoryNotEmpty => None,
         };
         if let Some(action) = action {
             map.insert(conflict.path, action);
@@ -136,6 +142,7 @@ fn actionmap_from_eden_conflicts(
     status_builder = status_builder.removed(removed);
     status_builder = status_builder.added(added);
     status_builder = status_builder.unknown(unknown);
+    status_builder = status_builder.deleted(missing);
 
     Ok((ActionMap { map }, status_builder.build()))
 }
@@ -146,6 +153,7 @@ pub fn edenfs_checkout(
     wc: &LockedWorkingCopy,
     target_commit: HgId,
     revert_conflicts: bool,
+    flush_dirstate: bool,
 ) -> anyhow::Result<()> {
     // TODO (sggutier): try to unify these steps with the non-edenfs version of checkout
     let target_commit_tree_hash = repo.tree_resolver()?.get_root_id(&target_commit)?;
@@ -163,12 +171,20 @@ pub fn edenfs_checkout(
     }
 
     wc.set_parents(vec![target_commit], Some(target_commit_tree_hash))?;
-    wc.treestate().lock().flush()?;
+    if flush_dirstate {
+        wc.treestate().lock().flush()?;
+    }
+
     // Clear the update state
     let updatestate_path = wc.dot_hg_path().join("updatestate");
     util::file::unlink_if_exists(updatestate_path)?;
-    // Run EdenFS specific "hooks"
-    edenfs_redirect_fixup(&ctx.logger, repo.config(), wc)?;
+
+    #[cfg(feature = "eden")]
+    if repo.requirements.contains("eden") {
+        // Run EdenFS specific "hooks"
+        edenfs_redirect_fixup(&ctx.logger, repo.config(), wc)?;
+    }
+
     Ok(())
 }
 
@@ -287,6 +303,7 @@ fn clear_edenfs_dirstate(wc: &LockedWorkingCopy) -> anyhow::Result<()> {
 ///
 /// Otherwise, run in foreground. This is needed for automation that relies
 /// on `checkout HASH` to setup critical repo redirections.
+#[cfg(feature = "eden")]
 pub fn edenfs_redirect_fixup(
     lgr: &TermLogger,
     config: &dyn Config,
@@ -313,6 +330,7 @@ pub fn edenfs_redirect_fixup(
 }
 
 /// Whether the edenfs redirect directories look okay, or None if redirect is unnecessary.
+#[cfg(feature = "eden")]
 fn is_edenfs_redirect_okay(wc: &WorkingCopy) -> anyhow::Result<Option<bool>> {
     let vfs = wc.vfs();
     let mut redirections = HashMap::new();
@@ -380,6 +398,7 @@ fn is_edenfs_redirect_okay(wc: &WorkingCopy) -> anyhow::Result<Option<bool>> {
 }
 
 /// abort if there is a ConflictType.ERROR type of conflicts
+#[cfg(feature = "eden")]
 pub fn abort_on_eden_conflict_error(
     config: &dyn Config,
     conflicts: Vec<CheckoutConflict>,
@@ -399,5 +418,15 @@ pub fn abort_on_eden_conflict_error(
             });
         }
     }
+    Ok(())
+}
+
+// Dot-git doesn't currently return any conflicts so just leave empty for now.
+#[cfg(not(feature = "eden"))]
+pub fn abort_on_eden_conflict_error(
+    config: &dyn Config,
+    conflicts: Vec<CheckoutConflict>,
+) -> Result<(), EdenConflictError> {
+    let (_, _) = (config, conflicts);
     Ok(())
 }

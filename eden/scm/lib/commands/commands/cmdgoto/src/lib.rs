@@ -73,10 +73,12 @@ pub fn run(ctx: ReqCtx<GotoOpts>, repo: &mut Repo, wc: &mut WorkingCopy) -> Resu
 
     if repo.config().get("commands", "update.check").as_deref() == Some("none") {
         // This is equivalent to --merge, which we don't support.
+        tracing::debug!(target: "checkout_info", checkout_detail="update.check");
         fallback!("commands.update.check=none");
     }
 
     if wc.parents()?.len() > 1 {
+        tracing::debug!(target: "checkout_info", checkout_detail="merge");
         fallback!("multiple working copy parents");
     }
 
@@ -124,13 +126,15 @@ pub fn run(ctx: ReqCtx<GotoOpts>, repo: &mut Repo, wc: &mut WorkingCopy) -> Resu
 
     let updatestate_path = wc.dot_hg_path().join("updatestate");
 
-    if ctx.opts.r#continue {
-        match mergestate {
-            GotoMergeState::Resolved => {
+    match mergestate {
+        GotoMergeState::Resolved => {
+            if ctx.opts.r#continue {
                 // User ran "sl goto --continue" after resolving all "--merge" conflicts.
                 return Ok(0);
             }
-            GotoMergeState::Unresolved => {
+        }
+        GotoMergeState::Unresolved => {
+            if !ctx.opts.clean {
                 // Still have unresolved files.
                 abort!(
                     "{}\n{}",
@@ -138,7 +142,9 @@ pub fn run(ctx: ReqCtx<GotoOpts>, repo: &mut Repo, wc: &mut WorkingCopy) -> Resu
                     "(use '@prog@ resolve --list' to list, '@prog@ resolve --mark FILE' to mark resolved)"
                 );
             }
-            GotoMergeState::NotMerging => {
+        }
+        GotoMergeState::NotMerging => {
+            if ctx.opts.r#continue {
                 let interrupted_dest = match fs::read_to_string(&updatestate_path) {
                     Ok(data) => data,
                     Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -212,6 +218,7 @@ pub fn run(ctx: ReqCtx<GotoOpts>, repo: &mut Repo, wc: &mut WorkingCopy) -> Resu
         },
         checkout_mode,
         ReportMode::Always,
+        true,
     )?;
 
     Ok(0)

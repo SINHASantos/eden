@@ -13,12 +13,9 @@ import type {Hash} from './types';
 import serverAPI from './ClientToServerAPI';
 import {Commit, InlineProgressSpan} from './Commit';
 import {Center, LargeSpinner} from './ComponentUtils';
-import {ErrorNotice} from './ErrorNotice';
 import {isHighlightedCommit} from './HighlightedCommits';
 import {RegularGlyph, RenderDag, YouAreHereGlyph} from './RenderDag';
 import {StackActions} from './StackActions';
-import {Tooltip, DOCUMENTATION_DELAY} from './Tooltip';
-import {Button} from './components/Button';
 import {YOU_ARE_HERE_VIRTUAL_COMMIT} from './dag/virtualCommit';
 import {T, t} from './i18n';
 import {atomFamilyWeak, localStorageBackedAtom} from './jotaiUtils';
@@ -39,9 +36,12 @@ import {
   latestUncommittedChangesData,
 } from './serverAPIState';
 import {MaybeEditStackModal} from './stackEdit/ui/EditStackModal';
+import {Button} from 'isl-components/Button';
+import {ErrorNotice} from 'isl-components/ErrorNotice';
+import {Icon} from 'isl-components/Icon';
+import {Tooltip, DOCUMENTATION_DELAY} from 'isl-components/Tooltip';
 import {ErrorShortMessages} from 'isl-server/src/constants';
 import {atom, useAtomValue} from 'jotai';
-import {Icon} from 'shared/Icon';
 
 import './CommitTreeList.css';
 

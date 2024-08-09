@@ -277,12 +277,6 @@ class remotefilelog:
 
         return p1, p2
 
-    def linknode(self, node):
-        p1, p2, linknode, copyfrom = self.repo.fileslog.metadatastore.getnodeinfo(
-            self.filename, node
-        )
-        return linknode
-
     def revdiff(self, node1, node2):
         if node1 != nullid and (self.flags(node1) or self.flags(node2)):
             raise error.ProgrammingError("cannot revdiff revisions with non-zero flags")
@@ -552,12 +546,7 @@ class remotefileslog(filelog.fileslog):
 
         mask = os.umask(0o002)
         try:
-            sharedonlycontentstore = revisionstore.filescmstore(
-                None,
-                repo.ui._rcfg,
-                sharedonlyremotestore,
-                edenapistore,
-            )
+            sharedonlycontentstore = self.filestore.getsharedmutable()
             sharedonlymetadatastore = revisionstore.metadatastore(
                 None,
                 repo.ui._rcfg,

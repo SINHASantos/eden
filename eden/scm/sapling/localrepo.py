@@ -878,11 +878,21 @@ class localrepository:
 
     def commitpending(self):
         # If we have any pending manifests, commit them to disk.
+        flush_rust = False
         if "manifestlog" in self.__dict__:
             self.manifestlog.commitpending()
+        else:
+            flush_rust = True
 
         if "fileslog" in self.__dict__:
             self.fileslog.commitpending()
+        else:
+            flush_rust = True
+
+        if flush_rust:
+            # We have have done a pure-Rust operation that wrote to caches.
+            # Flush via the Rust repo.
+            self._rsrepo.invalidatestores()
 
         if "changelog" in self.__dict__ and self.changelog.isvertexlazy():
             # Errors are not fatal. We lost some caches downloaded from the
@@ -1671,6 +1681,16 @@ class localrepository:
         )
         return hist
 
+    def pathcreation(self, path, nodes):
+        """Return the most recent commit where path was added.
+
+        path can be either a file or a directory.
+        nodes decides the search range (ex. "::." or "_firstancestors(.)")
+        """
+        return bindings.pathhistory.lastcreation(
+            nodes, path, self.changelog.inner, self.manifestlog.datastore
+        )
+
     def publishing(self):
         # narrow-heads repos are NOT publishing. This ensures pushing to a
         # narrow-heads repo would cause visible heads changes to make the
@@ -2054,6 +2074,12 @@ class localrepository:
         tr.addpostclose("refresh-filecachestats", self._refreshfilecachestats)
         self._transref = weakref.ref(tr)
         return tr
+
+    # Flush pending changelog/store writes. Used to make unflushed
+    # changes visible to EdenFS.
+    def flushpendingtransaction(self):
+        if tx := self.currenttransaction():
+            tx.writepending()
 
     def _journalfiles(self):
         return (
@@ -2817,54 +2843,11 @@ class localrepository:
         """Add a new revision to current repository.
         Revision information is passed via the context argument.
         """
+        _validate_committable_ctx(self.ui, ctx)
 
         tr = None
         p1, p2 = ctx.p1(), ctx.p2()
         user = ctx.user()
-
-        if (
-            not self.ui.configbool("commit", "allow-non-printable")
-            and not self.ui.plain()
-        ):
-            _check_non_printable(self.ui, ctx.description())
-
-        descriptionlimit = self.ui.configbytes("commit", "description-size-limit")
-        if descriptionlimit:
-            descriptionlen = len(ctx.description())
-            if descriptionlen > descriptionlimit:
-                raise errormod.Abort(
-                    _("commit message length (%s) exceeds configured limit (%s)")
-                    % (descriptionlen, descriptionlimit)
-                )
-
-        extraslimit = self.ui.configbytes("commit", "extras-size-limit")
-        if extraslimit:
-            extraslen = sum(len(k) + len(v) for k, v in pycompat.iteritems(ctx.extra()))
-            if extraslen > extraslimit:
-                raise errormod.Abort(
-                    _("commit extras total size (%s) exceeds configured limit (%s)")
-                    % (extraslen, extraslimit)
-                )
-
-        file_count_limit = self.ui.configint("commit", "file-count-limit")
-        if file_count_limit and file_count_limit < len(ctx.files()):
-            support = self.ui.config("ui", "supportcontact")
-            if support:
-                hint = (
-                    _(
-                        "contact %s for help or use '--config commit.file-count-limit=N' cautiously to override"
-                    )
-                    % support
-                )
-            else:
-                hint = _(
-                    "use '--config commit.file-count-limit=N' cautiously to override"
-                )
-            raise errormod.Abort(
-                _("commit file count (%d) exceeds configured limit (%d)")
-                % (len(ctx.files()), file_count_limit),
-                hint=hint,
-            )
 
         isgit = git.isgitformat(self)
         lock = self.lock()
@@ -2881,22 +2864,11 @@ class localrepository:
                 m2ctx = p2.manifestctx()
                 mctx = m1ctx.copy()
 
-                m = mctx.read()
                 m1 = m1ctx.read()
                 m2 = m2ctx.read()
+                m = mctx.read()
 
-                # Validate that the files that are checked in can be interpreted
-                # as utf8. This is to protect against potential crashes as we
-                # move to utf8 file paths. Changing encoding is a beast on top
-                # of storage format.
-                try:
-                    for f in ctx.added():
-                        if isinstance(f, bytes):
-                            f.decode("utf-8")
-                except UnicodeDecodeError as inst:
-                    raise errormod.Abort(
-                        _("invalid file name encoding: %s!") % inst.object
-                    )
+                _validate_file_paths_utf8(ctx.added())
 
                 # check in files
                 added = []
@@ -2945,8 +2917,7 @@ class localrepository:
                                 fctx, m1, m2, linkrev, trp, changed
                             )
                         assert filenode != nullid, "manifest should not have nullid"
-                        m[f] = filenode
-                        m.setflag(f, fctx.flags())
+                        m.set(f, filenode, fctx.flags())
                     except OSError:
                         self.ui.warn(_("trouble committing %s!\n") % f)
                         raise
@@ -3443,35 +3414,6 @@ def newreporequirements(repo) -> Set[str]:
     return requirements
 
 
-def newrepostorerequirements(repo):
-    ui = repo.ui
-    requirements = set()
-
-    # hgsql wants stable legacy revlog access, bypassing visibleheads,
-    # narrow-heads, and zstore-commit-data.
-    if "hgsql" in repo.requirements:
-        return requirements
-
-    if ui.configbool("visibility", "enabled"):
-        requirements.add("visibleheads")
-
-    # See also self._narrowheadsmigration()
-    if (
-        ui.configbool("experimental", "narrow-heads")
-        and ui.configbool("visibility", "enabled")
-        and extensions.isenabled(ui, "remotenames")
-    ):
-        requirements.add("narrowheads")
-
-    if ui.configbool("format", "use-segmented-changelog"):
-        requirements.add("segmentedchangelog")
-        # linkrev are not going to work with segmented changelog,
-        # because the numbers might get rewritten.
-        requirements.add("invalidatelinkrev")
-
-    return requirements
-
-
 def _check_non_printable(ui, message: str) -> None:
     """Raise if non-printable ASCII characters are detected
 
@@ -3556,3 +3498,57 @@ def _openchangelog(repo):
     repo._rsrepo.invalidatechangelog()
     inner = repo._rsrepo.changelog()
     return changelog2.changelog(repo, inner, repo.ui.uiconfig())
+
+
+def _validate_committable_ctx(ui, ctx):
+    if not ui.configbool("commit", "allow-non-printable") and not ui.plain():
+        _check_non_printable(ui, ctx.description())
+
+    descriptionlimit = ui.configbytes("commit", "description-size-limit")
+    if descriptionlimit:
+        descriptionlen = len(ctx.description())
+        if descriptionlen > descriptionlimit:
+            raise errormod.Abort(
+                _("commit message length (%s) exceeds configured limit (%s)")
+                % (descriptionlen, descriptionlimit)
+            )
+
+    extraslimit = ui.configbytes("commit", "extras-size-limit")
+    if extraslimit:
+        extraslen = sum(len(k) + len(v) for k, v in pycompat.iteritems(ctx.extra()))
+        if extraslen > extraslimit:
+            raise errormod.Abort(
+                _("commit extras total size (%s) exceeds configured limit (%s)")
+                % (extraslen, extraslimit)
+            )
+
+    file_count_limit = ui.configint("commit", "file-count-limit")
+    if file_count_limit and file_count_limit < len(ctx.files()):
+        support = ui.config("ui", "supportcontact")
+        if support:
+            hint = (
+                _(
+                    "contact %s for help or use '--config commit.file-count-limit=N' cautiously to override"
+                )
+                % support
+            )
+        else:
+            hint = _("use '--config commit.file-count-limit=N' cautiously to override")
+        raise errormod.Abort(
+            _("commit file count (%d) exceeds configured limit (%d)")
+            % (len(ctx.files()), file_count_limit),
+            hint=hint,
+        )
+
+
+def _validate_file_paths_utf8(file_paths):
+    # Validate that the files that are checked in can be interpreted
+    # as utf8. This is to protect against potential crashes as we
+    # move to utf8 file paths. Changing encoding is a beast on top
+    # of storage format.
+    try:
+        for f in file_paths:
+            if isinstance(f, bytes):
+                f.decode("utf-8")
+    except UnicodeDecodeError as inst:
+        raise errormod.Abort(_("invalid file name encoding: %s!") % inst.object)

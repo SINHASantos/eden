@@ -17,6 +17,7 @@ use bonsai_hg_mapping::BonsaiHgMapping;
 use cacheblob::MemWritesBlobstore;
 use context::CoreContext;
 use filenodes::Filenodes;
+use filestore::FilestoreConfig;
 use futures::future::try_join_all;
 use metaconfig_types::DerivedDataTypesConfig;
 use mononoke_types::BonsaiChangeset;
@@ -37,8 +38,9 @@ pub struct DerivationContext {
     pub(crate) filenodes: Option<Arc<dyn Filenodes>>,
     config_name: String,
     config: DerivedDataTypesConfig,
-    rederivation: Option<Arc<dyn Rederivation>>,
+    pub(crate) rederivation: Option<Arc<dyn Rederivation>>,
     pub(crate) blobstore: Arc<dyn Blobstore>,
+    filestore_config: FilestoreConfig,
 
     /// Write cache layered over the blobstore.  This is the same object
     /// with two views, so we can return a reference to the `Arc<dyn
@@ -57,6 +59,7 @@ impl DerivationContext {
         config_name: String,
         config: DerivedDataTypesConfig,
         blobstore: Arc<dyn Blobstore>,
+        filestore_config: FilestoreConfig,
     ) -> Self {
         // Start with None. Use with_rederivation later if needed
         let rederivation = None;
@@ -68,6 +71,7 @@ impl DerivationContext {
             config,
             rederivation,
             blobstore,
+            filestore_config,
             blobstore_write_cache: None,
         }
     }
@@ -83,7 +87,7 @@ impl DerivationContext {
     }
 
     // For dangerous-override: allow replacement of bonsai-hg-mapping
-    pub fn with_replaced_bonsai_hg_mapping(
+    pub(crate) fn with_replaced_bonsai_hg_mapping(
         &self,
         bonsai_hg_mapping: Arc<dyn BonsaiHgMapping>,
     ) -> Self {
@@ -93,15 +97,26 @@ impl DerivationContext {
         }
     }
 
+    // For dangerous-override: allow replacement of bonsai-git-mapping
+    pub(crate) fn with_replaced_bonsai_git_mapping(
+        &self,
+        bonsai_git_mapping: Arc<dyn BonsaiGitMapping>,
+    ) -> Self {
+        Self {
+            bonsai_git_mapping: Some(bonsai_git_mapping),
+            ..self.clone()
+        }
+    }
+
     // For dangerous-override: allow replacement of filenodes
-    pub fn with_replaced_filenodes(&self, filenodes: Arc<dyn Filenodes>) -> Self {
+    pub(crate) fn with_replaced_filenodes(&self, filenodes: Arc<dyn Filenodes>) -> Self {
         Self {
             filenodes: Some(filenodes),
             ..self.clone()
         }
     }
 
-    pub fn with_replaced_config(
+    pub(crate) fn with_replaced_config(
         &self,
         config_name: String,
         config: DerivedDataTypesConfig,
@@ -113,7 +128,7 @@ impl DerivationContext {
         }
     }
 
-    pub fn with_replaced_blobstore(&self, blobstore: Arc<dyn Blobstore>) -> Self {
+    pub(crate) fn with_replaced_blobstore(&self, blobstore: Arc<dyn Blobstore>) -> Self {
         Self {
             blobstore,
             ..self.clone()
@@ -236,6 +251,10 @@ impl DerivationContext {
         }
     }
 
+    pub fn filestore_config(&self) -> FilestoreConfig {
+        self.filestore_config
+    }
+
     pub fn bonsai_hg_mapping(&self) -> Result<&dyn BonsaiHgMapping> {
         self.bonsai_hg_mapping
             .as_deref()
@@ -272,24 +291,16 @@ impl DerivationContext {
             .map_or("", String::as_str)
     }
 
-    pub(crate) fn needs_rederive<Derivable>(&self, csid: ChangesetId) -> bool
+    /// Batch size for a particular derived data type.
+    pub fn batch_size<Derivable>(&self) -> u64
     where
         Derivable: BonsaiDerivable,
     {
-        if let Some(rederivation) = self.rederivation.as_ref() {
-            rederivation.needs_rederive(Derivable::VARIANT, csid) == Some(true)
-        } else {
-            false
-        }
-    }
-
-    pub(crate) fn mark_derived<Derivable>(&self, csid: ChangesetId)
-    where
-        Derivable: BonsaiDerivable,
-    {
-        if let Some(rederivation) = self.rederivation.as_ref() {
-            rederivation.mark_derived(Derivable::VARIANT, csid);
-        }
+        const DEFAULT_BATCH_SIZE: u64 = 20;
+        self.config()
+            .derivation_batch_sizes
+            .get(&Derivable::VARIANT)
+            .map_or(DEFAULT_BATCH_SIZE, |size| *size as u64)
     }
 
     /// Enable write batching for this derivation context.

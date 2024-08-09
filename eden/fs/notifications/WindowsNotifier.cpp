@@ -22,10 +22,12 @@
 #include <folly/futures/Future.h>
 #include <folly/portability/Windows.h>
 
+#include "eden/common/telemetry/StructuredLogger.h"
 #include "eden/common/utils/SpawnedProcess.h"
 #include "eden/common/utils/StringConv.h"
 #include "eden/common/utils/SystemError.h"
 #include "eden/fs/config/EdenConfig.h"
+#include "eden/fs/telemetry/LogEvent.h"
 
 namespace facebook::eden {
 namespace {
@@ -100,6 +102,32 @@ WindowsNotifier* getWindowsNotifier(HWND hwnd) {
       GetWindowLongPtr(hwnd, GWLP_USERDATA), "GetWindowLongPtr failed"));
 }
 
+bool isTaskbarDarkTheme() {
+  DWORD value = 0;
+  DWORD size = sizeof(value);
+  if (RegGetValueW(
+          HKEY_CURRENT_USER,
+          L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+          L"SystemUsesLightTheme",
+          RRF_RT_REG_DWORD | RRF_ZEROONFAILURE,
+          NULL,
+          &value,
+          &size) != ERROR_SUCCESS ||
+      value == 0) {
+    return true; // dark theme is enabled.
+  } else {
+    return false; // light theme is default on Windows 11 and later.
+  }
+}
+
+int getDefaultIcon() {
+  if (isTaskbarDarkTheme()) {
+    return IDI_WNOTIFICATIONICON;
+  } else {
+    return IDI_BNOTIFICATIONICON;
+  }
+}
+
 void registerWindowClass(
     LPCWSTR pszClassName,
     LPCWSTR pszMenuName,
@@ -135,7 +163,7 @@ void addNotificationIcon(HWND hwnd) {
   iconData.hIcon = checkNonZero(
       static_cast<HICON>(LoadImage(
           GetModuleHandle(NULL),
-          MAKEINTRESOURCE(IDI_WNOTIFICATIONICON),
+          MAKEINTRESOURCE(getDefaultIcon()),
           IMAGE_ICON,
           32,
           32,
@@ -398,7 +426,7 @@ WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) noexcept {
           case IDM_SIGNAL_CHECKOUT: {
             auto notifier = getWindowsNotifier(hwnd);
             auto numActive = static_cast<size_t>(lParam);
-            notifier->updateIconColor(numActive);
+            notifier->updateIconColor(std::optional<size_t>(numActive));
             return 0;
           }
 
@@ -434,10 +462,11 @@ WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) noexcept {
             // is prerable to listening to mouse clicks and key presses
             // directly.
           case WM_CONTEXTMENU: {
+            auto notifier = getWindowsNotifier(hwnd);
+            notifier->logEvent(EMenuActionEvent{EMenuActionEvent::EMenuClick});
             POINT pt = {};
             pt.x = GET_X_LPARAM(wParam);
             pt.y = GET_Y_LPARAM(wParam);
-            auto notifier = getWindowsNotifier(hwnd);
             notifier->showContextMenu(hwnd, pt);
           } break;
         }
@@ -445,6 +474,17 @@ WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) noexcept {
 
       case WMAPP_NOTIFYDESTROY:
         DestroyWindow(hwnd);
+        return 0;
+
+      case WM_SETTINGCHANGE:
+        if (wParam == 0 &&
+            lstrcmpW(L"ImmersiveColorSet", (LPCWSTR)lParam) == 0) {
+          // Theme has changed
+          auto notifier = getWindowsNotifier(hwnd);
+          notifier->updateIconColor(std::nullopt);
+        } else {
+          return DefWindowProc(hwnd, message, wParam, lParam);
+        }
         return 0;
 
       default:
@@ -531,20 +571,30 @@ void cacheIconImages() {
       32,
       32,
       LR_DEFAULTCOLOR | LR_SHARED);
+  LoadImage(
+      GetModuleHandle(NULL),
+      MAKEINTRESOURCE(IDI_BNOTIFICATIONICON),
+      IMAGE_ICON,
+      32,
+      32,
+      LR_DEFAULTCOLOR | LR_SHARED);
 }
 
 } // namespace
 
 WindowsNotifier::WindowsNotifier(
     std::shared_ptr<ReloadableConfig> edenConfig,
+    std::shared_ptr<StructuredLogger> logger,
     std::string_view version,
     std::chrono::time_point<std::chrono::steady_clock> startTime)
     : Notifier(std::move(edenConfig)),
+      structuredLogger_{std::move(logger)},
       guid_{
           version == "(dev build)" ? std::nullopt
                                    : std::optional<Guid>(EMenuGuid)},
       version_{version},
-      startTime_{startTime} {
+      startTime_{startTime},
+      lastNumActive_{0} {
   cacheIconImages();
   // We only use 1 bit of the uint8_t to indicate notifs are enabled/disabled
   notificationStatus_ = notificationsEnabledInConfig()
@@ -593,13 +643,23 @@ void WindowsNotifier::registerInodePopulationReportCallback(
   inodePopulationReportsCallback_ = callback;
 }
 
-void WindowsNotifier::updateIconColor(size_t numActive) {
+void WindowsNotifier::updateIconColor(std::optional<size_t> numActive) {
+  if (numActive.has_value()) {
+    lastNumActive_ = numActive.value();
+  }
   // In-progress checkouts (orange) take priority over unhealthy EdenFS mounts
   // (red). Default to white if we're healthy and have no in-progress checkouts.
-  if (numActive > 0) {
+  if (lastNumActive_ > 0) {
     changeIconColor(IDI_ONOTIFICATIONICON);
   } else {
-    changeIconColor(IDI_WNOTIFICATIONICON);
+    changeIconColor(getDefaultIcon());
+  }
+}
+
+template <typename Event>
+void WindowsNotifier::logEvent(const Event& event) {
+  if (structuredLogger_) {
+    structuredLogger_->logEvent(event);
   }
 }
 

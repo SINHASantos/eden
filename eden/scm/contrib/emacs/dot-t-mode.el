@@ -43,7 +43,7 @@
     ("^#\\w+" . font-lock-keyword-face)
 
     ;; Leading "$" and later "<", ">", "|", "&" and "$(" are keywords.
-    ("^\\s-+\\$"
+    ("^\\s-+\\$\\s-"
      (0 font-lock-keyword-face)
      ("\\([<>|&]\\)\\|\\(\\$\\)(" nil nil
       (1 font-lock-keyword-face nil t)
@@ -137,6 +137,9 @@
   ;; Make `"/some/path.py", line 123` into a link.
   (add-to-list 'compilation-error-regexp-alist-alist
                '(dot-t . ("\"\\([^\"]+\\)\", line \\([0-9]+\\)" 1 2)))
+  ;; Make `/some/path.py:123` into a link.
+  (add-to-list 'compilation-error-regexp-alist-alist
+               '(dot-t . ("\\(/.*\\.py\\):\\([0-9]+\\)" 1 2)))
 
   (add-hook 'compilation-filter-hook #'ansi-color-compilation-filter nil t))
 
@@ -157,7 +160,8 @@ Add prefix arg to run with --fix.
                            "--noprogress"
                            "--maxdifflines" "10000"
                            "--with-hg" (executable-find dot-t-sl-command)
-                           "--chg"))
+                           ;; "--chg" ; makes tests hang for some reason
+                           ))
           (when (save-excursion (goto-char (point-min)) (search-forward "#require fsmonitor" nil t))
             (setq args (append args '("--watchman")))))
       (setq args (list dot-t-sl-command

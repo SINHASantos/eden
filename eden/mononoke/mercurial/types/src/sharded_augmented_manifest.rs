@@ -25,6 +25,7 @@ use futures::stream;
 use futures::stream::BoxStream;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
+use futures_ext::FbStreamExt;
 use manifest::AsyncManifest;
 use manifest::Entry;
 use mononoke_types::hash::Blake2;
@@ -314,6 +315,7 @@ impl ShardedHgAugmentedManifest {
                     .map(|res| {
                         res.and_then(|(k, v)| anyhow::Ok((MPathElement::from_smallvec(k)?, v)))
                     })
+                    .yield_periodically()
                     .chunks(MAX_BUFFERED_ENTRIES)
                     .map(|results| {
                         results
@@ -337,6 +339,7 @@ impl ShardedHgAugmentedManifest {
             .and_then(
                 |(path, entry)| async move { Ok((MPathElement::from_smallvec(path)?, entry)) },
             )
+            .yield_periodically()
             .try_for_each(|(path, entry)| {
                 future::ready(Self::write_content_addressed_entry(
                     &path,
@@ -559,39 +562,35 @@ impl HgAugmentedManifestEnvelope {
         blobstore: &B,
         manifestid: HgAugmentedManifestId,
     ) -> Result<Option<Self>> {
-        if manifestid.clone().into_nodehash() == NULL_HASH {
-            Ok(None)
-        } else {
-            async {
-                let blobstore_key = manifestid.blobstore_key();
-                let bytes = blobstore
-                    .get(ctx, &blobstore_key)
-                    .await
-                    .context("While fetching aurmented manifest envelope blob")?;
-                (|| {
-                    let envelope = match bytes {
-                        Some(bytes) => Self::from_blob(bytes.into_raw_bytes())?,
-                        None => return Ok(None),
-                    };
-                    if manifestid.into_nodehash() != envelope.augmented_manifest.hg_node_id() {
-                        bail!(
-                            "Augmented Manifest ID mismatch (requested: {}, got: {})",
-                            manifestid,
-                            envelope.augmented_manifest.hg_node_id()
-                        );
-                    }
-                    Ok(Some(envelope))
-                })()
-                .context(MononokeHgBlobError::ManifestDeserializeFailed(
-                    blobstore_key,
-                ))
-            }
-            .await
-            .context(format!(
-                "Failed to load manifest {} from blobstore",
-                manifestid
+        async {
+            let blobstore_key = manifestid.blobstore_key();
+            let bytes = blobstore
+                .get(ctx, &blobstore_key)
+                .await
+                .context("While fetching aurmented manifest envelope blob")?;
+            (|| {
+                let envelope = match bytes {
+                    Some(bytes) => Self::from_blob(bytes.into_raw_bytes())?,
+                    None => return Ok(None),
+                };
+                if manifestid.into_nodehash() != envelope.augmented_manifest.hg_node_id() {
+                    bail!(
+                        "Augmented Manifest ID mismatch (requested: {}, got: {})",
+                        manifestid,
+                        envelope.augmented_manifest.hg_node_id()
+                    );
+                }
+                Ok(Some(envelope))
+            })()
+            .context(MononokeHgBlobError::ManifestDeserializeFailed(
+                blobstore_key,
             ))
         }
+        .await
+        .context(format!(
+            "Failed to load manifest {} from blobstore",
+            manifestid
+        ))
     }
 
     /// Serialize this structure into bytes
@@ -623,6 +622,34 @@ impl HgAugmentedManifestEnvelope {
         self.augmented_manifest
             .into_content_addressed_manifest_blob(ctx, blobstore)
     }
+}
+
+pub async fn fetch_augmented_manifest_envelope_opt<B: Blobstore>(
+    ctx: &CoreContext,
+    blobstore: &B,
+    augmented_node_id: HgAugmentedManifestId,
+) -> Result<Option<HgAugmentedManifestEnvelope>> {
+    if augmented_node_id == HgAugmentedManifestId::new(NULL_HASH) {
+        return Ok(None);
+    }
+    let blobstore_key = augmented_node_id.blobstore_key();
+    let bytes = blobstore
+        .get(ctx, &blobstore_key)
+        .await
+        .context("While fetching augmented manifest envelope blob")?;
+    let blobstore_bytes = match bytes {
+        Some(bytes) => bytes,
+        None => return Ok(None),
+    };
+    let envelope = HgAugmentedManifestEnvelope::from_blob(blobstore_bytes.into_raw_bytes())?;
+    if augmented_node_id.into_nodehash() != envelope.augmented_manifest.hg_node_id() {
+        bail!(
+            "Manifest ID mismatch (requested: {}, got: {})",
+            augmented_node_id,
+            envelope.augmented_manifest.hg_node_id()
+        );
+    }
+    Ok(Some(envelope))
 }
 
 #[async_trait]
@@ -769,11 +796,14 @@ impl<Store: Blobstore> AsyncManifest<Store> for HgAugmentedManifestEnvelope {
 
 #[cfg(test)]
 mod sharded_augmented_manifest_tests {
+    use std::io::Cursor;
+
     use bytes::BytesMut;
     use fbinit::FacebookInit;
     use fixtures::Linear;
     use fixtures::TestRepoFixture;
     use repo_blobstore::RepoBlobstoreArc;
+    use types::AugmentedTree;
 
     use super::*;
 
@@ -884,12 +914,14 @@ mod sharded_augmented_manifest_tests {
             subentries: ShardedMapV2Node::from_entries(&ctx, &blobstore, subentries).await?,
         };
 
+        let bytes = augmented_manifest
+            .into_content_addressed_manifest_blob(&ctx, &blobstore)
+            .map(|b| b.unwrap())
+            .collect::<BytesMut>()
+            .await;
+
         assert_eq!(
-            augmented_manifest
-                .into_content_addressed_manifest_blob(&ctx, &blobstore)
-                .map(|b| b.unwrap())
-                .collect::<BytesMut>()
-                .await,
+            bytes,
             Bytes::from(concat!(
                 "v1 1111111111111111111111111111111111111111 - 2222222222222222222222222222222222222222 3333333333333333333333333333333333333333\n",
                 "a.rs\x004444444444444444444444444444444444444444r 4444444444444444444444444444444444444444444444444444444444444444 10 4444444444444444444444444444444444444444 AQpjb3B5OiBmYmNvZGUvZWRlbi9zY20vbGliL3JldmlzaW9uc3RvcmUvVEFSR0VUUwpjb3B5cmV2OiBhNDU5NTA0ZjY3NmE1ZmVjNWFiM2QxYTE0ZjQ2MTY0MzAzOTFjMDNlCgEK\n",
@@ -898,6 +930,9 @@ mod sharded_augmented_manifest_tests {
                 "dir_2\x001111111111111111111111111111111111111111t 1111111111111111111111111111111111111111111111111111111111111111 10000\n"
             ))
         );
+
+        // Check compatibility with the Sapling Type, to make sure Sapling can deserialize
+        assert!(AugmentedTree::try_deserialize(Cursor::new(bytes)).is_ok());
 
         Ok(())
     }
