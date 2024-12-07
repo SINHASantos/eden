@@ -347,6 +347,9 @@ function mononoke_modern_sync {
     --repo-id "$REPOID" \
     --mononoke-config-path "$TESTTMP/mononoke-config" \
     --dest-socket $MONONOKE_SOCKET \
+    --tls-ca "$TEST_CERTDIR/root-ca.crt" \
+    --tls-private-key "$TEST_CERTDIR/localhost.key" \
+    --tls-certificate "$TEST_CERTDIR/localhost.crt" \
     --scuba-log-file "$TESTTMP/modern_sync_scuba_logs" \
     sync-once --start-id "$START_ID"
 }
@@ -1841,4 +1844,8 @@ function wait_for_bookmark_move_to_commit {
   echo "bookmark didn't move to commit $commit_title" >&2
   exit 1
 
+}
+
+function fb303-status() {
+  $FB303_STATUS "$@"
 }

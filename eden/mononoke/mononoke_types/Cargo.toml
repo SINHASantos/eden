@@ -31,8 +31,9 @@ either = "1.5"
 faster-hex = "0.6.1"
 fbthrift = { version = "0.0.1+unstable", git = "https://github.com/facebook/fbthrift.git", branch = "main" }
 futures = { version = "0.3.30", features = ["async-await", "compat"] }
-gix-date = { git = "https://github.com/pierrechevalier83/gitoxide", rev = "a080348c2fefb7a300ec80f4481617f870065589" }
-gix-hash = { git = "https://github.com/pierrechevalier83/gitoxide", rev = "a080348c2fefb7a300ec80f4481617f870065589" }
+futures_watchdog = { version = "0.1.0", path = "../common/futures_watchdog" }
+gix-date = "0.9.2"
+gix-hash = "0.15.1"
 itertools = "0.13.0"
 lazy_static = "1.4"
 lfs_protocol = { version = "0.1.0", path = "../lfs_protocol" }
@@ -47,6 +48,7 @@ sapling-xdiff = { version = "0.1.0", path = "../../scm/lib/xdiff" }
 serde = { version = "1.0.185", features = ["derive", "rc"] }
 serde_derive = "1.0.185"
 sha1 = "0.10.5"
+slog = { version = "2.7", features = ["max_level_trace", "nested-values"] }
 smallvec = { version = "1.6.1", features = ["serde", "specialization", "union"] }
 sorted_vector_map = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 sql = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }

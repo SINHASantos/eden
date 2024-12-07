@@ -115,13 +115,28 @@ pub async fn sync(
     let sender: Arc<dyn ModernSyncSender + Send + Sync> = if dry_run {
         Arc::new(DummySender::new(logger.clone()))
     } else {
-        let url = if let Some(socket) = app.args::<ModernSyncArgs>()?.dest_socket {
+        let app_args = app.args::<ModernSyncArgs>()?;
+        let url = if let Some(socket) = app_args.dest_socket {
             // Only for integration tests
             format!("{}:{}/edenapi/", &config.url, socket)
         } else {
             format!("{}/edenapi/", &config.url)
         };
-        Arc::new(EdenapiSender::new(Url::parse(&url)?, repo_name.clone(), logger.clone()).await?)
+
+        let tls_args = app_args
+            .tls_params
+            .clone()
+            .ok_or_else(|| format_err!("TLS params not found for repo {}", repo_name))?;
+
+        Arc::new(
+            EdenapiSender::new(
+                Url::parse(&url)?,
+                repo_name.clone(),
+                logger.clone(),
+                tls_args,
+            )
+            .await?,
+        )
     };
 
     let mut scuba_sample = ctx.scuba().clone();
@@ -155,7 +170,8 @@ pub async fn sync(
                         .try_next_step(move |cs_id| {
                             cloned!(ctx, repo, logger, sender);
                             async move {
-                                process_one_changeset(&cs_id, &ctx, repo, &logger, sender).await
+                                process_one_changeset(&cs_id, &ctx, repo, &logger, sender, false)
+                                    .await
                             }
                         })
                         .try_collect::<()>()
@@ -171,12 +187,13 @@ pub async fn sync(
     Ok(())
 }
 
-async fn process_one_changeset(
+pub async fn process_one_changeset(
     cs_id: &ChangesetId,
     ctx: &CoreContext,
     repo: Repo,
     logger: &Logger,
     sender: Arc<dyn ModernSyncSender + Send + Sync>,
+    log_completion: bool,
 ) -> Result<()> {
     info!(logger, "Found commit {:?}", cs_id);
 
@@ -202,6 +219,9 @@ async fn process_one_changeset(
         }
     }
 
-    STATS::synced_commits.add_value(1, (repo.repo_identity().name().to_string(),));
+    if log_completion {
+        STATS::synced_commits.add_value(1, (repo.repo_identity().name().to_string(),));
+    }
+
     Ok(())
 }

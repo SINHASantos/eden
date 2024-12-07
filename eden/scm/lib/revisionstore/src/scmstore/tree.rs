@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use ::types::errors::KeyedError;
+use ::metrics::Counter;
 use ::types::fetch_mode::FetchMode;
 use ::types::hgid::NULL_ID;
 use ::types::tree::TreeItemFlag;
@@ -35,14 +35,12 @@ use edenapi_types::TreeChildEntry;
 use fetch::FetchState;
 use minibytes::Bytes;
 use once_cell::sync::OnceCell;
-use parking_lot::RwLock;
 use storemodel::BoxIterator;
 use storemodel::InsertOpts;
 use storemodel::KeyStore;
 use storemodel::SerializationFormat;
 use storemodel::TreeEntry;
 
-pub use self::metrics::TreeStoreMetrics;
 use crate::datastore::HgIdDataStore;
 use crate::historystore::HistoryStore;
 use crate::indexedlogdatastore::Entry;
@@ -80,6 +78,8 @@ pub enum TreeMetadataMode {
     Always,
     OptIn,
 }
+
+static TREESTORE_FLUSH_COUNT: Counter = Counter::new_counter("scmstore.tree.flush");
 
 #[derive(Clone)]
 pub struct TreeStore {
@@ -121,12 +121,7 @@ pub struct TreeStore {
     /// Whether to fetch trees aux data from remote (provided by the augmented trees)
     pub fetch_tree_aux_data: bool,
 
-    pub(crate) metrics: Arc<RwLock<TreeStoreMetrics>>,
-
     pub format: SerializationFormat,
-
-    /// Immediately return empty results for non-REMOTE fetches with CAS enabled.
-    pub noop_cas_local: bool,
 }
 
 impl Drop for TreeStore {
@@ -147,26 +142,6 @@ impl TreeStore {
         let mut reqs = reqs.peekable();
         if reqs.peek().is_none() {
             return FetchResults::new(Box::new(std::iter::empty()));
-        }
-
-        let fetch_local = fetch_mode.contains(FetchMode::LOCAL);
-        let fetch_remote = fetch_mode.contains(FetchMode::REMOTE);
-        let cas_client = self.cas_client.clone();
-
-        if self.noop_cas_local && !fetch_remote && cas_client.is_some() {
-            // Make LOCAL mode a no-op for CAS to save work since LOCAL mode doesn't
-            // attempt fetching from CAS.
-            tracing::debug!("skipping local fetch with CAS enabled");
-            return FetchResults::new(Box::new(
-                reqs.map(|key| {
-                    Err(KeyFetchError::KeyedError(KeyedError(
-                        key,
-                        anyhow!("cas no-op"),
-                    )))
-                })
-                .collect::<Vec<_>>()
-                .into_iter(),
-            ));
         }
 
         let (found_tx, found_rx) = unbounded();
@@ -205,6 +180,7 @@ impl TreeStore {
         let cache_to_local_cache = self.cache_to_local_cache;
         let aux_cache = self.filestore.as_ref().and_then(|fs| fs.aux_cache.clone());
         let tree_aux_store = self.tree_aux_store.clone();
+        let cas_client = self.cas_client.clone();
 
         let fetch_children_metadata = match self.tree_metadata_mode {
             TreeMetadataMode::Always => true,
@@ -213,6 +189,9 @@ impl TreeStore {
         };
         let fetch_tree_aux_data = self.fetch_tree_aux_data || attrs.aux_data;
         let fetch_parents = attrs.parents || self.prefetch_tree_parents;
+
+        let fetch_local = fetch_mode.contains(FetchMode::LOCAL);
+        let fetch_remote = fetch_mode.contains(FetchMode::REMOTE);
 
         tracing::debug!(
             ?fetch_mode,
@@ -223,8 +202,6 @@ impl TreeStore {
             fetch_remote,
             keys_len
         );
-
-        let store_metrics = self.metrics.clone();
 
         let process_func = move || -> Result<()> {
             let fetch_cas = fetch_remote && cas_client.is_some();
@@ -389,12 +366,6 @@ impl TreeStore {
             // TODO(meyer): Report incomplete / not found, handle errors better instead of just always failing the batch, etc
             state.common.results(state.errors);
 
-            if let Err(err) = state.metrics.update_ods() {
-                tracing::error!(?err, "error updating tree ods counters");
-            }
-
-            store_metrics.write().fetch += state.metrics;
-
             Ok(())
         };
         let process_func_errors = move || {
@@ -442,14 +413,13 @@ impl TreeStore {
             flush_on_drop: true,
             tree_metadata_mode: TreeMetadataMode::Never,
             fetch_tree_aux_data: false,
-            metrics: Default::default(),
             prefetch_tree_parents: false,
             format: SerializationFormat::Hg,
-            noop_cas_local: false,
         }
     }
 
     #[allow(unused_must_use)]
+    #[tracing::instrument(level = "debug", skip(self))]
     pub fn flush(&self) -> Result<()> {
         let mut result = Ok(());
         let mut handle_error = |error| {
@@ -477,11 +447,7 @@ impl TreeStore {
             historystore_cache.flush().map_err(&mut handle_error);
         }
 
-        let mut metrics = self.metrics.write();
-        for (k, v) in metrics.metrics() {
-            hg_metrics::increment_counter(k, v as u64);
-        }
-        *metrics = Default::default();
+        TREESTORE_FLUSH_COUNT.increment();
 
         result
     }
@@ -509,10 +475,8 @@ impl TreeStore {
             flush_on_drop: true,
             tree_metadata_mode: TreeMetadataMode::Never,
             fetch_tree_aux_data: false,
-            metrics: self.metrics.clone(),
             prefetch_tree_parents: false,
             format: self.format(),
-            noop_cas_local: self.noop_cas_local,
         }
     }
 

@@ -6,7 +6,7 @@ import {gitHubRepo, gitHubRepoName, latestReleasePage} from '@site/constants'
 
 import {Command, SLCommand} from '@site/elements'
 
-import {latestReleaseVersion, macArmAsset, macIntelAsset, ubuntu20, ubuntu22, windowsAsset} from '@site/src/releaseData';
+import {latestReleaseVersion, macArmAsset, ubuntu20, ubuntu22, windowsAsset} from '@site/src/releaseData';
 
 import CodeBlock from '@theme/CodeBlock';
 
@@ -44,20 +44,6 @@ Then install:
 
 <CodeBlock>
 brew install ./{macArmAsset.name}
-</CodeBlock>
-
-##### Intel (x86_64)
-
-Download using `curl`:
-
-<CodeBlock>
-curl -L -o {macIntelAsset.name} {macIntelAsset.url}
-</CodeBlock>
-
-Then install:
-
-<CodeBlock>
-brew install ./{macIntelAsset.name}
 </CodeBlock>
 
 :::caution
@@ -193,4 +179,4 @@ python3 .\\packaging\\windows\\build_windows_zip.py
 `}
 </pre>
 
-Once you have Sapling installed, follow the [Getting Started](./getting-started.md) instructions.
+Once you have Sapling installed, follow the [Getting Started](/docs/introduction/getting-started.md) instructions.

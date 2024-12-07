@@ -10,10 +10,11 @@ mod metrics;
 mod types;
 
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
-use ::types::errors::KeyedError;
+use ::metrics::Counter;
 use ::types::fetch_mode::FetchMode;
 use ::types::HgId;
 use ::types::Key;
@@ -25,6 +26,8 @@ use cas_client::CasClient;
 use clientinfo::get_client_request_info_thread_local;
 use clientinfo::set_client_request_info_thread_local;
 use crossbeam::channel::unbounded;
+use indexedlog::log::AUTO_SYNC_COUNT;
+use indexedlog::log::SYNC_COUNT;
 use itertools::Itertools;
 use minibytes::Bytes;
 use parking_lot::Mutex;
@@ -54,7 +57,6 @@ use crate::lfs::LfsStore;
 use crate::scmstore::activitylogger::ActivityLogger;
 use crate::scmstore::fetch::FetchResults;
 use crate::scmstore::metrics::StoreLocation;
-use crate::scmstore::KeyFetchError;
 use crate::ContentDataStore;
 use crate::ContentMetadata;
 use crate::Delta;
@@ -115,9 +117,6 @@ pub struct FileStore {
 
     // The threshold for using CAS cache
     pub(crate) cas_cache_threshold_bytes: Option<u64>,
-
-    /// Immediately return empty results for non-REMOTE fetches with CAS enabled.
-    pub noop_cas_local: bool,
 }
 
 impl Drop for FileStore {
@@ -138,6 +137,10 @@ macro_rules! try_local_content {
     };
 }
 
+static FILESTORE_FLUSH_COUNT: Counter = Counter::new_counter("scmstore.file.flush");
+static INDEXEDLOG_SYNC_COUNT: Counter = Counter::new_counter("scmstore.indexedlog.sync");
+static INDEXEDLOG_AUTO_SYNC_COUNT: Counter = Counter::new_counter("scmstore.indexedlog.auto_sync");
+
 impl FileStore {
     /// Get the "local content" without going through the heavyweight "fetch" API.
     pub(crate) fn get_local_content_direct(&self, id: &HgId) -> Result<Option<Bytes>> {
@@ -157,26 +160,6 @@ impl FileStore {
         let mut keys = keys.into_iter().peekable();
         if keys.peek().is_none() {
             return FetchResults::new(Box::new(std::iter::empty()));
-        }
-
-        let fetch_local = fetch_mode.contains(FetchMode::LOCAL);
-        let fetch_remote = fetch_mode.contains(FetchMode::REMOTE);
-        let cas_client = self.cas_client.clone();
-
-        if self.noop_cas_local && !fetch_remote && cas_client.is_some() {
-            // Make LOCAL mode a no-op for CAS to save work since LOCAL mode doesn't
-            // attempt fetching from CAS.
-            tracing::debug!("skipping local fetch with CAS enabled");
-            return FetchResults::new(Box::new(
-                keys.map(|key| {
-                    Err(KeyFetchError::KeyedError(KeyedError(
-                        key,
-                        anyhow!("cas no-op"),
-                    )))
-                })
-                .collect::<Vec<_>>()
-                .into_iter(),
-            ));
         }
 
         let (found_tx, found_rx) = unbounded();
@@ -222,10 +205,13 @@ impl FileStore {
         let lfs_cache = self.lfs_cache.clone();
         let lfs_local = self.lfs_local.clone();
         let edenapi = self.edenapi.clone();
+        let cas_client = self.cas_client.clone();
         let lfs_remote = self.lfs_remote.clone();
-        let metrics = self.metrics.clone();
         let activity_logger = self.activity_logger.clone();
         let format = self.format();
+
+        let fetch_local = fetch_mode.contains(FetchMode::LOCAL);
+        let fetch_remote = fetch_mode.contains(FetchMode::REMOTE);
 
         let process_func = move || {
             let start_instant = Instant::now();
@@ -338,11 +324,11 @@ impl FileStore {
 
             state.derive_computable(aux_cache.as_ref().map(|s| s.as_ref()));
 
-            metrics.write().fetch += state.metrics().clone();
-            if let Err(err) = state.metrics().update_ods() {
-                tracing::error!("Error updating ods fetch metrics: {}", err);
-            }
             state.finish();
+
+            // These aren't technically filestore specific, but this will keep them updated.
+            INDEXEDLOG_SYNC_COUNT.add(SYNC_COUNT.swap(0, Ordering::Relaxed) as usize);
+            INDEXEDLOG_AUTO_SYNC_COUNT.add(AUTO_SYNC_COUNT.swap(0, Ordering::Relaxed) as usize);
 
             if let Some(activity_logger) = activity_logger {
                 if let Err(err) = activity_logger.lock().log_file_fetch(
@@ -455,6 +441,7 @@ impl FileStore {
     }
 
     #[allow(unused_must_use)]
+    #[tracing::instrument(level = "debug", skip(self))]
     pub fn flush(&self) -> Result<()> {
         let mut result = Ok(());
         let mut handle_error = |error| {
@@ -482,11 +469,12 @@ impl FileStore {
             aux_cache.flush().map_err(&mut handle_error);
         }
 
-        let mut metrics = self.metrics.write();
+        let metrics = std::mem::take(&mut *self.metrics.write());
         for (k, v) in metrics.metrics() {
             hg_metrics::increment_counter(k, v as u64);
         }
-        *metrics = Default::default();
+
+        FILESTORE_FLUSH_COUNT.increment();
 
         result
     }
@@ -530,8 +518,6 @@ impl FileStore {
             format: SerializationFormat::Hg,
 
             cas_cache_threshold_bytes: None,
-
-            noop_cas_local: false,
         }
     }
 
@@ -583,8 +569,6 @@ impl FileStore {
             format: self.format(),
 
             cas_cache_threshold_bytes: self.cas_cache_threshold_bytes.clone(),
-
-            noop_cas_local: self.noop_cas_local,
         }
     }
 

@@ -9,7 +9,7 @@
 import sys
 import time
 import unittest
-from typing import Optional
+from typing import List, Optional
 
 from facebook.eden.ttypes import (
     Added,
@@ -46,7 +46,7 @@ def getLargeChangeSafe(
 
 
 def buildSmallChange(
-    changeType: SmallChangeNotification,
+    changeType: int,
     fileType: Dtype,
     path: Optional[bytes] = None,
     from_path: Optional[bytes] = None,
@@ -95,8 +95,7 @@ def buildSmallChange(
     return ChangeNotification()
 
 
-@testcase.eden_repo_test
-class ChangesTest(testcase.EdenRepoTest):
+class ChangesTestBase(testcase.EdenRepoTest):
     def populate_repo(self) -> None:
         # Create the initial repo. It requires at least 1 file and 1 commit
         self.repo.write_file("hello", "bonjour\n")
@@ -130,13 +129,114 @@ class ChangesTest(testcase.EdenRepoTest):
         print(changes)
         return False
 
-    def getChangesSinceV2(self, position) -> ChangesSinceV2Result:
+    def getChangesSinceV2(
+        self, position, included_roots=None, excluded_roots=None
+    ) -> ChangesSinceV2Result:
         return self.client.changesSinceV2(
             ChangesSinceV2Params(
-                mountPoint=self.mount_path_bytes, fromPosition=position
+                mountPoint=self.mount_path_bytes,
+                fromPosition=position,
+                includedRoots=included_roots,
+                excludedRoots=excluded_roots,
             )
         )
 
+    def repo_write_file(self, path, contents, mode=None, add=True) -> None:
+        self.eden_repo.write_file(path, contents, mode, add)
+
+    def setup_test_add_file(self) -> ChangesSinceV2Result:
+        position = self.client.getCurrentJournalPosition(self.mount_path_bytes)
+        self.repo_write_file("test_file", "", add=False)
+        return self.getChangesSinceV2(position=position)
+
+    def setup_test_rename_file(self) -> ChangesSinceV2Result:
+        self.repo_write_file("test_file", "", add=False)
+        position = self.client.getCurrentJournalPosition(self.mount_path_bytes)
+        self.rename("test_file", "best_file")
+        return self.getChangesSinceV2(position=position)
+
+    def repo_rmdir(self, path) -> None:
+        self.rmdir(path)
+
+    def add_file_expect(
+        self, path, contents, mode=None, add=True
+    ) -> List[ChangeNotification]:
+        self.repo_write_file(path, contents, mode, add)
+        return [
+            buildSmallChange(
+                SmallChangeNotification.ADDED, Dtype.REGULAR, path=path.encode()
+            ),
+            buildSmallChange(
+                SmallChangeNotification.MODIFIED, Dtype.REGULAR, path=path.encode()
+            ),
+        ]
+
+    def add_folder_expect(self, path) -> List[ChangeNotification]:
+        self.mkdir(path)
+        return [
+            buildSmallChange(
+                SmallChangeNotification.ADDED, Dtype.DIR, path=path.encode()
+            ),
+        ]
+
+
+class WindowsTestBase(ChangesTestBase):
+    SYNC_MAX: int = 1
+
+    def syncProjFS(self, position) -> None:
+        # Wait for eden to get the PrjFS notification
+        pollTime = 0.1
+        waitTime = 0
+        newPosition = self.client.getCurrentJournalPosition(self.mount_path_bytes)
+        while position == newPosition and waitTime < self.SYNC_MAX:
+            time.sleep(pollTime)
+            waitTime += pollTime
+            newPosition = self.client.getCurrentJournalPosition(self.mount_path_bytes)
+
+    def repo_write_file(self, path, contents, mode=None, add=True) -> None:
+        position = self.client.getCurrentJournalPosition(self.mount_path_bytes)
+        super().repo_write_file(path, contents, mode, add)
+        self.syncProjFS(position)
+
+    def rm(self, path) -> None:
+        position = self.client.getCurrentJournalPosition(self.mount_path_bytes)
+        super().rm(path)
+        self.syncProjFS(position)
+
+    def rename(self, from_path, to_path) -> None:
+        position = self.client.getCurrentJournalPosition(self.mount_path_bytes)
+        super().rename(from_path, to_path)
+        self.syncProjFS(position)
+
+    def mkdir(self, path) -> None:
+        position = self.client.getCurrentJournalPosition(self.mount_path_bytes)
+        super().mkdir(path)
+        self.syncProjFS(position)
+
+    def repo_rmdir(self, path) -> None:
+        position = self.client.getCurrentJournalPosition(self.mount_path_bytes)
+        super().rmdir(path)
+        self.syncProjFS(position)
+
+    def add_file_expect(
+        self, path, contents, mode=None, add=True
+    ) -> List[ChangeNotification]:
+        self.repo_write_file(path, contents, mode, add)
+        return [
+            buildSmallChange(
+                SmallChangeNotification.ADDED, Dtype.REGULAR, path=path.encode()
+            ),
+        ]
+
+
+if sys.platform == "win32":
+    testBase = WindowsTestBase
+else:
+    testBase = ChangesTestBase
+
+
+@testcase.eden_repo_test
+class ChangesTestCommon(testBase):
     def test_wrong_mount_generation(self):
         # The input mount generation should equal the current mount generation
         oldPosition = self.client.getCurrentJournalPosition(self.mount_path_bytes)
@@ -151,14 +251,121 @@ class ChangesTest(testcase.EdenRepoTest):
             LostChangesReason.EDENFS_REMOUNTED,
         )
 
-    def test_add_file(self):
+    def test_exclude_directory(self):
+        expected_changes = []
+        oldPosition = self.client.getCurrentJournalPosition(self.mount_path_bytes)
+        self.add_folder_expect("ignored_dir")
+        self.add_folder_expect("ignored_dir2/nested_ignored_dir")
+        expected_changes += self.add_folder_expect("want_dir")
+        # same name in subdir should not be ignored
+        expected_changes += self.add_folder_expect("want_dir/ignored_dir")
+        self.add_file_expect("ignored_dir/test_file", "contents", add=False)
+        expected_changes += self.add_file_expect(
+            "want_dir/test_file", "contents", add=False
+        )
+        self.add_file_expect(
+            "ignored_dir2/nested_ignored_dir/test_file", "contents", add=False
+        )
+        expected_changes += self.add_file_expect(
+            "want_dir/ignored_dir/test_file", "contents", add=False
+        )
+        changes = self.getChangesSinceV2(
+            oldPosition,
+            excluded_roots=["ignored_dir", "ignored_dir2/nested_ignored_dir"],
+        )
+        self.assertTrue(self.check_changes(changes.changes, expected_changes))
+
+    def test_include_directory(self):
+        expected_changes = []
+        oldPosition = self.client.getCurrentJournalPosition(self.mount_path_bytes)
+        self.mkdir("ignored_dir")
+        self.mkdir("ignored_dir2/nested_ignored_dir")
+        expected_changes += self.add_folder_expect("want_dir")
+        expected_changes += self.add_folder_expect("want_dir/ignored_dir")
+        self.add_file_expect("ignored_dir/test_file", "contents", add=False)
+        expected_changes += self.add_file_expect(
+            "want_dir/test_file", "contents", add=False
+        )
+        self.add_file_expect(
+            "ignored_dir2/nested_ignored_dir/test_file", "contents", add=False
+        )
+        expected_changes += self.add_file_expect(
+            "want_dir/ignored_dir/test_file", "contents", add=False
+        )
+        changes = self.getChangesSinceV2(
+            oldPosition,
+            included_roots=["want_dir"],
+        )
+        self.assertTrue(self.check_changes(changes.changes, expected_changes))
+
+    def test_modify_file(self):
+        self.repo_write_file("test_file", "", add=False)
         position = self.client.getCurrentJournalPosition(self.mount_path_bytes)
-        self.eden_repo.write_file("test_file", "", add=False)
-        if sys.platform == "win32":
-            # Wait for eden to get the PrjFS notification
-            time.sleep(1)
+        self.repo_write_file("test_file", "contents", add=False)
         changes = self.getChangesSinceV2(position=position)
+        expected_changes = [
+            buildSmallChange(
+                SmallChangeNotification.MODIFIED, Dtype.REGULAR, path=b"test_file"
+            ),
+        ]
+        self.assertTrue(self.check_changes(changes.changes, expected_changes))
+
+    def test_remove_file(self):
+        self.repo_write_file("test_file", "", add=False)
+        position = self.client.getCurrentJournalPosition(self.mount_path_bytes)
+        self.rm("test_file")
+        changes = self.getChangesSinceV2(position=position)
+        expected_changes = [
+            buildSmallChange(
+                SmallChangeNotification.REMOVED,
+                Dtype.REGULAR,
+                path=b"test_file",
+            ),
+        ]
+        self.assertTrue(self.check_changes(changes.changes, expected_changes))
+
+    def test_add_folder(self):
+        position = self.client.getCurrentJournalPosition(self.mount_path_bytes)
+        # self.repo_write_file("test_folder/test_file", "", add=False)
+        self.mkdir("test_folder")
+        changes = self.getChangesSinceV2(position=position)
+        expected_changes = [
+            buildSmallChange(
+                SmallChangeNotification.ADDED,
+                Dtype.DIR,
+                path=b"test_folder",
+            ),
+        ]
+        self.assertTrue(self.check_changes(changes.changes, expected_changes))
+
+    def test_remove_folder(self):
+        self.mkdir("test_folder")
+        position = self.client.getCurrentJournalPosition(self.mount_path_bytes)
+        self.repo_rmdir("test_folder")
+        changes = self.getChangesSinceV2(position=position)
+        expected_changes = [
+            buildSmallChange(
+                SmallChangeNotification.REMOVED,
+                Dtype.DIR,
+                path=b"test_folder",
+            ),
+        ]
+        self.assertTrue(self.check_changes(changes.changes, expected_changes))
+
+
+# The following tests have different results based on platform
+
+
+@testcase.eden_repo_test
+class ChangesTestNix(ChangesTestBase):
+    def setUp(self) -> None:
+        if sys.platform == "win32":
+            self.skipTest("Non-Windows test")
+        return super().setUp()
+
+    def test_add_file(self):
         # When adding a file, it is technically written to so there's an additional modified operation
+        changes = self.setup_test_add_file()
         expected_changes = [
             buildSmallChange(
                 SmallChangeNotification.ADDED, Dtype.REGULAR, path=b"test_file"
@@ -167,40 +374,10 @@ class ChangesTest(testcase.EdenRepoTest):
                 SmallChangeNotification.MODIFIED, Dtype.REGULAR, path=b"test_file"
             ),
         ]
-        if sys.platform == "win32":
-            # PrjFS notifications only shows up as added, so remove the modified
-            expected_changes.pop()
-        self.assertTrue(self.check_changes(changes.changes, expected_changes))
-
-    def test_modify_file(self):
-        self.eden_repo.write_file("test_file", "", add=False)
-        if sys.platform == "win32":
-            # Wait for eden to get the PrjFS notification
-            time.sleep(1)
-        position = self.client.getCurrentJournalPosition(self.mount_path_bytes)
-        self.eden_repo.write_file("test_file", "contents", add=False)
-        if sys.platform == "win32":
-            # Wait for eden to get the PrjFS notification
-            time.sleep(1)
-        changes = self.getChangesSinceV2(position=position)
-        expected_changes = [
-            buildSmallChange(
-                SmallChangeNotification.MODIFIED, Dtype.REGULAR, path=b"test_file"
-            ),
-        ]
         self.assertTrue(self.check_changes(changes.changes, expected_changes))
 
     def test_rename_file(self):
-        self.eden_repo.write_file("test_file", "", add=False)
-        if sys.platform == "win32":
-            # Wait for eden to get the PrjFS notification
-            time.sleep(1)
-        position = self.client.getCurrentJournalPosition(self.mount_path_bytes)
-        self.rename("test_file", "best_file")
-        if sys.platform == "win32":
-            # Wait for eden to get the PrjFS notification
-            time.sleep(1)
-        changes = self.getChangesSinceV2(position=position)
+        changes = self.setup_test_rename_file()
         expected_changes = [
             buildSmallChange(
                 SmallChangeNotification.RENAMED,
@@ -209,19 +386,8 @@ class ChangesTest(testcase.EdenRepoTest):
                 to_path=b"best_file",
             ),
         ]
-        if sys.platform == "win32":
-            # No renames on windows, the files are added/removed
-            expected_changes = [
-                buildSmallChange(
-                    SmallChangeNotification.REMOVED, Dtype.REGULAR, path=b"test_file"
-                ),
-                buildSmallChange(
-                    SmallChangeNotification.ADDED, Dtype.REGULAR, path=b"best_file"
-                ),
-            ]
         self.assertTrue(self.check_changes(changes.changes, expected_changes))
 
-    @unittest.skipIf(sys.platform == "win32", "PrjFS does not support replace")
     def test_replace_file(self):
         self.eden_repo.write_file("test_file", "test_contents", add=False)
         self.eden_repo.write_file("gone_file", "replaced_contents", add=False)
@@ -238,22 +404,48 @@ class ChangesTest(testcase.EdenRepoTest):
         ]
         self.assertTrue(self.check_changes(changes.changes, expected_changes))
 
-    def test_remove_file(self):
-        self.eden_repo.write_file("test_file", "", add=False)
-        if sys.platform == "win32":
-            # Wait for eden to get the PrjFS notification
-            time.sleep(1)
-        position = self.client.getCurrentJournalPosition(self.mount_path_bytes)
-        self.rm("test_file")
-        if sys.platform == "win32":
-            # Wait for eden to get the PrjFS notification
-            time.sleep(1)
-        changes = self.getChangesSinceV2(position=position)
+
+@testcase.eden_repo_test
+class ChangesTestWin(WindowsTestBase):
+    def setUp(self) -> None:
+        if sys.platform != "win32":
+            self.skipTest("Windows only test")
+        return super().setUp()
+
+    def test_add_file(self):
+        # In windows, the file is created and then modified in projfs, then eden gets
+        # a single ADDED notification
+        changes = self.setup_test_add_file()
         expected_changes = [
             buildSmallChange(
-                SmallChangeNotification.REMOVED,
+                SmallChangeNotification.ADDED, Dtype.REGULAR, path=b"test_file"
+            )
+        ]
+        self.assertTrue(self.check_changes(changes.changes, expected_changes))
+
+    def test_rename_file(self):
+        changes = self.setup_test_rename_file()
+        expected_changes = [
+            buildSmallChange(
+                SmallChangeNotification.RENAMED,
                 Dtype.REGULAR,
-                path=b"test_file",
+                from_path=b"test_file",
+                to_path=b"best_file",
+            ),
+        ]
+        expected_changes = [
+            buildSmallChange(
+                SmallChangeNotification.REMOVED, Dtype.REGULAR, path=b"test_file"
+            ),
+            buildSmallChange(
+                SmallChangeNotification.ADDED, Dtype.REGULAR, path=b"best_file"
             ),
         ]
         self.assertTrue(self.check_changes(changes.changes, expected_changes))
+
+    # Files cannot be replaced in windows
+    def test_replace_file(self):
+        self.repo_write_file("test_file", "test_contents", add=False)
+        self.repo_write_file("gone_file", "replaced_contents", add=False)
+        with self.assertRaises(FileExistsError):
+            self.rename("test_file", "gone_file")
