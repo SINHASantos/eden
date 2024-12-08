@@ -8,16 +8,18 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::sync::RwLock;
 
 use futures::Future;
 use once_cell::sync::Lazy;
 use once_cell::sync::OnceCell;
+use parking_lot::RwLock;
+
+#[cfg_attr(not(feature = "ods"), path = "dummy_ods.rs")]
+mod ods;
 
 pub struct Counter {
     name: &'static str,
-    inner: AtomicUsize,
-    registered: OnceCell<()>,
+    counter: OnceCell<(AtomicUsize, ods::Counter)>,
     gauge: bool,
 }
 
@@ -28,8 +30,7 @@ impl Counter {
         // Unfortunately we can't check name this here because of const restriction
         Self {
             name,
-            inner: AtomicUsize::new(0),
-            registered: OnceCell::new(),
+            counter: OnceCell::new(),
             gauge: false,
         }
     }
@@ -45,15 +46,19 @@ impl Counter {
     }
 
     pub fn add(&'static self, val: usize) {
-        self.inner().fetch_add(val, Ordering::Relaxed);
+        let (counter, ods) = self.counter();
+        counter.fetch_add(val, Ordering::Relaxed);
+        ods::increment(ods, val as i64);
     }
 
     pub fn sub(&'static self, val: usize) {
-        self.inner().fetch_sub(val, Ordering::Relaxed);
+        let (counter, ods) = self.counter();
+        counter.fetch_sub(val, Ordering::Relaxed);
+        ods::increment(ods, -(val as i64));
     }
 
     pub fn value(&'static self) -> usize {
-        self.inner().load(Ordering::Relaxed)
+        self.counter().0.load(Ordering::Relaxed)
     }
 
     /// Increment counter by v and decrement it back by v when returned guard is dropped
@@ -66,10 +71,11 @@ impl Counter {
         self.gauge
     }
 
-    fn inner(&'static self) -> &AtomicUsize {
-        self.registered
-            .get_or_init(|| Registry::global().register_counter(self));
-        &self.inner
+    fn counter(&'static self) -> &(AtomicUsize, ods::Counter) {
+        self.counter.get_or_init(|| {
+            Registry::global().register_counter(self);
+            (AtomicUsize::new(0), ods::new_counter(self.name))
+        })
     }
 }
 
@@ -103,7 +109,6 @@ impl Registry {
         if self
             .counters
             .write()
-            .unwrap()
             .insert(counter.name, counter)
             .is_some()
         {
@@ -112,12 +117,12 @@ impl Registry {
     }
 
     pub fn counters(&self) -> HashMap<&'static str, &'static Counter> {
-        self.counters.read().unwrap().clone()
+        self.counters.read().clone()
     }
 
     pub fn reset(&self) {
-        for counter in self.counters.read().unwrap().values() {
-            counter.inner().store(0, Ordering::Relaxed);
+        for counter in self.counters.read().values() {
+            counter.counter().0.store(0, Ordering::Relaxed);
         }
     }
 }
