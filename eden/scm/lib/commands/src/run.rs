@@ -214,6 +214,16 @@ fn dispatch_command(
     if let Some(repo) = dispatcher.repo() {
         tracing::info!(target: "symlink_info",
                        symlinks_enabled=cfg!(unix) || repo.requirements.contains("windowssymlinks"));
+        let _ = sampling::log!(
+            target: "repo_info",
+            repo_requirements = {
+                let reqs1 = repo.requirements.to_set();
+                let reqs2 = repo.store_requirements.to_set();
+                let mut reqs: Vec<String> = reqs1.into_iter().chain(reqs2.into_iter()).collect();
+                reqs.sort_unstable();
+                reqs
+            }
+        );
     }
 
     let run_logger =
@@ -890,7 +900,7 @@ fn log_metrics(io: &IO, config: &dyn Config) -> Result<()> {
             .counters()
             .into_iter()
             .filter_map(|(n, c)| {
-                if c.is_gauge() {
+                if c.is_gauge() || c.value() == 0 {
                     None
                 } else {
                     Some((n.to_string(), c.value() as u64))

@@ -113,10 +113,21 @@ export enum ArchivedReasonType {
   STALE_FILE_CHANGED = 'STALE_FILE_CHANGED',
 }
 
+export type CodeChange = {
+  oldContent?: string;
+  newContent?: string;
+  oldLineNumber?: number;
+  trimmedLineNumber?: number;
+  trimmedLength?: number;
+  adjustedLineNumber?: number;
+  patch?: ParsedDiff;
+};
+
 export type SuggestedChange = {
   id?: string;
   type?: SuggestedChangeType;
   codePatchSuggestionID?: string;
+  codePatchID?: string;
   status?: CodePatchSuggestionStatus;
   archivedState?: ArchivedStateType;
   archivedReason?: ArchivedReasonType;
@@ -124,9 +135,7 @@ export type SuggestedChange = {
   patch?: ParsedDiff;
   oldPath?: string;
   currentPath?: string;
-  oldContent?: string;
-  newContent?: string;
-  oldLineNumber?: number;
+  codeChange?: CodeChange[];
 };
 
 export type DiffComment = {
@@ -580,6 +589,7 @@ export type OperationProgress =
   | {id: string; kind: 'inlineProgress'; hash?: string; message?: string}
   | {id: string; kind: 'exit'; exitCode: number; timestamp: number}
   | {id: string; kind: 'error'; error: string}
+  | {id: string; kind: 'warning'; warning: string}
   // used by requestMissedOperationProgress, client thinks this operation is running but server no longer knows about it.
   | {id: string; kind: 'forgot'};
 
@@ -598,6 +608,7 @@ export type OperationCommandProgressReporter = (
     // null message -> clear inline progress for this hash. Null hash -> apply to all affected hashes (set message or clear)
     | [type: 'inlineProgress', hash?: string, message?: string]
     | ['progress', ProgressStep]
+    | ['warning', string]
     | ['exit', number]
 ) => void;
 

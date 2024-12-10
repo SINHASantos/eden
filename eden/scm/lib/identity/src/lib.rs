@@ -19,6 +19,7 @@ use anyhow::Error;
 use anyhow::Result;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
+pub mod dotgit;
 
 #[derive(PartialEq, Debug, Clone, Copy)]
 pub struct Identity {
@@ -100,6 +101,9 @@ struct RepoIdentity {
     /// This is useful to avoid potential risks that (potentially used in automation)
     /// that "hg root" succeeding in a `.git` repo.
     sniff_initial_cli_names: Option<&'static str>,
+
+    /// Function. Turn (working_copy_root, dot_dir) to full_dot_dir.
+    resolve_dot_dir_func: fn(&Path, &'static str) -> PathBuf,
 }
 
 impl Identity {
@@ -115,8 +119,20 @@ impl Identity {
         self.user.long_product_name
     }
 
+    /// Obtain the static ".hg" or ".sl", or ".git/sl" directory name.
+    ///
+    /// Note: In complex cases (ex. dotgit + submodule) the full dot_dir is not
+    /// as simple as `repo_root.join(dot_dir)`. Use `resolve_dot_dir` instead.
     pub fn dot_dir(&self) -> &'static str {
         self.repo.dot_dir
+    }
+
+    /// Obtain the full ".hg" or ".sl", or ".git/sl" path, given the working
+    /// copy root. This function handles complexity like dotgit and submodules.
+    ///
+    /// `root` is the "repo root" that matches `sl root` output.
+    pub fn resolve_full_dot_dir(&self, root: &Path) -> PathBuf {
+        (self.repo.resolve_dot_dir_func)(root, self.repo.dot_dir)
     }
 
     pub fn config_repo_file(&self) -> &'static str {
@@ -285,6 +301,10 @@ impl Identity {
     }
 }
 
+fn default_resolve_dot_dir_func(root: &Path, dot_dir: &'static str) -> PathBuf {
+    root.join(dot_dir)
+}
+
 /// Split the HGRCPATH. Return items matching at least one of the given prefix.
 ///
 /// `;` can be used as the separator on all platforms.
@@ -370,6 +390,7 @@ const HG: Identity = Identity {
         sniff_dot_dir_required_files: &["requires"],
         sniff_root_priority: 0,
         sniff_initial_cli_names: None,
+        resolve_dot_dir_func: default_resolve_dot_dir_func,
     },
 };
 
@@ -397,6 +418,7 @@ const SL: Identity = Identity {
         sniff_dot_dir_required_files: &["requires"],
         sniff_root_priority: 0,
         sniff_initial_cli_names: None,
+        resolve_dot_dir_func: default_resolve_dot_dir_func,
     },
 };
 
@@ -408,6 +430,7 @@ const SL_GIT: Identity = Identity {
         sniff_dot_dir_required_files: &[],
         sniff_root_priority: 10, // lowest
         sniff_initial_cli_names: Some("sl"),
+        resolve_dot_dir_func: dotgit::resolve_dot_dir_func,
         ..*SL.repo
     },
     ..SL
@@ -435,6 +458,7 @@ const TEST: Identity = Identity {
         sniff_dot_dir_required_files: &[],
         sniff_root_priority: 5,
         sniff_initial_cli_names: None,
+        resolve_dot_dir_func: default_resolve_dot_dir_func,
     },
 };
 
@@ -951,6 +975,27 @@ mod test {
         // sniff_root should ignore a/b/.sl (no "requires") and use a/.sl (has "requires").
         let sniffed_path = sniff_root(&dir_a_b)?.unwrap().0;
         assert_eq!(sniffed_path, dir_a);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_dotgit_submodule() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let dir = dir.path();
+
+        let git_module_dir = dir.join(".git").join("modules").join("sub1");
+        fs::create_dir_all(&git_module_dir)?;
+
+        let submodule_dir = dir.join("sub1");
+        fs::create_dir_all(&submodule_dir)?;
+        fs::write(submodule_dir.join(".git"), "gitdir: ../.git/modules/sub1")?;
+
+        let id = sniff_dir(dir)?.unwrap();
+        assert_eq!(id.repo, SL_GIT.repo);
+
+        let full_dot_dir = id.resolve_full_dot_dir(&submodule_dir);
+        assert_eq!(full_dot_dir, git_module_dir.join("sl"));
 
         Ok(())
     }
