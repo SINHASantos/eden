@@ -83,6 +83,33 @@ test subtree merge from copy dest -> copy source
    bbb
   +dest
 
+test subtree merge from copy dest -> copy source, with new file in copy dest
+  $ newclientrepo
+  $ drawdag <<'EOS'
+  > B   # B/foo/y = bbb\n
+  > |
+  > A   # A/foo/x = aaa\n
+  >     # drawdag.defaultfiles=false
+  > EOS
+  $ hg go -q $B
+  $ hg subtree copy --from-path foo --to-path foo2
+  copying foo to foo2
+  $ echo 1 >> foo2/new
+  $ hg ci -Aqm "add foo2/new"
+  $ hg subtree merge --from-path foo2 --to-path foo
+  merge base: 9998a5c40732
+  1 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  (subtree merge, don't forget to commit)
+  $ hg st
+  M foo/new
+  $ hg diff
+  diff --git a/foo/new b/foo/new
+  new file mode 100644
+  --- /dev/null
+  +++ b/foo/new
+  @@ -0,0 +1,1 @@
+  +1
+
 test subtree merge from copy dest -> copy source with conflicts
   $ newclientrepo
   $ drawdag <<'EOS'

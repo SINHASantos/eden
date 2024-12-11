@@ -395,7 +395,7 @@ class HgRepo(Repo):
         self._hg_binary = os.environ.get("EDEN_HG_BINARY", "hg")
 
     def __repr__(self) -> str:
-        return f"HgRepo(source={self.source!r}, " f"working_dir={self.working_dir!r})"
+        return f"HgRepo(source={self.source!r}, working_dir={self.working_dir!r})"
 
     # pyre-fixme[2]: Parameter must be annotated.
     def _run_hg(self, args: List[str], stderr_output=None) -> bytes:
@@ -420,7 +420,7 @@ class GitRepo(Repo):
         super(GitRepo, self).__init__("git", source, working_dir)
 
     def __repr__(self) -> str:
-        return f"GitRepo(source={self.source!r}, " f"working_dir={self.working_dir!r})"
+        return f"GitRepo(source={self.source!r}, working_dir={self.working_dir!r})"
 
     def _run_git(self, args: List[str]) -> bytes:
         cmd = ["git"] + args
@@ -809,21 +809,25 @@ class Spinner:
 
 
 # pyre-fixme[3]: Return type must be annotated.
-# pyre-fixme[24]: Generic type `Callable` expects 2 type parameters.
-def hook_recursive_with_spinner(function: Callable, spinner: Spinner):
+def hook_recursive_with_spinner(
+    function: Callable,  # pyre-fixme[24]: Generic type `Callable` expects 2 type parameters.
+    spinner: Spinner,
+    args_parser: Callable,  # pyre-fixme[24]: Generic type `Callable` expects 2 type parameters.
+):
     """
     hook_recursive_with_spinner
     Hook a recursive function updating a spinner at every recursion step
     Params:
     - function: the recursive function to hook
     - spinner: Spinner supporting text arguments
+    - args_parser: a callable to extract printable information from args
     """
 
     @functools.wraps(function)
     # pyre-fixme[3]: Return type must be annotated.
     # pyre-fixme[2]: Parameter must be annotated.
     def run(*args, **kwargs):
-        spinner.spin(args[0])
+        spinner.spin(args_parser(args))
         return function(*args, **kwargs)
 
     return run

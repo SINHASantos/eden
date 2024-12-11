@@ -5,6 +5,7 @@
  * GNU General Public License version 2.
  */
 
+use anyhow::Error;
 use anyhow::Result;
 use async_requests::types::AsynchronousRequestResult;
 use async_requests::RequestId;
@@ -13,8 +14,19 @@ use context::CoreContext;
 use futures_stats::FutureStats;
 use slog::info;
 use source_control::AsyncRequestError;
+use stats::define_stats;
+use stats::prelude::*;
 
 use crate::worker::AsyncMethodRequestWorker;
+
+define_stats! {
+    prefix = "async_requests.worker.process";
+
+    process_complete_failed: timeseries("complete.failed"; Count),
+    process_retriable_error: timeseries("retriable.error"; Count),
+    process_succeeded: timeseries("succeeded"; Count),
+    process_error: timeseries("error"; Count),
+}
 
 impl AsyncMethodRequestWorker {
     pub(crate) fn prepare_ctx(
@@ -48,31 +60,41 @@ pub(crate) fn log_start(ctx: &CoreContext) {
     scuba.log_with_msg("Request start", None);
 }
 
+/// Log the result of a request: either a success or a final error. Retriable errors (i.e. where the worker
+/// internally failed and will retry) are logged separately.
 pub(crate) fn log_result(
     ctx: CoreContext,
-    tag: &'static str,
     stats: &FutureStats,
-    result: &Result<AsynchronousRequestResult>,
+    result: &AsynchronousRequestResult,
+    complete_result: &Result<bool>,
 ) {
     let mut scuba = ctx.scuba().clone();
 
-    let (status, error) = match result {
-        Ok(response) => match response.thrift() {
-            ThriftAsynchronousRequestResult::error(error) => match error {
-                AsyncRequestError::request_error(error) => {
-                    ("REQUEST_ERROR", Some(format!("{:?}", error)))
-                }
-                AsyncRequestError::internal_error(error) => {
-                    ("INTERNAL_ERROR", Some(format!("{:?}", error)))
-                }
-                AsyncRequestError::UnknownField(error) => {
-                    ("UNKNOWN_ERROR", Some(format!("unknown error: {:?}", error)))
-                }
-            },
-            _ => ("SUCCESS", None),
+    let (status, error, succeeded, complete_failed, method_error) = match result.thrift() {
+        ThriftAsynchronousRequestResult::error(error) => match error {
+            AsyncRequestError::request_error(error) => {
+                ("REQUEST_ERROR", Some(format!("{:?}", error)), 0, 0, 1)
+            }
+            AsyncRequestError::internal_error(error) => {
+                ("INTERNAL_ERROR", Some(format!("{:?}", error)), 0, 0, 1)
+            }
+            AsyncRequestError::UnknownField(error) => (
+                "UNKNOWN_ERROR",
+                Some(format!("unknown error: {:?}", error)),
+                0,
+                0,
+                1,
+            ),
         },
-        Err(err) => ("POLL_ERROR", Some(err.to_string())),
+        _ => match complete_result {
+            Ok(_complete) => ("SUCCESS", None, 1, 0, 0),
+            Err(err) => ("SAVE_ERROR", Some(err.to_string()), 0, 1, 0),
+        },
     };
+
+    STATS::process_succeeded.add_value(succeeded);
+    STATS::process_complete_failed.add_value(complete_failed);
+    STATS::process_error.add_value(method_error);
 
     scuba.add_future_stats(stats);
     scuba.add("status", status);
@@ -81,5 +103,19 @@ pub(crate) fn log_result(
         scuba.unsampled();
         scuba.add("error", error.as_str());
     }
-    scuba.log_with_msg(tag, None);
+    scuba.log_with_msg("Request complete", None);
+}
+
+/// Log a retriable error, i.e. one that failed because of internal worker issues and will be retried.
+pub(crate) fn log_retriable_error(ctx: CoreContext, stats: &FutureStats, error: Error) {
+    let mut scuba = ctx.scuba().clone();
+
+    STATS::process_retriable_error.add_value(1);
+
+    scuba.add_future_stats(stats);
+    scuba.add("status", "RETRIABLE_ERROR");
+    scuba.unsampled();
+    scuba.add("error", format!("{:?}", error));
+
+    scuba.log_with_msg("Request complete", None);
 }

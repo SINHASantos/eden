@@ -50,3 +50,14 @@ Status from submodule:
   $ touch c
   $ sl status
   ? c
+
+Committing from submodule:
+
+  $ sl add c
+  $ sl commit -m c
+
+Checking out from submodule:
+
+  $ sl prev
+  update complete
+  [7e03c5] Add a

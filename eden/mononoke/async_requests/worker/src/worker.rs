@@ -21,6 +21,7 @@ use std::time::Duration;
 use anyhow::Error;
 use anyhow::Result;
 use async_requests::types::AsynchronousRequestParams;
+use async_requests::types::RequestStatus;
 use async_requests::AsyncMethodRequestQueue;
 use async_requests::AsyncRequestsError;
 use async_requests::ClaimedBy;
@@ -52,6 +53,7 @@ use stats::prelude::*;
 
 use crate::methods::megarepo_async_request_compute;
 use crate::scuba::log_result;
+use crate::scuba::log_retriable_error;
 use crate::scuba::log_start;
 use crate::AsyncRequestsWorkerArgs;
 
@@ -61,6 +63,12 @@ const DEQUEUE_STREAM_SLEEP_TIME: u64 = 1000;
 const ABANDONED_REQUEST_THRESHOLD_SECS: i64 = 5 * 60;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const STATS_LOOP_INTERNAL: Duration = Duration::from_secs(5 * 60);
+const STATUSES: [RequestStatus; 4] = [
+    RequestStatus::New,
+    RequestStatus::InProgress,
+    RequestStatus::Ready,
+    RequestStatus::Polled,
+];
 
 define_stats! {
     prefix = "async_requests.worker";
@@ -68,9 +76,7 @@ define_stats! {
     cleanup_error: timeseries("cleanup.error"; Count),
     dequeue_error: timeseries("dequeue.error"; Count),
     process_aborted: timeseries("process.aborted"; Count),
-    process_complete_failed: timeseries("process.complete.failed"; Count),
     process_failed: timeseries("process.failed"; Count),
-    process_succeeded: timeseries("process.succeeded"; Count),
     requested: timeseries("requested"; Count),
 
     stats_error: timeseries("stats.error"; Count),
@@ -329,13 +335,16 @@ impl AsyncMethodRequestWorker {
                     &req_id.0,
                     result.is_ok()
                 );
-                log_result(ctx.clone(), "Request complete", &stats, &result);
 
                 // Save the result.
                 match result {
                     Ok(work_result) => {
-                        STATS::process_succeeded.add_value(1);
-                        match self.queue.complete(&ctx, &req_id, work_result).await {
+                        let complete_result = self
+                            .queue
+                            .complete(&ctx, &req_id, work_result.clone())
+                            .await;
+                        log_result(ctx.clone(), &stats, &work_result, &complete_result);
+                        match complete_result {
                             Ok(updated) => {
                                 info!(
                                     ctx.logger(),
@@ -343,7 +352,6 @@ impl AsyncMethodRequestWorker {
                                 );
                             }
                             Err(err) => {
-                                STATS::process_complete_failed.add_value(1);
                                 error!(
                                     ctx.logger(),
                                     "[{}] failed to save result: {:?}", &req_id.0, err
@@ -352,13 +360,13 @@ impl AsyncMethodRequestWorker {
                         };
                     }
                     Err(err) => {
-                        STATS::process_failed.add_value(1);
                         info!(
                             ctx.logger(),
                             "[{}] worker failed to process request, will retry: {:?}",
                             &req_id.0,
                             err
                         );
+                        log_retriable_error(ctx.clone(), &stats, err);
                     }
                 }
             }
@@ -420,14 +428,15 @@ impl AsyncMethodRequestWorker {
             let res = queue.get_queue_stats(ctx).await;
             match res {
                 Ok(res) => {
-                    for (status, count) in res.queue_length_by_status.iter() {
+                    for status in STATUSES {
+                        let count = res.queue_length_by_status.get(&status).unwrap_or(&0);
                         STATS::queue_length_by_status.set_value(
                             ctx.fb,
                             *count as i64,
                             (status.to_string(),),
                         );
-                    }
-                    for (status, ts) in res.queue_age_by_status.iter() {
+
+                        let ts = res.queue_age_by_status.get(&status).unwrap_or(&now);
                         let diff = now.timestamp_seconds() - ts.timestamp_seconds();
                         STATS::queue_age_by_status.set_value(ctx.fb, diff, (status.to_string(),));
                     }
