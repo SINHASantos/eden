@@ -93,6 +93,7 @@ pub enum SaplingRemoteApiMethod {
     AlterSnapshot,
     Blame,
     Bookmarks,
+    Bookmarks2,
     Capabilities,
     CloudHistoricalVersions,
     CloudReferences,
@@ -128,6 +129,7 @@ pub enum SaplingRemoteApiMethod {
     UploadFile,
     UploadHgChangesets,
     UploadHgFilenodes,
+    UploadIdenticalChangesets,
     UploadTrees,
 }
 
@@ -137,6 +139,7 @@ impl fmt::Display for SaplingRemoteApiMethod {
             Self::AlterSnapshot => "alter_snapshot",
             Self::Blame => "blame",
             Self::Bookmarks => "bookmarks",
+            Self::Bookmarks2 => "bookmarks2",
             Self::Capabilities => "capabilities",
             Self::CloudHistoricalVersions => "cloud_historical_versions",
             Self::CloudReferences => "cloud_references",
@@ -172,6 +175,7 @@ impl fmt::Display for SaplingRemoteApiMethod {
             Self::UploadFile => "upload_file",
             Self::UploadHgChangesets => "upload_hg_changesets",
             Self::UploadHgFilenodes => "upload_filenodes",
+            Self::UploadIdenticalChangesets => "upload_identical_changesets",
             Self::UploadTrees => "upload_trees",
         };
         write!(f, "{}", name)
@@ -470,6 +474,7 @@ pub fn build_router<R: Send + Sync + Clone + 'static>(ctx: ServerContext<R>) -> 
         Handlers::setup::<blame::BlameHandler>(route);
         Handlers::setup::<bookmarks::BookmarksHandler>(route);
         Handlers::setup::<bookmarks::SetBookmarkHandler>(route);
+        Handlers::setup::<bookmarks::Bookmarks2Handler>(route);
         Handlers::setup::<commit_cloud::CommitCloudHistoricalVersions>(route);
         Handlers::setup::<commit_cloud::CommitCloudReferences>(route);
         Handlers::setup::<commit_cloud::CommitCloudRenameWorkspace>(route);
@@ -492,6 +497,7 @@ pub fn build_router<R: Send + Sync + Clone + 'static>(ctx: ServerContext<R>) -> 
         Handlers::setup::<commit::LocationToHashHandler>(route);
         Handlers::setup::<commit::UploadBonsaiChangesetHandler>(route);
         Handlers::setup::<commit::UploadHgChangesetsHandler>(route);
+        Handlers::setup::<commit::UploadIdenticalChangesetsHandler>(route);
         Handlers::setup::<files::DownloadFileHandler>(route);
         Handlers::setup::<files::Files2Handler>(route);
         Handlers::setup::<files::UploadHgFilenodesHandler>(route);

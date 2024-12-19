@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use cloned::cloned;
 use context::CoreContext;
 use futures::pin_mut;
 use futures::stream;
@@ -19,6 +20,7 @@ use futures::stream::FuturesOrdered;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
 use futures::try_join;
+use futures_watchdog::WatchdogExt;
 use hooks::HookExecution;
 use hooks::HookOutcome;
 use itertools::Either;
@@ -180,12 +182,13 @@ impl CommitFileDiffsItem {
 
     async fn response_element(
         &self,
+        ctx: &CoreContext,
         format: thrift::DiffFormat,
         context_lines: usize,
     ) -> Result<CommitFileDiffsResponseElement, scs_errors::ServiceError> {
         match format {
-            thrift::DiffFormat::RAW_DIFF => self.raw_diff(context_lines).await,
-            thrift::DiffFormat::METADATA_DIFF => self.metadata_diff().await,
+            thrift::DiffFormat::RAW_DIFF => self.raw_diff(ctx, context_lines).await,
+            thrift::DiffFormat::METADATA_DIFF => self.metadata_diff(ctx).await,
             unknown => Err(scs_errors::invalid_request(format!(
                 "invalid diff format: {:?}",
                 unknown
@@ -196,6 +199,7 @@ impl CommitFileDiffsItem {
 
     async fn raw_diff(
         &self,
+        ctx: &CoreContext,
         context_lines: usize,
     ) -> Result<CommitFileDiffsResponseElement, scs_errors::ServiceError> {
         let mode = if self.placeholder {
@@ -205,15 +209,16 @@ impl CommitFileDiffsItem {
         };
         let diff = self
             .path_diff_context
-            .unified_diff(context_lines, mode)
+            .unified_diff(ctx, context_lines, mode)
             .await?;
         Ok(CommitFileDiffsResponseElement::RawDiff { diff })
     }
 
     async fn metadata_diff(
         &self,
+        ctx: &CoreContext,
     ) -> Result<CommitFileDiffsResponseElement, scs_errors::ServiceError> {
-        let metadata_diff = self.path_diff_context.metadata_diff().await?;
+        let metadata_diff = self.path_diff_context.metadata_diff(ctx).await?;
         Ok(CommitFileDiffsResponseElement::MetadataDiff { metadata_diff })
     }
 }
@@ -264,13 +269,21 @@ impl SourceControlServiceImpl {
         params: thrift::CommitCommonBaseWithParams,
     ) -> Result<thrift::CommitLookupResponse, scs_errors::ServiceError> {
         let (_repo, changeset, other_changeset) = self
-            .repo_changeset_pair(ctx, &commit, &params.other_commit_id)
+            .repo_changeset_pair(ctx.clone(), &commit, &params.other_commit_id)
+            .watched(ctx.logger())
             .await?;
-        let lca = changeset.common_base_with(other_changeset.id()).await?;
+        let lca = changeset
+            .common_base_with(other_changeset.id())
+            .watched(ctx.logger())
+            .await?;
         Ok(thrift::CommitLookupResponse {
             exists: lca.is_some(),
             ids: if let Some(lca) = lca {
-                Some(map_commit_identity(&lca, &params.identity_schemes).await?)
+                Some(
+                    map_commit_identity(&lca, &params.identity_schemes)
+                        .watched(ctx.logger())
+                        .await?,
+                )
             } else {
                 None
             },
@@ -322,12 +335,12 @@ impl SourceControlServiceImpl {
         let (base_commit, other_commit) = match params.other_commit_id {
             Some(other_commit_id) => {
                 let (_repo, base_commit, other_commit) = self
-                    .repo_changeset_pair(ctx, &commit, &other_commit_id)
+                    .repo_changeset_pair(ctx.clone(), &commit, &other_commit_id)
                     .await?;
                 (base_commit, Some(other_commit))
             }
             None => {
-                let (_repo, base_commit) = self.repo_changeset(ctx, &commit).await?;
+                let (_repo, base_commit) = self.repo_changeset(ctx.clone(), &commit).await?;
                 (base_commit, None)
             }
         };
@@ -467,9 +480,12 @@ impl SourceControlServiceImpl {
         let mut stopped_at_pair = None;
 
         let path_diffs = stream::iter(items)
-            .map(|item| async move {
-                let element = item.response_element(params.format, context).await?;
-                Ok::<_, scs_errors::ServiceError>((item, element))
+            .map(|item| {
+                cloned!(ctx);
+                async move {
+                    let element = item.response_element(&ctx, params.format, context).await?;
+                    Ok::<_, scs_errors::ServiceError>((item, element))
+                }
             })
             .boxed() // Prevents compiler error
             .buffered(20)
@@ -583,16 +599,26 @@ impl SourceControlServiceImpl {
     ) -> Result<thrift::CommitCompareResponse, scs_errors::ServiceError> {
         let (base_changeset, other_changeset) = match &params.other_commit_id {
             Some(id) => {
-                let (_repo, mut base_changeset, other_changeset) =
-                    self.repo_changeset_pair(ctx.clone(), &commit, id).await?;
-                add_mutable_renames(&mut base_changeset, &params).await?;
+                let (_repo, mut base_changeset, other_changeset) = self
+                    .repo_changeset_pair(ctx.clone(), &commit, id)
+                    .watched(ctx.logger())
+                    .await?;
+                add_mutable_renames(&mut base_changeset, &params)
+                    .watched(ctx.logger())
+                    .await?;
                 (base_changeset, Some(other_changeset))
             }
             None => {
-                let (repo, mut base_changeset) = self.repo_changeset(ctx.clone(), &commit).await?;
-                add_mutable_renames(&mut base_changeset, &params).await?;
+                let (repo, mut base_changeset) = self
+                    .repo_changeset(ctx.clone(), &commit)
+                    .watched(ctx.logger())
+                    .await?;
+                add_mutable_renames(&mut base_changeset, &params)
+                    .watched(ctx.logger())
+                    .await?;
                 let other_changeset = self
                     .find_commit_compare_parent(&repo, &mut base_changeset, &params)
+                    .watched(ctx.logger())
                     .await?;
                 (base_changeset, other_changeset)
             }
@@ -600,9 +626,13 @@ impl SourceControlServiceImpl {
 
         // Log the generation difference to drill down on clients making
         // expensive `commit_compare` requests
-        let base_generation = base_changeset.generation().await?.value();
+        let base_generation = base_changeset
+            .generation()
+            .watched(ctx.logger())
+            .await?
+            .value();
         let other_generation = match other_changeset {
-            Some(ref cs) => cs.generation().await?.value(),
+            Some(ref cs) => cs.generation().watched(ctx.logger()).await?.value(),
             // If there isn't another commit, let's use the same generation
             // to have a difference of 0.
             None => base_generation,
@@ -651,11 +681,13 @@ impl SourceControlServiceImpl {
                                 paths,
                                 diff_items,
                             )
+                            .watched(ctx.logger())
                             .await?
                     }
                     None => {
                         base_changeset
                             .diff_root_unordered(paths, diff_items)
+                            .watched(ctx.logger())
                             .await?
                     }
                 };
@@ -663,6 +695,7 @@ impl SourceControlServiceImpl {
                     .map(CommitComparePath::from_path_diff)
                     .buffer_unordered(CONCURRENCY_LIMIT)
                     .try_collect::<Vec<_>>()
+                    .watched(ctx.logger())
                     .await?
                     .into_iter()
                     .partition_map(|diff| match diff {
@@ -698,6 +731,7 @@ impl SourceControlServiceImpl {
                                 ChangesetFileOrdering::Ordered { after },
                                 Some(limit),
                             )
+                            .watched(ctx.logger())
                             .await?
                     }
                     None => {
@@ -708,6 +742,7 @@ impl SourceControlServiceImpl {
                                 ChangesetFileOrdering::Ordered { after },
                                 Some(limit),
                             )
+                            .watched(ctx.logger())
                             .await?
                     }
                 };
@@ -716,6 +751,7 @@ impl SourceControlServiceImpl {
                     .map(CommitComparePath::from_path_diff)
                     .collect::<FuturesOrdered<_>>()
                     .try_collect::<Vec<_>>()
+                    .watched(ctx.logger())
                     .await?;
                 if diff_items.len() >= limit {
                     if let Some(item) = diff_items.last() {
@@ -731,9 +767,11 @@ impl SourceControlServiceImpl {
 
         let other_commit_ids = match other_changeset {
             None => None,
-            Some(other_changeset) => {
-                Some(map_commit_identity(&other_changeset, &params.identity_schemes).await?)
-            }
+            Some(other_changeset) => Some(
+                map_commit_identity(&other_changeset, &params.identity_schemes)
+                    .watched(ctx.logger())
+                    .await?,
+            ),
         };
         Ok(thrift::CommitCompareResponse {
             diff_files,

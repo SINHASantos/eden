@@ -338,17 +338,26 @@ function mononoke_hg_sync_loop_regenerate {
 }
 
 function mononoke_modern_sync {
-  START_ID="$1"
+  COMMAND="$1"
+  ORIG_REPO="$2"
+  DEST_REPO="$3"
+  shift
+  shift
   shift
 
   GLOG_minloglevel=5 "$MONONOKE_MODERN_SYNC" \
     "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
-    --repo-id "$REPOID" \
+    --repo-name "$ORIG_REPO" \
+    --dest-repo-name "$DEST_REPO" \
+    --update-counters \
     --mononoke-config-path "$TESTTMP/mononoke-config" \
     --dest-socket $MONONOKE_SOCKET \
+    --tls-ca "$TEST_CERTDIR/root-ca.crt" \
+    --tls-private-key "$TEST_CERTDIR/localhost.key" \
+    --tls-certificate "$TEST_CERTDIR/localhost.crt" \
     --scuba-log-file "$TESTTMP/modern_sync_scuba_logs" \
-    sync-once --start-id "$START_ID"
+    "$COMMAND" "$@"
 }
 
 function mononoke_admin {
@@ -1841,4 +1850,8 @@ function wait_for_bookmark_move_to_commit {
   echo "bookmark didn't move to commit $commit_title" >&2
   exit 1
 
+}
+
+function fb303-status() {
+  $FB303_STATUS "$@"
 }

@@ -32,6 +32,7 @@ use edenapi_types::BlameResult;
 use edenapi_types::BonsaiChangesetContent;
 use edenapi_types::BookmarkEntry;
 use edenapi_types::BookmarkRequest;
+use edenapi_types::BookmarkResult;
 use edenapi_types::CloudShareWorkspaceRequest;
 use edenapi_types::CloudShareWorkspaceResponse;
 use edenapi_types::CloudWorkspaceRequest;
@@ -73,6 +74,7 @@ use edenapi_types::HistoricalVersionsResponse;
 use edenapi_types::HistoryEntry;
 use edenapi_types::HistoryRequest;
 use edenapi_types::HistoryResponseChunk;
+use edenapi_types::IdenticalChangesetContent;
 use edenapi_types::IndexableId;
 use edenapi_types::LandStackRequest;
 use edenapi_types::LandStackResponse;
@@ -103,6 +105,7 @@ use edenapi_types::UploadBonsaiChangesetRequest;
 use edenapi_types::UploadHgChangeset;
 use edenapi_types::UploadHgChangesetsRequest;
 use edenapi_types::UploadHgFilenodeRequest;
+use edenapi_types::UploadIdenticalChangesetsRequest;
 use edenapi_types::UploadToken;
 use edenapi_types::UploadTokenMetadata;
 use edenapi_types::UploadTokensResponse;
@@ -161,6 +164,7 @@ mod paths {
     pub const ALTER_SNAPSHOT: &str = "snapshot/alter";
     pub const BLAME: &str = "blame";
     pub const BOOKMARKS: &str = "bookmarks";
+    pub const BOOKMARKS2: &str = "bookmarks2";
     pub const CLOUD_HISTORICAL_VERSIONS: &str = "cloud/historical_versions";
     pub const CLOUD_REFERENCES: &str = "cloud/references";
     pub const CLOUD_RENAME_WORKSPACE: &str = "cloud/rename_workspace";
@@ -195,6 +199,7 @@ mod paths {
     pub const UPLOAD_CHANGESETS: &str = "upload/changesets";
     pub const UPLOAD_FILENODES: &str = "upload/filenodes";
     pub const UPLOAD_TREES: &str = "upload/trees";
+    pub const UPLOAD_IDENTICAL_CHANGESET: &str = "upload/changesets/identical";
     pub const UPLOAD: &str = "upload/";
 }
 
@@ -678,6 +683,34 @@ impl Client {
             mutations,
         }
         .to_wire();
+
+        // Currently, server sends the "upload_changesets" response once it is fully completed,
+        // disable min speed transfer check to avoid premature termination of requests.
+        let request = self
+            .configure_request(self.inner.client.post(url))?
+            .min_transfer_speed(None)
+            .cbor(&req)
+            .map_err(SaplingRemoteApiError::RequestSerializationFailed)?;
+
+        self.fetch::<UploadTokensResponse>(vec![request])
+    }
+
+    // the request isn't batched, batching should be done outside if needed
+    async fn upload_identical_changesets_attempt(
+        &self,
+        changesets: Vec<IdenticalChangesetContent>,
+    ) -> Result<Response<UploadTokensResponse>, SaplingRemoteApiError> {
+        tracing::info!(
+            "Requesting identical changesets upload for {} item(s)",
+            changesets.len(),
+        );
+
+        if changesets.is_empty() {
+            return Ok(Response::empty());
+        }
+
+        let url = self.build_url(paths::UPLOAD_IDENTICAL_CHANGESET)?;
+        let req = UploadIdenticalChangesetsRequest { changesets }.to_wire();
 
         // Currently, server sends the "upload_changesets" response once it is fully completed,
         // disable min speed transfer check to avoid premature termination of requests.
@@ -1435,6 +1468,38 @@ impl SaplingRemoteApi for Client {
         Ok(response)
     }
 
+    async fn bookmarks2(
+        &self,
+        bookmarks: Vec<String>,
+    ) -> Result<Vec<BookmarkResult>, SaplingRemoteApiError> {
+        let request_len = bookmarks.len();
+        tracing::info!(
+            "Requesting {} bookmarks through bookmarks2",
+            bookmarks.len()
+        );
+        let url = self.build_url(paths::BOOKMARKS2)?;
+        let bookmark_req = BookmarkRequest { bookmarks };
+        self.log_request(&bookmark_req, "bookmarks2");
+        let bookmarks_wire = bookmark_req.to_wire();
+        let req = self
+            .configure_request(self.inner.client.post(url))?
+            .cbor(&bookmarks_wire)
+            .map_err(SaplingRemoteApiError::RequestSerializationFailed)?;
+
+        let response = self
+            .fetch_vec_with_retry::<BookmarkResult>(vec![req])
+            .await?;
+        if response.len() != request_len {
+            let bookmarks = bookmarks_wire.bookmarks;
+            let message = format!(
+                "Requested bookmarks {:?} but only got {:?}.",
+                bookmarks, &response
+            );
+            return Err(SaplingRemoteApiError::IncompleteResponse(message));
+        }
+        Ok(response)
+    }
+
     async fn set_bookmark(
         &self,
         bookmark: String,
@@ -1758,6 +1823,17 @@ impl SaplingRemoteApi for Client {
     ) -> Result<Response<UploadTokensResponse>, SaplingRemoteApiError> {
         self.with_retry(|this| {
             this.upload_changesets_attempt(changesets.clone(), mutations.clone())
+                .boxed()
+        })
+        .await
+    }
+
+    async fn upload_identical_changesets(
+        &self,
+        changesets: Vec<IdenticalChangesetContent>,
+    ) -> Result<Response<UploadTokensResponse>, SaplingRemoteApiError> {
+        self.with_retry(|this| {
+            this.upload_identical_changesets_attempt(changesets.clone())
                 .boxed()
         })
         .await
