@@ -18,6 +18,7 @@ use edenapi_types::AnyId;
 use edenapi_types::BlameResult;
 use edenapi_types::BonsaiChangesetContent;
 use edenapi_types::BookmarkEntry;
+use edenapi_types::BookmarkResult;
 use edenapi_types::CloudShareWorkspaceRequest;
 use edenapi_types::CloudShareWorkspaceResponse;
 use edenapi_types::CommitGraphEntry;
@@ -45,6 +46,7 @@ use edenapi_types::HgMutationEntryContent;
 use edenapi_types::HistoricalVersionsParams;
 use edenapi_types::HistoricalVersionsResponse;
 use edenapi_types::HistoryEntry;
+use edenapi_types::IdenticalChangesetContent;
 use edenapi_types::LandStackResponse;
 use edenapi_types::LookupResponse;
 use edenapi_types::ReferencesDataResponse;
@@ -206,6 +208,14 @@ pub trait SaplingRemoteApi: Send + Sync + 'static {
         Err(SaplingRemoteApiError::NotSupported)
     }
 
+    async fn bookmarks2(
+        &self,
+        bookmarks: Vec<String>,
+    ) -> Result<Vec<BookmarkResult>, SaplingRemoteApiError> {
+        let _ = bookmarks;
+        Err(SaplingRemoteApiError::NotSupported)
+    }
+
     /// Create, delete, or move a bookmark
     ///
     /// Both `from` and `to` can be None, but not both:
@@ -290,6 +300,15 @@ pub trait SaplingRemoteApi: Send + Sync + 'static {
         mutations: Vec<HgMutationEntryContent>,
     ) -> Result<Response<UploadTokensResponse>, SaplingRemoteApiError> {
         let _ = (changesets, mutations);
+        Err(SaplingRemoteApiError::NotSupported)
+    }
+
+    /// Upload list of changesets with bonsai and hg info
+    async fn upload_identical_changesets(
+        &self,
+        changesets: Vec<IdenticalChangesetContent>,
+    ) -> Result<Response<UploadTokensResponse>, SaplingRemoteApiError> {
+        let _ = changesets;
         Err(SaplingRemoteApiError::NotSupported)
     }
 

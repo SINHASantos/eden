@@ -22,6 +22,7 @@ use edenapi_types::AlterSnapshotResponse;
 use edenapi_types::AnyFileContentId;
 use edenapi_types::AnyId;
 use edenapi_types::Batch;
+use edenapi_types::BonsaiChangesetContent;
 use edenapi_types::BonsaiFileChange;
 use edenapi_types::CommitGraphEntry;
 use edenapi_types::CommitGraphRequest;
@@ -46,8 +47,10 @@ use edenapi_types::EphemeralPrepareRequest;
 use edenapi_types::EphemeralPrepareResponse;
 use edenapi_types::FetchSnapshotRequest;
 use edenapi_types::FetchSnapshotResponse;
+use edenapi_types::HgChangesetContent;
 use edenapi_types::UploadBonsaiChangesetRequest;
 use edenapi_types::UploadHgChangesetsRequest;
+use edenapi_types::UploadIdenticalChangesetsRequest;
 use edenapi_types::UploadToken;
 use edenapi_types::UploadTokensResponse;
 use ephemeral_blobstore::BubbleId;
@@ -66,8 +69,10 @@ use gotham_ext::handler::SlapiCommitIdentityScheme;
 use gotham_ext::middleware::request_context::RequestContext;
 use gotham_ext::middleware::scuba::ScubaMiddlewareState;
 use gotham_ext::response::TryIntoResponse;
+use maplit::hashmap;
 use mercurial_types::HgChangesetId;
 use mercurial_types::HgNodeHash;
+use mononoke_api::CoreContext;
 use mononoke_api::CreateInfo;
 use mononoke_api::MononokeError;
 use mononoke_api::MononokeRepo;
@@ -82,7 +87,10 @@ use mononoke_types::ChangesetId;
 use mononoke_types::DateTime;
 use mononoke_types::FileChange;
 use mononoke_types::Globalrev;
+use rate_limiting::Metric;
+use rate_limiting::RateLimitStatus;
 use serde::Deserialize;
+use slog::debug;
 use types::HgId;
 use types::Parents;
 
@@ -95,7 +103,9 @@ use crate::context::ServerContext;
 use crate::errors::ErrorKind;
 use crate::handlers::git_objects::fetch_git_object;
 use crate::middleware::request_dumper::RequestDumper;
+use crate::utils::build_counter;
 use crate::utils::cbor_stream_filtered_errors;
+use crate::utils::counter_check_and_bump;
 use crate::utils::custom_cbor_stream;
 use crate::utils::get_repo;
 use crate::utils::parse_cbor_request;
@@ -104,12 +114,13 @@ use crate::utils::to_create_change;
 use crate::utils::to_hg_path;
 use crate::utils::to_mpath;
 use crate::utils::to_revlog_changeset;
-
 /// XXX: This number was chosen arbitrarily.
 const MAX_CONCURRENT_FETCHES_PER_REQUEST: usize = 100;
 const HASH_TO_LOCATION_BATCH_SIZE: usize = 100;
 
 const PHASES_CHECK_LIMIT: usize = 10;
+
+const COMMITS_PER_USER_RATE_LIMIT: &str = "commits_per_user";
 
 #[derive(Debug, Deserialize, StateData, StaticResponseExtender)]
 pub struct HashToLocationParams {
@@ -168,6 +179,62 @@ async fn translate_location<R: MononokeRepo>(
         hgids,
     };
     Ok(answer)
+}
+
+/// Ratelimit commit creation
+async fn ratelimit_commit_creation(ctx: CoreContext) -> Result<(), Error> {
+    let rate_limiter = match ctx.session().rate_limiter() {
+        Some(rate_limiter) => rate_limiter,
+        None => {
+            debug!(ctx.logger(), "No rate_limiter info found");
+            return Ok(());
+        }
+    };
+    let category = rate_limiter.category();
+    let limit = match rate_limiter.find_rate_limit(Metric::CommitsPerUser) {
+        Some(limit) => limit,
+        None => {
+            debug!(ctx.logger(), "No commits_per_user rate limit found");
+            return Ok(());
+        }
+    };
+
+    let enforced = match limit.body.raw_config.status {
+        RateLimitStatus::Disabled => return Ok(()),
+        RateLimitStatus::Tracked => false,
+        RateLimitStatus::Enforced => true,
+        _ => panic!("Invalid limit status: {:?}", limit.body.raw_config.status),
+    };
+    let max_value = limit.body.raw_config.limit;
+    let time_window = limit.body.window.as_secs() as u32;
+
+    let client_request_info = match ctx.client_request_info() {
+        Some(client_request_info) => client_request_info,
+        None => {
+            debug!(ctx.logger(), "No client request info found");
+            return Ok(());
+        }
+    };
+
+    let main_client_id = match &client_request_info.main_id {
+        Some(main_client_id) => main_client_id,
+        None => {
+            debug!(ctx.logger(), "No main client id found");
+            return Ok(());
+        }
+    };
+
+    let counter = build_counter(&ctx, category, COMMITS_PER_USER_RATE_LIMIT, main_client_id);
+    counter_check_and_bump(
+        &ctx,
+        counter,
+        COMMITS_PER_USER_RATE_LIMIT,
+        max_value,
+        time_window,
+        enforced,
+        hashmap! {"main_client_id" => main_client_id.as_str() },
+    )
+    .await
 }
 
 #[async_trait]
@@ -430,6 +497,12 @@ impl SaplingRemoteApiHandler for UploadHgChangesetsHandler {
     ) -> HandlerResult<'async_trait, Self::Response> {
         let repo = ectx.repo();
         let changesets = request.changesets;
+
+        let ctx = repo.ctx().clone();
+        ratelimit_commit_creation(ctx)
+            .await
+            .map_err(HttpError::e429)?;
+
         let mutations = request.mutations;
         let changesets_data = changesets
             .into_iter()
@@ -437,6 +510,7 @@ impl SaplingRemoteApiHandler for UploadHgChangesetsHandler {
                 Ok((
                     HgChangesetId::new(HgNodeHash::from(changeset.node_id)),
                     to_revlog_changeset(changeset.changeset_content)?,
+                    None,
                 ))
             })
             .collect::<Result<Vec<_>, Error>>()?;
@@ -486,6 +560,12 @@ impl SaplingRemoteApiHandler for UploadBonsaiChangesetHandler {
         let bubble_id = query.bubble_id.map(BubbleId::new);
         let cs = request.changeset;
         let repo = &repo;
+
+        let ctx = repo.ctx().clone();
+        ratelimit_commit_creation(ctx)
+            .await
+            .map_err(HttpError::e429)?;
+
         let parents = stream::iter(cs.hg_parents)
             .then(|hgid| async move {
                 repo.get_bonsai_from_hg(hgid.into())
@@ -494,38 +574,8 @@ impl SaplingRemoteApiHandler for UploadBonsaiChangesetHandler {
             })
             .try_collect()
             .await?;
-        let (_hg_extra, cs_ctx) = repo
-            .repo_ctx()
-            .create_changeset(
-                parents,
-                CreateInfo {
-                    author: cs.author,
-                    author_date: DateTime::from_timestamp(cs.time, cs.tz)?.into(),
-                    committer: None,
-                    committer_date: None,
-                    message: cs.message,
-                    extra: cs.extra.into_iter().map(|e| (e.key, e.value)).collect(),
-                    // TODO(rajshar): Need to allow passing git_extra_headers through Eden API as well.
-                    git_extra_headers: None,
-                },
-                cs.file_changes
-                    .into_iter()
-                    .map(|(path, fc)| {
-                        let create_change = to_create_change(fc, bubble_id)
-                            .with_context(|| anyhow!("Parsing file changes for {}", path))?;
-                        Ok((to_mpath(path)?, create_change))
-                    })
-                    .collect::<anyhow::Result<_>>()?,
-                match bubble_id {
-                    Some(id) => Some(repo.open_bubble(id).await?),
-                    None => None,
-                }
-                .as_ref(),
-            )
-            .await
-            .with_context(|| anyhow!("When creating bonsai changeset"))?;
 
-        let cs_id = cs_ctx.id();
+        let cs_id = upload_bonsai_changeset(cs.clone(), repo, bubble_id, parents).await?;
 
         Ok(stream::once(async move {
             Ok(UploadTokensResponse {
@@ -537,6 +587,46 @@ impl SaplingRemoteApiHandler for UploadBonsaiChangesetHandler {
         })
         .boxed())
     }
+}
+
+async fn upload_bonsai_changeset(
+    cs: BonsaiChangesetContent,
+    repo: &HgRepoContext<Repo>,
+    bubble_id: Option<BubbleId>,
+    parents: Vec<ChangesetId>,
+) -> anyhow::Result<ChangesetId> {
+    let (_hg_extra, cs_ctx) = repo
+        .repo_ctx()
+        .create_changeset(
+            parents,
+            CreateInfo {
+                author: cs.author,
+                author_date: DateTime::from_timestamp(cs.time, cs.tz)?.into(),
+                committer: None,
+                committer_date: None,
+                message: cs.message,
+                extra: cs.extra.into_iter().map(|e| (e.key, e.value)).collect(),
+                // TODO(rajshar): Need to allow passing git_extra_headers through Eden API as well.
+                git_extra_headers: None,
+            },
+            cs.file_changes
+                .into_iter()
+                .map(|(path, fc)| {
+                    let create_change = to_create_change(fc, bubble_id)
+                        .with_context(|| anyhow!("Parsing file changes for {}", path))?;
+                    Ok((to_mpath(path)?, create_change))
+                })
+                .collect::<anyhow::Result<_>>()?,
+            match bubble_id {
+                Some(id) => Some(repo.open_bubble(id).await?),
+                None => None,
+            }
+            .as_ref(),
+        )
+        .await
+        .with_context(|| anyhow!("When creating bonsai changeset"))?;
+
+    Ok(cs_ctx.id())
 }
 
 /// Get information about a snapshot changeset
@@ -560,7 +650,8 @@ impl SaplingRemoteApiHandler for FetchSnapshotHandler {
         let bubble_id = repo
             .ephemeral_store()
             .bubble_from_changeset(repo.ctx(), &cs_id)
-            .await?
+            .await
+            .context("Failure in fetching bubble from changeset")?
             .context("Snapshot not in a bubble")?;
         let labels = repo
             .ephemeral_store()
@@ -571,6 +662,7 @@ impl SaplingRemoteApiHandler for FetchSnapshotHandler {
         let cs = cs_id
             .load(repo.ctx(), &blobstore)
             .await
+            .context("Failed to load bonsai changeset through bubble blobstore")
             .map_err(MononokeError::from)?
             .into_mut();
         let time = cs.author_date.timestamp_secs();
@@ -608,6 +700,7 @@ impl SaplingRemoteApiHandler for FetchSnapshotHandler {
                                     Some(bubble_id.into()),
                                 ),
                                 file_type: tc.file_type().try_into()?,
+                                copy_info: None, // TODO: Add copy info on tracked changes
                             },
                             FileChange::UntrackedChange(uc) => BonsaiFileChange::UntrackedChange {
                                 upload_token: UploadToken::new_fake_token(
@@ -1041,5 +1134,72 @@ impl SaplingRemoteApiHandler for CommitTranslateId {
             .collect();
 
         Ok(stream::iter(translations).boxed())
+    }
+}
+
+/// For modern sync usage only
+pub struct UploadIdenticalChangesetsHandler;
+
+#[async_trait]
+impl SaplingRemoteApiHandler for UploadIdenticalChangesetsHandler {
+    type Request = UploadIdenticalChangesetsRequest;
+    type Response = UploadTokensResponse;
+
+    const HTTP_METHOD: hyper::Method = hyper::Method::POST;
+    const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::UploadIdenticalChangesets;
+    const ENDPOINT: &'static str = "/upload/changesets/identical";
+
+    async fn handler(
+        ectx: SaplingRemoteApiContext<Self::PathExtractor, Self::QueryStringExtractor, Repo>,
+        request: Self::Request,
+    ) -> HandlerResult<'async_trait, Self::Response> {
+        let repo = ectx.repo();
+        let changesets = request.changesets;
+
+        let ctx = repo.ctx().clone();
+        ratelimit_commit_creation(ctx.clone())
+            .await
+            .map_err(HttpError::e429)?;
+
+        let mut changesets_data = Vec::new();
+        for changeset in changesets {
+            let bs_c = BonsaiChangesetContent::from(changeset.clone());
+
+            let parents = changeset
+                .bonsai_parents
+                .to_vec()
+                .into_iter()
+                .map(|p| p.into())
+                .collect();
+            let bcs_id = upload_bonsai_changeset(bs_c, &repo, None, parents).await?;
+            let blobstore = repo.repo_ctx().repo_blobstore();
+            let bcs = bcs_id
+                .load(&ctx, &blobstore)
+                .await
+                .map_err(MononokeError::from)?;
+
+            let item = (
+                HgChangesetId::new(HgNodeHash::from(changeset.hg_info.node_id)),
+                to_revlog_changeset(HgChangesetContent::from(changeset))?,
+                Some(bcs),
+            );
+            changesets_data.push(item);
+        }
+
+        let results = repo
+            .store_hg_changesets(changesets_data, vec![])
+            .await?
+            .into_iter()
+            .map(move |r| {
+                r.map(|(hg_cs_id, _bonsai_cs_id)| {
+                    let hgid = HgId::from(hg_cs_id.into_nodehash());
+                    UploadTokensResponse {
+                        token: UploadToken::new_fake_token(AnyId::HgChangesetId(hgid), None),
+                    }
+                })
+                .map_err(Error::from)
+            });
+
+        Ok(stream::iter(results).boxed())
     }
 }

@@ -41,7 +41,9 @@ use futures::stream::BoxStream;
 use futures::stream::Stream;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
+use futures_ext::FbStreamExt;
 use futures_lazy_shared::LazyShared;
+use futures_watchdog::WatchdogExt;
 use git_types::MappedGitCommitId;
 use hooks::CrossRepoPushSource;
 use hooks::HookOutcome;
@@ -597,7 +599,7 @@ impl<R: MononokeRepo> ChangesetContext<R> {
     }
 
     /// Get the `BonsaiChangeset` information for this changeset.
-    async fn bonsai_changeset(&self) -> Result<BonsaiChangeset, MononokeError> {
+    pub async fn bonsai_changeset(&self) -> Result<BonsaiChangeset, MononokeError> {
         self.bonsai_changeset
             .get_or_init(|| {
                 let ctx = self.ctx().clone();
@@ -760,6 +762,7 @@ impl<R: MononokeRepo> ChangesetContext<R> {
             .repo()
             .commit_graph()
             .common_base(self.ctx(), self.id, other_commit)
+            .watched(self.ctx().logger())
             .await?;
         Ok(lca.first().map(|id| Self::new(self.repo_ctx.clone(), *id)))
     }
@@ -779,6 +782,7 @@ impl<R: MononokeRepo> ChangesetContext<R> {
             ChangesetFileOrdering::Unordered,
             None,
         )
+        .watched(self.ctx().logger())
         .await
     }
 
@@ -1347,7 +1351,10 @@ impl<R: MononokeRepo> ChangesetContext<R> {
         let diff_trees = diff_items.contains(&ChangesetDiffItem::TREES);
 
         self.find_entries(to_vec1(path_restrictions), ordering)
+            .watched(self.ctx().logger())
             .await?
+            .yield_periodically()
+            .with_logger(self.ctx().logger())
             .try_filter_map(|(path, entry)| async move {
                 match (path.into_optional_non_root_path(), entry) {
                     (Some(mpath), ManifestEntry::Leaf(_)) if diff_files => Ok(Some(mpath)),
@@ -1364,6 +1371,7 @@ impl<R: MononokeRepo> ChangesetContext<R> {
                 ))
             })
             .try_collect::<Vec<_>>()
+            .watched(self.ctx().logger())
             .await
     }
 
