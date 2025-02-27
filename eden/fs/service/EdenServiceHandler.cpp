@@ -2347,7 +2347,7 @@ void EdenServiceHandler::sync_changesSinceV2(
           "fromPosition={}:{}:{}, includedRoots:{}, excludedRoots:{}, includedSuffixes:{}, excludedSuffixes:{}",
           fromPosition.mountGeneration().value(),
           fromPosition.sequenceNumber().value(),
-          fromPosition.snapshotHash().value(),
+          logHash(fromPosition.snapshotHash().value()),
           toLogArg(includedRoots),
           toLogArg(excludedRoots),
           toLogArg(includedSuffixes),
@@ -5500,6 +5500,12 @@ EdenServiceHandler::semifuture_debugInvalidateNonMaterialized(
         std::move(invalFut).semi());
     return std::make_unique<DebugInvalidateResponse>();
   }
+}
+
+folly::SemiFuture<std::unique_ptr<ListRedirectionsResponse>>
+EdenServiceHandler::semifuture_listRedirections(
+    std::unique_ptr<ListRedirectionsRequest>) {
+  NOT_IMPLEMENTED();
 }
 
 void EdenServiceHandler::getStatInfo(

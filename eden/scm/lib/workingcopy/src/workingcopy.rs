@@ -41,6 +41,7 @@ use status::FileStatus;
 use status::Status;
 use status::StatusBuilder;
 use storemodel::FileStore;
+use submodule::parse_gitmodules;
 use tracing::debug;
 use treestate::filestate::StateFlags;
 use treestate::treestate::TreeState;
@@ -63,7 +64,6 @@ use crate::filesystem::FileSystemType;
 use crate::filesystem::PendingChange;
 use crate::filesystem::PhysicalFileSystem;
 use crate::filesystem::WatchmanFileSystem;
-use crate::git::parse_submodules;
 use crate::status::compute_status;
 use crate::util::added_files;
 use crate::util::walk_treestate;
@@ -409,7 +409,8 @@ impl WorkingCopy {
             let git_modules_path = self.vfs.join(".gitmodules".try_into()?);
             if git_modules_path.exists() {
                 ignore_dirs.extend(
-                    parse_submodules(&fs_err::read(&git_modules_path)?)?
+                    // No need to access "url" here. So no need for a real "origin_url".
+                    parse_gitmodules(&fs_err::read(&git_modules_path)?, None)
                         .into_iter()
                         .map(|s| PathBuf::from(s.path)),
                 );

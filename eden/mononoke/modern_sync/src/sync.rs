@@ -12,7 +12,6 @@ use std::sync::Arc;
 use anyhow::bail;
 use anyhow::format_err;
 use anyhow::Result;
-use assembly_line::TryAssemblyLine;
 use blobstore::Loadable;
 use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateLogArc;
@@ -41,7 +40,7 @@ use mercurial_types::HgChangesetId;
 use mercurial_types::HgFileNodeId;
 use mercurial_types::HgManifestId;
 use metadata::Metadata;
-use mononoke_app::args::RepoArg;
+use mononoke_app::args::SourceRepoArgs;
 use mononoke_app::MononokeApp;
 use mononoke_types::ChangesetId;
 use mononoke_types::FileChange;
@@ -62,9 +61,9 @@ use crate::bul_util;
 use crate::sender::edenapi::EdenapiSender;
 use crate::sender::manager::ChangesetMessage;
 use crate::sender::manager::ContentMessage;
-use crate::sender::manager::FileOrTreeMessage;
-use crate::sender::manager::Messages;
+use crate::sender::manager::FileMessage;
 use crate::sender::manager::SendManager;
+use crate::sender::manager::TreeMessage;
 use crate::ModernSyncArgs;
 use crate::Repo;
 
@@ -86,12 +85,13 @@ pub enum ExecutionType {
 pub async fn sync(
     app: Arc<MononokeApp>,
     start_id_arg: Option<u64>,
-    repo_arg: RepoArg,
+    source_repo_arg: SourceRepoArgs,
+    dest_repo_name: String,
     exec_type: ExecutionType,
     dry_run: bool,
     chunk_size: u64,
 ) -> Result<()> {
-    let repo: Repo = app.open_repo(&repo_arg).await?;
+    let repo: Repo = app.open_repo(&source_repo_arg).await?;
     let _repo_id = repo.repo_identity().id();
     let repo_name = repo.repo_identity().name().to_string();
 
@@ -154,12 +154,10 @@ pub async fn sync(
             .clone()
             .ok_or_else(|| format_err!("TLS params not found for repo {}", repo_name))?;
 
-        let dest_repo = format!("{}_shadow", repo_name.clone());
-
         Arc::new(
             EdenapiSender::new(
                 Url::parse(&url)?,
-                dest_repo,
+                dest_repo_name.clone(),
                 logger.clone(),
                 tls_args,
                 ctx.clone(),
@@ -263,12 +261,13 @@ pub async fn sync(
                                         missing_changesets.len()
                                     );
 
-                                    stream::iter(missing_changesets.into_iter())
-                                        .map(|cs_id| {
+                                    stream::iter(missing_changesets.into_iter().map(Ok))
+                                        .try_for_each(|cs_id| {
                                             cloned!(
                                                 ctx,
                                                 repo,
                                                 logger,
+                                                send_manager,
                                                 bookmark_name,
                                                 to_cs,
                                                 cs_tx,
@@ -289,18 +288,14 @@ pub async fn sync(
                                                     &ctx,
                                                     repo,
                                                     &logger,
+                                                    &send_manager,
                                                     app_args.log_to_ods,
                                                     bookmark_name.as_str(),
                                                     channel,
                                                 )
                                                 .await
                                             }
-                                        }).buffered(10).try_next_step(|messages|{
-                                            cloned!(mut send_manager);
-                                            async move {
-                                                send_messages_in_order(messages, &mut send_manager).await
-                                            }
-                                        }).try_collect::<()>()
+                                        })
                                         .await?;
                                     Ok(())
                                 }
@@ -366,15 +361,12 @@ pub async fn process_one_changeset(
     ctx: &CoreContext,
     repo: Repo,
     logger: &Logger,
+    send_manager: &SendManager,
     log_to_ods: bool,
     bookmark_name: &str,
     changeset_ready: Option<mpsc::Sender<Result<()>>>,
-) -> Result<Messages> {
+) -> Result<()> {
     let now = std::time::Instant::now();
-
-    let mut content_messages = Vec::new();
-    let mut files_and_trees_messages = Vec::new();
-    let mut changeset_messages = Vec::new();
 
     let cs_info = repo
         .repo_derived_data()
@@ -394,17 +386,24 @@ pub async fn process_one_changeset(
 
         if let Some(cid) = cid {
             let blob = cid.load(ctx, &repo.repo_blobstore()).await?;
-
-            content_messages.push(ContentMessage::Content((
-                AnyFileContentId::ContentId(cid.into()),
-                blob,
-            )));
+            send_manager
+                .send_content(ContentMessage::Content((
+                    AnyFileContentId::ContentId(cid.into()),
+                    blob,
+                )))
+                .await?;
         }
     }
 
     // Notify contents for this changeset are ready
-    let (content_tx, content_rx) = oneshot::channel();
-    content_messages.push(ContentMessage::ContentDone(content_tx));
+    let (content_files_tx, content_files_rx) = oneshot::channel();
+    let (content_trees_tx, content_trees_rx) = oneshot::channel();
+    send_manager
+        .send_content(ContentMessage::ContentDone(
+            content_files_tx,
+            content_trees_tx,
+        ))
+        .await?;
 
     let mut mf_ids_p = vec![];
 
@@ -425,27 +424,51 @@ pub async fn process_one_changeset(
     mf_ids.push(hg_mf_id);
 
     // Send files and trees
-    files_and_trees_messages.push(FileOrTreeMessage::WaitForContents(content_rx));
+    send_manager
+        .send_file(FileMessage::WaitForContents(content_files_rx))
+        .await?;
 
-    for mf_id in mf_ids {
-        files_and_trees_messages.push(FileOrTreeMessage::Tree(mf_id));
-    }
-
-    for file_id in file_ids {
-        files_and_trees_messages.push(FileOrTreeMessage::FileNode(file_id));
-    }
+    send_manager
+        .send_tree(TreeMessage::WaitForContents(content_trees_rx))
+        .await?;
 
     // Notify files and trees for this changeset are ready
-    let (ft_tx, ft_rx) = oneshot::channel();
-    files_and_trees_messages.push(FileOrTreeMessage::FilesAndTreesDone(ft_tx));
+    let (f_tx, f_rx) = oneshot::channel();
+    let (t_tx, t_rx) = oneshot::channel();
+
+    let (_, _) = tokio::try_join!(
+        async {
+            for mf_id in mf_ids {
+                send_manager.send_tree(TreeMessage::Tree(mf_id)).await?;
+            }
+            send_manager.send_tree(TreeMessage::TreesDone(t_tx)).await?;
+            anyhow::Ok(())
+        },
+        async {
+            cloned!(send_manager);
+            for file_id in file_ids {
+                send_manager
+                    .send_file(FileMessage::FileNode(file_id))
+                    .await?;
+            }
+            send_manager.send_file(FileMessage::FilesDone(f_tx)).await?;
+            anyhow::Ok(())
+        }
+    )?;
 
     // Upload changeset
-    changeset_messages.push(ChangesetMessage::WaitForFilesAndTrees(ft_rx));
-    changeset_messages.push(ChangesetMessage::Changeset((hg_cs, bs_cs)));
+    send_manager
+        .send_changeset(ChangesetMessage::WaitForFilesAndTrees(f_rx, t_rx))
+        .await?;
+    send_manager
+        .send_changeset(ChangesetMessage::Changeset((hg_cs, bs_cs)))
+        .await?;
 
     // Notify changeset for this changeset is ready if someone requested it
     if let Some(changeset_ready) = changeset_ready {
-        changeset_messages.push(ChangesetMessage::ChangesetDone(changeset_ready));
+        send_manager
+            .send_changeset(ChangesetMessage::ChangesetDone(changeset_ready))
+            .await?;
     }
 
     if log_to_ods {
@@ -463,10 +486,12 @@ pub async fn process_one_changeset(
             None
         };
 
-        changeset_messages.push(ChangesetMessage::Log((
-            repo.repo_identity().name().to_string(),
-            lag,
-        )));
+        send_manager
+            .send_changeset(ChangesetMessage::Log((
+                repo.repo_identity().name().to_string(),
+                lag,
+            )))
+            .await?;
     }
 
     let elapsed = now.elapsed();
@@ -475,26 +500,7 @@ pub async fn process_one_changeset(
         (repo.repo_identity().name().to_string(),),
     );
     STATS::changeset_procesed.add_value(1, (repo.repo_identity().name().to_string(),));
-    Ok(Messages {
-        content_messages,
-        files_and_trees_messages,
-        changeset_messages,
-    })
-}
 
-pub async fn send_messages_in_order(
-    messages: Messages,
-    send_manager: &mut SendManager,
-) -> Result<()> {
-    for msg in messages.content_messages {
-        send_manager.send_content(msg).await?;
-    }
-    for msg in messages.files_and_trees_messages {
-        send_manager.send_file_or_tree(msg).await?;
-    }
-    for msg in messages.changeset_messages {
-        send_manager.send_changeset(msg).await?;
-    }
     Ok(())
 }
 
@@ -578,4 +584,21 @@ fn classify_entries(
             }
         }
     }
+}
+
+pub(crate) async fn get_unsharded_repo_args(
+    app: Arc<MononokeApp>,
+    app_args: &ModernSyncArgs,
+) -> Result<(SourceRepoArgs, String)> {
+    let source_repo: Repo = app.open_repo(&app_args.repo).await?;
+    let source_repo_name = source_repo.repo_identity.name().to_string();
+    let target_repo_name = app_args
+        .dest_repo_name
+        .clone()
+        .unwrap_or(source_repo_name.clone());
+
+    Ok((
+        SourceRepoArgs::with_name(source_repo_name),
+        target_repo_name,
+    ))
 }

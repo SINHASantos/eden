@@ -10,7 +10,7 @@ license = "GPLv2+"
 [dependencies]
 anyhow = "1.0.95"
 arg_extensions = { version = "0.1.0", path = "../extensions" }
-async-trait = "0.1.71"
+async-trait = "0.1.86"
 base_app = { version = "0.1.0", path = "../base_app" }
 blobstore = { version = "0.1.0", path = "../../blobstore" }
 blobstore_factory = { version = "0.1.0", path = "../../blobstore/factory" }
@@ -20,7 +20,7 @@ bonsai_hg_mapping = { version = "0.1.0", path = "../../bonsai_hg_mapping" }
 bonsai_svnrev_mapping = { version = "0.1.0", path = "../../bonsai_svnrev_mapping" }
 bookmarks = { version = "0.1.0", path = "../../bookmarks" }
 cached_config = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-clap = { version = "4.5.20", features = ["derive", "env", "string", "unicode", "wrap_help"] }
+clap = { version = "4.5.30", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 cmdlib_caching = { version = "0.1.0", path = "../caching" }
 cmdlib_logging = { version = "0.1.0", path = "../log" }
 commit_graph_types = { version = "0.1.0", path = "../../repo_attributes/commit_graph/commit_graph_types" }

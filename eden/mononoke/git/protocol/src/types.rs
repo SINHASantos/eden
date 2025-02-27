@@ -501,11 +501,11 @@ pub enum ShallowVariant {
     /// Requests that the shallow clone/fetch should be cut at a specific time,
     /// instead of depth. The timestamp provided should be in the same format
     /// as is expected for git rev-list --max-age <timestamp>
-    FromServerWithTime(gix_date::Time),
+    FromServerWithTime(usize),
     /// Requests that the shallow clone/fetch should be cut at a specific revision
     /// instead of a depth, i.e. the specified oid becomes the boundary at which the
     /// fetch or clone should stop at
-    FromServerWithOid(ObjectId),
+    FromServerExcludingRefs(Vec<String>),
 }
 
 impl ShallowVariant {

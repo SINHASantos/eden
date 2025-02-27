@@ -8,19 +8,20 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+use anyhow::bail;
 use anyhow::Result;
 use async_trait::async_trait;
 use clap::Parser;
 use executor_lib::RepoShardedProcess;
 use executor_lib::RepoShardedProcessExecutor;
-use mononoke_app::args::AsRepoArg;
-use mononoke_app::args::RepoArg;
+use mononoke_app::args::SourceRepoArgs;
 use mononoke_app::MononokeApp;
 use sharding_ext::RepoShard;
 use slog::info;
 
 use crate::sync::ExecutionType;
 use crate::ModernSyncArgs;
+use crate::Repo;
 
 const SM_CLEANUP_TIMEOUT_SECS: u64 = 120;
 pub const CHUNK_SIZE_DEFAULT: u64 = 1000;
@@ -50,10 +51,32 @@ impl ModernSyncProcess {
 #[async_trait]
 impl RepoShardedProcess for ModernSyncProcess {
     async fn setup(&self, repo: &RepoShard) -> anyhow::Result<Arc<dyn RepoShardedProcessExecutor>> {
+        let logger = self.app.logger().clone();
+
+        let source_repo_name = repo.repo_name.clone();
+        let target_repo_name = match repo.target_repo_name.clone() {
+            Some(repo_name) => repo_name,
+            None => {
+                let details = format!(
+                    "Only source repo name {} provided, target repo name missing in {}",
+                    source_repo_name, repo
+                );
+                bail!("{}", details)
+            }
+        };
+
+        info!(
+            logger,
+            "Setting up sharded sync from repo {} to repo {}", source_repo_name, target_repo_name,
+        );
+
+        let source_repo_args = SourceRepoArgs::with_name(source_repo_name.clone());
+
         Ok(Arc::new(ModernSyncProcessExecutor {
             app: self.app.clone(),
             sync_args: self.sync_args.clone(),
-            repo_arg: RepoArg::Name(repo.repo_name.clone()),
+            source_repo_args,
+            dest_repo_name: target_repo_name,
         }))
     }
 }
@@ -61,7 +84,8 @@ impl RepoShardedProcess for ModernSyncProcess {
 pub struct ModernSyncProcessExecutor {
     app: Arc<MononokeApp>,
     sync_args: Arc<CommandArgs>,
-    repo_arg: RepoArg,
+    source_repo_args: SourceRepoArgs,
+    dest_repo_name: String,
 }
 
 #[async_trait]
@@ -70,7 +94,8 @@ impl RepoShardedProcessExecutor for ModernSyncProcessExecutor {
         crate::sync::sync(
             self.app.clone(),
             self.sync_args.start_id,
-            self.repo_arg.clone(),
+            self.source_repo_args.clone(),
+            self.dest_repo_name.clone(),
             ExecutionType::Tail,
             self.sync_args.dry_run,
             self.sync_args.chunk_size.unwrap_or(CHUNK_SIZE_DEFAULT),
@@ -104,10 +129,28 @@ pub async fn run(app: MononokeApp, args: CommandArgs) -> Result<()> {
             .await?;
     } else {
         info!(logger, "Running unsharded sync loop");
+
+        let source_repo: Repo = process.app.clone().open_repo(&app_args.repo).await?;
+        let source_repo_name = source_repo.repo_identity.name().to_string();
+        let target_repo_name = app_args
+            .dest_repo_name
+            .clone()
+            .unwrap_or(source_repo_name.clone());
+
+        let source_repo_args = SourceRepoArgs::with_name(source_repo_name.clone());
+
+        info!(
+            logger,
+            "Setting up unsharded sync from repo {:?} to repo {:?}",
+            source_repo_name,
+            target_repo_name,
+        );
+
         crate::sync::sync(
             process.app.clone(),
             process.sync_args.start_id.clone(),
-            app_args.repo.as_repo_arg().clone(),
+            source_repo_args,
+            target_repo_name,
             ExecutionType::Tail,
             process.sync_args.dry_run.clone(),
             process

@@ -33,7 +33,7 @@ pub(crate) fn populate_module(py: Python<'_>, module: &PyModule) -> PyResult<PyN
             // see update_modules.sh
             // [[[cog
             // import cog, glob, os
-            // for path in sorted(glob.glob('modules/py*/TARGETS')):
+            // for path in sorted(glob.glob('modules/py*/BUCK')):
             //     name = os.path.basename(os.path.dirname(path))
             //     cog.outl(f'{name[2:]},')
             // ]]]
@@ -94,6 +94,7 @@ pub(crate) fn populate_module(py: Python<'_>, module: &PyModule) -> PyResult<PyN
             sptui,
             status,
             storemodel,
+            submodule,
             threading,
             toml,
             tracing,

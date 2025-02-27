@@ -45,7 +45,7 @@ bonsai_svnrev_mapping = { version = "0.1.0", path = "bonsai_svnrev_mapping" }
 borrowed = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 bytesize = "1.1"
 check_git_wc = { version = "0.1.0", path = "git/check_git_wc" }
-clap = { version = "4.5.20", features = ["derive", "env", "string", "unicode", "wrap_help"] }
+clap = { version = "4.5.30", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 clap_old = { package = "clap", version = "2.34.0" }
 cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 cmdlib_logging = { version = "0.1.0", path = "cmdlib/log" }
@@ -100,6 +100,7 @@ tree-sitter-bash = { git = "https://github.com/cfsmp3/tree-sitter-bash", rev = "
 tree-sitter-c = { git = "https://github.com/cfsmp3/tree-sitter-c", rev = "d01f584b67e581e9888b4b8e71e7150fd3867e38" }
 uefisettings = { git = "https://github.com/linuxboot/uefisettings", rev = "f16daed1d2bd1216204fd24e876c6477d03aebb3" }
 uefisettings_backend_thrift = { git = "https://github.com/linuxboot/uefisettings", rev = "f16daed1d2bd1216204fd24e876c6477d03aebb3" }
+vm-allocator = { git = "https://github.com/rust-vmm/vm-allocator", rev = "5fb545cc6e41fdc9f27d48d97ed26274a35bc6c6" }
 warp = { git = "https://github.com/jdthomas/warp.git", rev = "c794232d182abaa3add8184e7d661e084cc516c5", features = ["tls"] }
 
 [workspace]
@@ -238,7 +239,6 @@ members = [
   "common/assembly_line",
   "common/async_limiter",
   "common/async_limiter/examples/tokio_v2",
-  "common/bounded_traversal",
   "common/connection_security_checker",
   "common/copy_utils",
   "common/dedupmap",

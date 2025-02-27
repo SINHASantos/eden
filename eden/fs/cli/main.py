@@ -1295,7 +1295,17 @@ class HealthReportCmd(Subcmd):
 
     def is_eden_running(self, instance: EdenInstance) -> bool:
         health_info = instance.check_health()
-        if not health_info.is_healthy():
+        if health_info.is_starting():
+            print("EdenFS daemon is still starting. Waiting for EdenFS to start ...")
+            try:
+                wait_for_instance_healthy(instance, 600)
+            except Exception as error:
+                self.error_codes[HealthReportCmd.ErrorCode.EDEN_NOT_RUNNING] = (
+                    "EdenFS start error: " + error.args[0]
+                )
+                return False
+
+        elif not health_info.is_healthy():
             self.error_codes[HealthReportCmd.ErrorCode.EDEN_NOT_RUNNING] = (
                 "Failed to find EdenFS daemon pid."
             )
@@ -1442,7 +1452,12 @@ class HealthReportCmd(Subcmd):
             out (ui.Output): Output stream to write the JSON data to.
             notify (bool): Whether to send notifications.
         """
-
+        instance.log_sample(
+            "health-report",
+            num_detected_issues=len(HealthReportCmd.error_codes),
+            detected_issues=set(HealthReportCmd.error_codes.keys()),
+            detected_issues_descriptions=set(HealthReportCmd.error_codes.values()),
+        )
         # Serialize error codes
         data = [
             {"error": error_code.name, "description": error_additional_info}
