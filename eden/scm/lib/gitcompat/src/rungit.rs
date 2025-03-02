@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitStatus;
 use std::process::Output;
+use std::sync::RwLock;
 
 use configmodel::Config;
 use configmodel::ConfigExt;
@@ -22,14 +23,7 @@ use spawn_ext::CommandExt;
 /// Run `git` outside a repo.
 #[derive(Default, Clone)]
 pub struct GlobalGit {
-    /// Path to the "git" command.
-    pub git_binary: String,
-
-    /// Whether to use --verbose.
-    pub verbose: bool,
-
-    /// Whether to use --quiet.
-    pub quiet: bool,
+    config: RunGitConfig,
 
     /// Extra Git configs, "foo.bar=baz".
     pub extra_git_configs: Vec<String>,
@@ -52,9 +46,36 @@ pub struct RepoGit {
     pub(crate) parent: BareGit,
 }
 
-impl GlobalGit {
-    /// Construct from config.
-    pub fn from_config(config: &dyn Config) -> Self {
+/// Config related to run git.
+#[derive(Clone)]
+struct RunGitConfig {
+    /// Path to the "git" command.
+    pub git_binary: String,
+
+    /// Whether to use --verbose.
+    pub verbose: bool,
+
+    /// Whether to use --quiet.
+    pub quiet: bool,
+}
+
+impl Default for RunGitConfig {
+    fn default() -> Self {
+        if let Ok(config) = DEFAULT_CONFIG.read() {
+            if let Some(config) = config.as_ref() {
+                return config.clone();
+            }
+        }
+        Self {
+            git_binary: GIT.to_owned(),
+            verbose: false,
+            quiet: false,
+        }
+    }
+}
+
+impl RunGitConfig {
+    fn from_config(config: &dyn Config) -> Self {
         let (git_binary, verbose, quiet) = (
             config
                 .get_or("ui", "git", || GIT.to_owned())
@@ -66,6 +87,18 @@ impl GlobalGit {
             git_binary,
             verbose,
             quiet,
+        }
+    }
+}
+
+static DEFAULT_CONFIG: RwLock<Option<RunGitConfig>> = RwLock::new(None);
+
+impl GlobalGit {
+    /// Construct from config.
+    pub fn from_config(config: &dyn Config) -> Self {
+        let config = RunGitConfig::from_config(config);
+        Self {
+            config,
             ..Default::default()
         }
     }
@@ -83,6 +116,11 @@ impl GlobalGit {
         let git_dir = root.join(".git");
         self.with_bare(git_dir).with_working_copy(root)
     }
+
+    /// Set default config. Affects constructors without `config` like `GlobalGit::default`.
+    pub fn set_default_config(config: &dyn Config) {
+        *DEFAULT_CONFIG.write().unwrap() = Some(RunGitConfig::from_config(config));
+    }
 }
 
 impl BareGit {
@@ -91,6 +129,14 @@ impl BareGit {
         Self {
             git_dir: follow_dotgit_path(git_dir),
             parent: GlobalGit::from_config(config),
+        }
+    }
+
+    /// Construct from git_dir (".git" path) and default config.
+    pub fn from_git_dir(git_dir: PathBuf) -> Self {
+        Self {
+            git_dir: follow_dotgit_path(git_dir),
+            parent: GlobalGit::default(),
         }
     }
 
@@ -112,6 +158,15 @@ impl RepoGit {
         Self {
             root,
             parent: BareGit::from_git_dir_and_config(git_dir, config),
+        }
+    }
+
+    /// Construct from root (parent of ".git") and default config.
+    pub fn from_root(root: PathBuf) -> Self {
+        let git_dir = root.join(".git");
+        Self {
+            root,
+            parent: BareGit::from_git_dir(git_dir),
         }
     }
 
@@ -212,7 +267,8 @@ fn git_cmd_impl(
     git_dir: Option<&Path>,
     root: Option<&Path>,
 ) -> Command {
-    let mut cmd = Command::new(&opts.git_binary);
+    let cfg = &opts.config;
+    let mut cmd = Command::new(&cfg.git_binary);
 
     // -c foo.bar=baz ...
     for c in &opts.extra_git_configs {
@@ -243,12 +299,12 @@ fn git_cmd_impl(
 
     // insert --verbose and --quiet between the git command name and its arguments
     // not all commands support --verbose or --quiet
-    let verbose = opts.verbose && ["fetch", "push"].contains(&cmd_name);
+    let verbose = cfg.verbose && ["fetch", "push"].contains(&cmd_name);
     if verbose {
         cmd.arg("--verbose");
     }
     let quiet =
-        opts.quiet && ["fetch", "init", "checkout", "push", "bundle create"].contains(&cmd_name);
+        cfg.quiet && ["fetch", "init", "checkout", "push", "bundle create"].contains(&cmd_name);
     if quiet {
         cmd.arg("--quiet");
     }

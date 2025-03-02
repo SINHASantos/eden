@@ -9,7 +9,6 @@ pub mod client;
 mod errors;
 mod filechangedetector;
 pub mod filesystem;
-pub mod git;
 pub mod metadata;
 pub mod sparse;
 pub mod status;
@@ -19,4 +18,5 @@ pub mod walker;
 mod watchman_client;
 pub mod workingcopy;
 
+pub use util::sniff_wdir_parents;
 pub use workingcopy::WorkingCopy;

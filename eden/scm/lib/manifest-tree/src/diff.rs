@@ -112,6 +112,9 @@ pub fn diff(
     }
 
     let (result_send, result_recv) = unbounded();
+
+    // Use unbounded channel to avoid deadlocks. Memory use should be bounded in practice
+    // since workers will block sending results to caller.
     let (work_send, work_recv) = unbounded();
 
     let store = left.store.clone();

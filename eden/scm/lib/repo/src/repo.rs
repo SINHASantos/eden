@@ -25,12 +25,11 @@ use eagerepo::EagerRepoStore;
 use edenapi::Builder;
 use edenapi::SaplingRemoteApi;
 use edenapi::SaplingRemoteApiError;
+use identity::Identity;
 use manifest_tree::ReadTreeManifest;
 use metalog::MetaLog;
 use once_cell::sync::OnceCell;
 use parking_lot::RwLock;
-use repo_minimal_info::constants::SUPPORTED_DEFAULT_REQUIREMENTS;
-use repo_minimal_info::constants::SUPPORTED_STORE_REQUIREMENTS;
 pub use repo_minimal_info::read_sharedpath;
 use repo_minimal_info::RepoMinimalInfo;
 use repo_minimal_info::Requirements;
@@ -205,14 +204,10 @@ impl Repo {
     }
 
     pub fn reload_requires(&mut self) -> Result<()> {
-        self.requirements = Requirements::open(
-            &self.dot_hg_path.join("requires"),
-            &SUPPORTED_DEFAULT_REQUIREMENTS,
-        )?;
-        self.store_requirements = Requirements::open(
-            &self.store_path.join("requires"),
-            &SUPPORTED_STORE_REQUIREMENTS,
-        )?;
+        let requirements = Requirements::load_repo_requirements(&self.dot_hg_path)?;
+        let store_requirements = Requirements::load_store_requirements(&self.store_path)?;
+        self.requirements = requirements;
+        self.store_requirements = store_requirements;
         Ok(())
     }
 
@@ -270,6 +265,11 @@ impl Repo {
 
     pub fn config_path(&self) -> PathBuf {
         self.dot_hg_path.join(self.ident.config_repo_file())
+    }
+
+    /// Identity used by the working copy.
+    pub fn ident(&self) -> Identity {
+        self.ident
     }
 
     #[cached_field]
@@ -677,12 +677,12 @@ impl Repo {
 
         tracing::trace!(target: "repo::workingcopy", "creating tree resolver");
         let tree_resolver = self.tree_resolver()?;
-        let has_requirement = |s: &str| self.requirements.contains(s);
+        let has_requirement =
+            |s: &str| self.requirements.contains(s) || self.store_requirements.contains(s);
 
         let wc = WorkingCopy::new(
             &self.path,
             &self.config,
-            self.storage_format(),
             tree_resolver,
             file_store,
             self.locker.clone(),

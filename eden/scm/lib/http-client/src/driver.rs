@@ -25,7 +25,9 @@ use crate::Easy2H;
 /// `Multi::wait`. The Multi session maintains its own timeout internally based
 /// on the state of the underlying transfers; this default value will only be
 /// used if there is no internal timer value set at the time `wait` is called.
-const MULTI_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Note that "paused" transfers might need to wait this timeout before we
+/// attempt to unpause, so don't set too large.
+const MULTI_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// A complete transfer, along with the associated error
 /// if the transfer did not complete successfully.
@@ -105,10 +107,9 @@ impl<'a> MultiDriver<'a> {
     where
         F: FnMut(Result<Easy2H, (Easy2H, curl::Error)>) -> Result<(), Abort>,
     {
-        let total = self.num_transfers();
+        let mut total = self.num_transfers();
         let mut in_progress = total;
-
-        tracing::debug!("Performing {} transfer(s)", total);
+        tracing::debug!("Performing {total} transfer(s)");
 
         let start = Instant::now();
 
@@ -143,6 +144,16 @@ impl<'a> MultiDriver<'a> {
                 let token = c.token;
                 callback(c.into_result())?;
                 tracing::trace!("Successfully handled transfer: {}", token);
+
+                // Notice if the callback added new handles and adjust `in_progress`
+                // accordingly so we continue looping.
+                let num_transfers = self.num_transfers();
+                if num_transfers > total {
+                    let added = num_transfers - total;
+                    tracing::trace!("Perform callback added {added} new handles");
+                    in_progress += added;
+                    total += added;
+                }
             }
 
             // If any tranfers reported progress, notify the user.
@@ -157,6 +168,17 @@ impl<'a> MultiDriver<'a> {
             let active_sockets = self.multi.wait(&mut [], MULTI_WAIT_TIMEOUT)?;
             if active_sockets == 0 {
                 tracing::trace!("Timed out waiting for activity");
+            }
+
+            // Check for paused transfers that can be resumed.
+            for easy in self.handles.borrow_mut().iter_mut() {
+                if let Some(easy) = easy {
+                    if easy.get_mut().needs_unpause() {
+                        tracing::trace!("unpausing transfer");
+                        tracing::trace!(target: "curl_pause", "unpausing transfer");
+                        easy.unpause_write()?;
+                    }
+                }
             }
         }
 

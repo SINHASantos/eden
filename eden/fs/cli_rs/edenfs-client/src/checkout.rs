@@ -1232,7 +1232,12 @@ pub async fn get_mounts(instance: &EdenFsInstance) -> Result<BTreeMap<PathBuf, E
     // Get active mounted checkouts info from eden daemon
     let client = instance.connect(Some(Duration::from_secs(3))).await;
     let mounted_checkouts = match client {
-        Ok(client) => Some(client.listMounts().await.from_err()?),
+        Ok(client) => {
+            match client.listMounts().await {
+                Ok(result) => Some(result),
+                Err(_) => None, // eden daemon is not running or not healthy
+            }
+        }
         Err(_) => None, // eden daemon not running
     };
 
@@ -1391,6 +1396,7 @@ mod tests {
     use crate::checkout::MOUNT_CONFIG;
     use crate::checkout::REPO_SOURCE;
     use crate::redirect::Redirection;
+    use crate::redirect::RedirectionState;
 
     // path and type are required... /tmp/ is probably the safest place to use as the path
     const DEFAULT_CHECKOUT_CONFIG: &str = r#"
@@ -1486,7 +1492,7 @@ mod tests {
             redir_type: RedirectionType::Symlink,
             target: None,
             source: "NotARepoSource".into(),
-            state: None,
+            state: RedirectionState::UnknownMount,
         };
         assert!(update_and_test_redirection(redir1, config_dir, true).is_ok());
 
@@ -1496,7 +1502,7 @@ mod tests {
             redir_type: RedirectionType::Symlink,
             target: None,
             source: REPO_SOURCE.into(),
-            state: None,
+            state: RedirectionState::UnknownMount,
         };
         assert!(update_and_test_redirection(redir2, config_dir, false).is_ok());
 
@@ -1506,7 +1512,7 @@ mod tests {
             redir_type: RedirectionType::Bind,
             target: None,
             source: "NotARepoSource".into(),
-            state: None,
+            state: RedirectionState::UnknownMount,
         };
         assert!(update_and_test_redirection(redir3, config_dir, true).is_ok());
 
@@ -1516,7 +1522,7 @@ mod tests {
             redir_type: RedirectionType::Bind,
             target: None,
             source: REPO_SOURCE.into(),
-            state: None,
+            state: RedirectionState::UnknownMount,
         };
         assert!(update_and_test_redirection(redir4, config_dir, false).is_ok());
     }

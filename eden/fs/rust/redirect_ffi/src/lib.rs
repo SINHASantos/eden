@@ -13,53 +13,76 @@ use edenfs_client::redirect::get_effective_redirs_for_mount;
 use edenfs_client::redirect::Redirection;
 use edenfs_client::redirect::RedirectionState;
 use edenfs_client::redirect::RedirectionType;
+use edenfs_client::EdenFsInstance;
 
 #[cxx::bridge]
 mod ffi {
 
     // Original enum: RedirectionType
     // Mapping is ensured at compile-time by `match` in the From impl
-    pub enum RedirectionTypeFFI {
-        Bind,
-        Symlink,
-        Unknown,
+    #[namespace = "facebook::eden"]
+    #[repr(u32)]
+    pub enum RedirectionType {
+        BIND,
+        SYMLINK,
+        UNKNOWN,
     }
 
     // Original enum: RedirectionState
     // Mapping is ensured at compile-time by `match` in the From impl
-    pub enum RedirectionStateFFI {
-        MatchesConfiguration,
-        UnknownMount,
-        NotMounted,
-        SymlinkMissing,
-        SymlinkIncorrect,
-        None,
+    #[namespace = "facebook::eden"]
+    #[repr(u32)]
+    pub enum RedirectionState {
+        MATCHES_CONFIGURATION,
+        UNKNOWN_MOUNT,
+        NOT_MOUNTED,
+        SYMLINK_MISSING,
+        SYMLINK_INCORRECT,
     }
 
     // Original struct: Redirection
+    #[namespace = "facebook::eden"]
     pub struct RedirectionFFI {
         // Original type: PathBuf
         pub repo_path: String,
         // Original type: RedirectionType
-        pub redir_type: RedirectionTypeFFI,
+        pub redir_type: RedirectionType,
         // Original type: PathBuf
         pub source: String,
-        // Original type: Option<RedirectionState>
-        pub state: RedirectionStateFFI,
+        // Original type: RedirectionState
+        pub state: RedirectionState,
         // Original type: Option<PathBuf>
         pub target: String,
     }
 
     #[namespace = "facebook::eden"]
+    unsafe extern "C++" {
+        // Declare enums to let cxx assert
+        // they match thrift enums generated in C++
+        include!("eden/fs/service/gen-cpp2/eden_types.h");
+        type RedirectionType;
+        type RedirectionState;
+    }
+
+    #[namespace = "facebook::eden"]
     extern "Rust" {
 
-        fn list_redirections(mount: String) -> Result<Vec<RedirectionFFI>>;
+        fn list_redirections(
+            mount: String,
+            config_dir: String,
+            etc_eden_dir: String,
+        ) -> Result<Vec<RedirectionFFI>>;
 
     }
 }
 
-pub fn list_redirections(mount: String) -> Result<Vec<ffi::RedirectionFFI>, anyhow::Error> {
-    let redirs = get_effective_redirs_for_mount(mount.into())?;
+pub fn list_redirections(
+    mount: String,
+    config_dir: String,
+    etc_eden_dir: String,
+) -> Result<Vec<ffi::RedirectionFFI>, anyhow::Error> {
+    let instance = EdenFsInstance::new(config_dir.into(), etc_eden_dir.into(), None);
+    let redirs = get_effective_redirs_for_mount(&instance, mount.into())?;
     let redirs_ffi = redirs
         .values()
         .map(ffi::RedirectionFFI::try_from)
@@ -86,39 +109,34 @@ impl TryFrom<&Redirection> for ffi::RedirectionFFI {
     }
 }
 
-impl From<RedirectionType> for ffi::RedirectionTypeFFI {
+impl From<RedirectionType> for ffi::RedirectionType {
     fn from(redir_type: RedirectionType) -> Self {
         match redir_type {
-            RedirectionType::Bind => ffi::RedirectionTypeFFI::Bind,
-            RedirectionType::Symlink => ffi::RedirectionTypeFFI::Symlink,
-            RedirectionType::Unknown => ffi::RedirectionTypeFFI::Unknown,
+            RedirectionType::Bind => ffi::RedirectionType::BIND,
+            RedirectionType::Symlink => ffi::RedirectionType::SYMLINK,
+            RedirectionType::Unknown => ffi::RedirectionType::UNKNOWN,
         }
     }
 }
 
-impl From<Option<RedirectionState>> for ffi::RedirectionStateFFI {
-    fn from(redir_state: Option<RedirectionState>) -> Self {
+impl From<RedirectionState> for ffi::RedirectionState {
+    fn from(redir_state: RedirectionState) -> Self {
         match redir_state {
-            Some(provided) => match provided {
-                RedirectionState::MatchesConfiguration => {
-                    ffi::RedirectionStateFFI::MatchesConfiguration
-                }
-                RedirectionState::UnknownMount => ffi::RedirectionStateFFI::UnknownMount,
-                RedirectionState::NotMounted => ffi::RedirectionStateFFI::NotMounted,
-                RedirectionState::SymlinkMissing => ffi::RedirectionStateFFI::SymlinkMissing,
-                RedirectionState::SymlinkIncorrect => ffi::RedirectionStateFFI::SymlinkIncorrect,
-            },
-            None => ffi::RedirectionStateFFI::None,
+            RedirectionState::MatchesConfiguration => ffi::RedirectionState::MATCHES_CONFIGURATION,
+            RedirectionState::UnknownMount => ffi::RedirectionState::UNKNOWN_MOUNT,
+            RedirectionState::NotMounted => ffi::RedirectionState::NOT_MOUNTED,
+            RedirectionState::SymlinkMissing => ffi::RedirectionState::SYMLINK_MISSING,
+            RedirectionState::SymlinkIncorrect => ffi::RedirectionState::SYMLINK_INCORRECT,
         }
     }
 }
 
-impl From<ffi::RedirectionTypeFFI> for RedirectionType {
-    fn from(redir: ffi::RedirectionTypeFFI) -> Self {
+impl From<ffi::RedirectionType> for RedirectionType {
+    fn from(redir: ffi::RedirectionType) -> Self {
         match redir {
-            ffi::RedirectionTypeFFI::Bind => RedirectionType::Bind,
-            ffi::RedirectionTypeFFI::Symlink => RedirectionType::Symlink,
-            ffi::RedirectionTypeFFI::Unknown => RedirectionType::Unknown,
+            ffi::RedirectionType::BIND => RedirectionType::Bind,
+            ffi::RedirectionType::SYMLINK => RedirectionType::Symlink,
+            ffi::RedirectionType::UNKNOWN => RedirectionType::Unknown,
             // All the explicitly defined values are mapped above, but shared enums
             // in cxx::bridge need default handling for `match` to be exhaustive
             _ => RedirectionType::Unknown,
@@ -126,20 +144,17 @@ impl From<ffi::RedirectionTypeFFI> for RedirectionType {
     }
 }
 
-impl From<ffi::RedirectionStateFFI> for Option<RedirectionState> {
-    fn from(redir_state: ffi::RedirectionStateFFI) -> Option<RedirectionState> {
+impl From<ffi::RedirectionState> for RedirectionState {
+    fn from(redir_state: ffi::RedirectionState) -> RedirectionState {
         match redir_state {
-            ffi::RedirectionStateFFI::MatchesConfiguration => {
-                Some(RedirectionState::MatchesConfiguration)
-            }
-            ffi::RedirectionStateFFI::UnknownMount => Some(RedirectionState::UnknownMount),
-            ffi::RedirectionStateFFI::NotMounted => Some(RedirectionState::NotMounted),
-            ffi::RedirectionStateFFI::SymlinkMissing => Some(RedirectionState::SymlinkMissing),
-            ffi::RedirectionStateFFI::SymlinkIncorrect => Some(RedirectionState::SymlinkIncorrect),
-            ffi::RedirectionStateFFI::None => None,
+            ffi::RedirectionState::MATCHES_CONFIGURATION => RedirectionState::MatchesConfiguration,
+            ffi::RedirectionState::UNKNOWN_MOUNT => RedirectionState::UnknownMount,
+            ffi::RedirectionState::NOT_MOUNTED => RedirectionState::NotMounted,
+            ffi::RedirectionState::SYMLINK_MISSING => RedirectionState::SymlinkMissing,
+            ffi::RedirectionState::SYMLINK_INCORRECT => RedirectionState::SymlinkIncorrect,
             // All the explicitly defined values are mapped above, but shared enums
             // in cxx::bridge need default handling for `match` to be exhaustive
-            _ => None,
+            _ => RedirectionState::UnknownMount,
         }
     }
 }
