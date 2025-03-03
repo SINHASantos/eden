@@ -1,0 +1,18 @@
+load("@fbcode_macros//build_defs:python_library.bzl", "python_library")
+load("//bento:buck_macros.bzl", "bento_test_kernel")
+
+oncall("source_control")
+
+python_library(
+    name = "usc",
+    srcs = ["usc.py"],
+    deps = [
+        "fbsource//third-party/pypi/pandas:pandas",
+        "//pvc2:pvc2",
+    ],
+)
+
+bento_test_kernel(
+    kernel_name = "eden",
+    notebooks = ["notebooks/usc_probability_distribution.py"],
+)

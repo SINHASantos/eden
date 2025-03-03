@@ -364,21 +364,23 @@ impl<'a> FileStoreBuilder<'a> {
                 None
             };
 
-        // We want to prefetch lots of files, but prefetching millions of files causes us
-        // to tie up memory for longer and make larger allocations. Let's limit fetch size
-        // to try to cut down on memory usage.
-        let max_prefetch_size = self
+        let is_casc_enabled = match self
             .config
-            .get_or("scmstore", "max-prefetch-size", || 100_000)?;
-
-        let cas_client = if self.config.get_or_default("scmstore", "fetch-from-cas")?
+            .get_or_default::<String>("scmstore", "cas-mode")?
+            .as_str()
+        {
+            "files" | "on" => true,
+            _ => false,
+        };
+        let cas_client = if is_casc_enabled
+            || self.config.get_or_default("scmstore", "fetch-from-cas")?
             || self
                 .config
                 .get_or_default("scmstore", "fetch-files-from-cas")?
         {
             self.cas_client
         } else {
-            tracing::debug!(target: "cas", "scmstore disabled (scmstore.fetch-from-cas=false and scmstore.fetch-files-from-cas=false)");
+            tracing::debug!(target: "cas", "scmstore disabled (scmstore.fetch-from-cas=false and scmstore.fetch-files-from-cas=false and scmstore.cas-mode!=files|on)");
             None
         };
 
@@ -395,7 +397,6 @@ impl<'a> FileStoreBuilder<'a> {
 
             prefetch_aux_data,
             compute_aux_data,
-            max_prefetch_size,
 
             indexedlog_local,
             lfs_local,
@@ -412,11 +413,12 @@ impl<'a> FileStoreBuilder<'a> {
 
             aux_cache,
 
-            lfs_progress: AggregatingProgressBar::new("fetching", "LFS"),
             flush_on_drop: true,
             format,
 
             cas_cache_threshold_bytes,
+
+            progress_bar: AggregatingProgressBar::new("fetching from ScmStore", "files"),
         })
     }
 }
@@ -655,10 +657,20 @@ impl<'a> TreeStoreBuilder<'a> {
             self.build_indexedlog_cache()?
         };
 
-        tracing::trace!(target: "revisionstore::treestore", "processing tree_aux_store");
-        let tree_aux_store = if self
+        let is_casc_enabled = match self
             .config
-            .get_or("scmstore", "store-tree-aux-data", || true)?
+            .get_or_default::<String>("scmstore", "cas-mode")?
+            .as_str()
+        {
+            "trees" | "on" => true,
+            _ => false,
+        };
+
+        tracing::trace!(target: "revisionstore::treestore", "processing tree_aux_store");
+        let tree_aux_store = if is_casc_enabled
+            || self
+                .config
+                .get_or("scmstore", "store-tree-aux-data", || true)?
         {
             if let Some(tree_aux_store) = self.tree_aux_store.take() {
                 Some(tree_aux_store)
@@ -690,16 +702,19 @@ impl<'a> TreeStoreBuilder<'a> {
             .config
             .get_or_default("scmstore", "prefetch-tree-parents")?;
 
-        let tree_metadata_mode = match self.config.get("scmstore", "tree-metadata-mode").as_deref()
-        {
-            Some("always") => TreeMetadataMode::Always,
-            None | Some("opt-in") => TreeMetadataMode::OptIn,
-            _ => TreeMetadataMode::Never,
+        let tree_metadata_mode = match is_casc_enabled {
+            true => TreeMetadataMode::Always,
+            _ => match self.config.get("scmstore", "tree-metadata-mode").as_deref() {
+                Some("always") => TreeMetadataMode::Always,
+                None | Some("opt-in") => TreeMetadataMode::OptIn,
+                _ => TreeMetadataMode::Never,
+            },
         };
 
-        let fetch_tree_aux_data = self
-            .config
-            .get_or_default::<bool>("scmstore", "fetch-tree-aux-data")?;
+        let fetch_tree_aux_data = is_casc_enabled
+            || self
+                .config
+                .get_or_default::<bool>("scmstore", "fetch-tree-aux-data")?;
 
         if fetch_tree_aux_data && tree_aux_store.is_none() {
             tracing::warn!(
@@ -707,7 +722,8 @@ impl<'a> TreeStoreBuilder<'a> {
             );
         }
 
-        let cas_client = if self.config.get_or_default("scmstore", "fetch-from-cas")?
+        let cas_client = if is_casc_enabled
+            || self.config.get_or_default("scmstore", "fetch-from-cas")?
             || self
                 .config
                 .get_or_default("scmstore", "fetch-trees-from-cas")?
@@ -723,7 +739,7 @@ impl<'a> TreeStoreBuilder<'a> {
 
             self.cas_client
         } else {
-            tracing::debug!(target: "cas", "scmstore disabled (scmstore.fetch-from-cas=false and scmstore.fetch-trees-from-cas=false)");
+            tracing::debug!(target: "cas", "scmstore disabled (scmstore.fetch-from-cas=false and scmstore.fetch-trees-from-cas=false and scmstore.cas-mode!=trees|on)");
             None
         };
 
@@ -743,6 +759,7 @@ impl<'a> TreeStoreBuilder<'a> {
             fetch_tree_aux_data,
             flush_on_drop: true,
             format,
+            progress_bar: AggregatingProgressBar::new("fetching from ScmStore", "trees"),
         })
     }
 }

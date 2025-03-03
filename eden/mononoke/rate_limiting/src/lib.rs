@@ -15,9 +15,6 @@ use anyhow::Error;
 use async_trait::async_trait;
 use cached_config::ConfigHandle;
 use fbinit::FacebookInit;
-use mononoke_macros::mononoke;
-use ods_counters::CounterManager;
-use ods_counters::OdsCounterManager;
 use permission_checker::MononokeIdentitySet;
 use permission_checker::MononokeIdentitySetExt;
 use scuba_ext::MononokeScubaSampleBuilder;
@@ -84,7 +81,6 @@ pub struct RateLimitEnvironment {
     fb: FacebookInit,
     category: String,
     config: ConfigHandle<MononokeRateLimitConfig>,
-    counter_manager: OdsCounterManager,
 }
 
 impl RateLimitEnvironment {
@@ -92,36 +88,16 @@ impl RateLimitEnvironment {
         fb: FacebookInit,
         category: String,
         config: ConfigHandle<MononokeRateLimitConfig>,
-        counter_manager: OdsCounterManager,
     ) -> Self {
         Self {
             fb,
             category,
             config,
-            counter_manager,
         }
     }
 
-    pub async fn get_rate_limiter(&mut self) -> BoxRateLimiter {
+    pub fn get_rate_limiter(&self) -> BoxRateLimiter {
         let config = self.config.get();
-        for limit in &config.load_shed_limits {
-            match &limit.raw_config.load_shedding_metric {
-                LoadSheddingMetric::external_ods_counter(counter) => {
-                    self.counter_manager
-                        .add_counter(counter.entity.clone(), counter.key.clone())
-                        .await;
-                }
-                _ => {}
-            };
-        }
-
-        let mut counter_manager_clone = self.counter_manager.clone();
-
-        mononoke::spawn_task(async move {
-            counter_manager_clone
-                .run_periodic_fetch(Duration::from_secs(1))
-                .await;
-        });
 
         create_rate_limiter(self.fb, self.category.clone(), config)
     }
@@ -212,19 +188,20 @@ impl LoadShedLimit {
         }
 
         // Fetch the counter
-        let value = match self.raw_config.load_shedding_metric.clone() {
+        let (metric_string, value) = match self.raw_config.load_shedding_metric.clone() {
             LoadSheddingMetric::local_fb303_counter(metric) => {
                 let metric = metric.to_string();
-                STATS::load_shed_counter.get_value(fb, (metric.clone(),))
+                (
+                    metric.clone(),
+                    STATS::load_shed_counter.get_value(fb, (metric,)),
+                )
             }
-            _ => None,
+            _ => ("".to_string(), None),
         };
-
-        let metric = self.raw_config.metric.to_string();
 
         match value {
             Some(value) if value > self.raw_config.limit => {
-                log_or_enforce_status(self.raw_config.clone(), metric, value, scuba)
+                log_or_enforce_status(self.raw_config.clone(), metric_string, value, scuba)
             }
             _ => LoadShedResult::Pass,
         }

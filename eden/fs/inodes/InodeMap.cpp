@@ -24,6 +24,7 @@
 #include "eden/fs/inodes/ParentInodeInfo.h"
 #include "eden/fs/inodes/TreeInode.h"
 #include "eden/fs/telemetry/EdenStats.h"
+#include "eden/fs/telemetry/LogEvent.h"
 #include "eden/fs/utils/NotImplemented.h"
 
 using folly::Future;
@@ -103,8 +104,12 @@ InodeType InodeMap::UnloadedInode::getInodeType() const {
 InodeMap::InodeMap(
     EdenMount* mount,
     std::shared_ptr<ReloadableConfig> config,
-    EdenStatsPtr stats)
-    : mount_{mount}, config_{std::move(config)}, stats_{std::move(stats)} {}
+    EdenStatsPtr stats,
+    std::shared_ptr<StructuredLogger> logger)
+    : mount_{mount},
+      config_{std::move(config)},
+      stats_{std::move(stats)},
+      structuredLogger_{std::move(logger)} {}
 
 InodeMap::~InodeMap() {
   // TODO: We need to clean up the EdenMount / InodeMap destruction process a
@@ -290,6 +295,7 @@ ImmediateFuture<InodePtr> InodeMap::lookupInode(InodeNumber number) {
       // windows does not have ESTALE. We need some other error to turn into the
       // nfs stale error. For now let's just let it throw.
 #ifndef _WIN32
+      structuredLogger_->logEvent(NFSStaleError{number.getRawValue()});
       return ImmediateFuture<InodePtr>{folly::Try<InodePtr>{
           std::system_error{std::error_code{ESTALE, std::system_category()}}}};
 #endif
@@ -523,8 +529,8 @@ InodeMap::PromiseVector InodeMap::inodeLoadComplete(InodeBase* inode) {
 void InodeMap::inodeLoadFailed(
     InodeNumber number,
     const folly::exception_wrapper& ex) {
-  XLOG(ERR) << "failed to load inode " << number << ": "
-            << folly::exceptionStr(ex);
+  auto errStr = folly::exceptionStr(ex);
+  XLOGF(ERR, "failed to load inode {}: {}", number, errStr);
   auto promises = extractPendingPromises(number);
   for (auto& promise : promises) {
     promise.setException(ex);
@@ -533,6 +539,13 @@ void InodeMap::inodeLoadFailed(
   if (optionalFailEvent.has_value()) {
     mount_->publishInodeTraceEvent(std::move(optionalFailEvent.value()));
   }
+
+#ifdef __APPLE__
+  // Temporarily log every inode load failure and associated error string.
+  // This data will help us understand the impact of X2P errors on EdenFS.
+  structuredLogger_->logEvent(
+      InodeLoadingFailed{errStr.toStdString(), number.getRawValue()});
+#endif // __APPLE__
   stats_->increment(&InodeMapStats::lookupInodeError, promises.size());
 }
 

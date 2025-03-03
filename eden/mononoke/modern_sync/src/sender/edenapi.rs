@@ -15,6 +15,7 @@ use clientinfo::ClientEntryPoint;
 use clientinfo::ClientInfo;
 use cloned::cloned;
 use context::CoreContext;
+use edenapi::paths;
 use edenapi::Client;
 use edenapi::HttpClientBuilder;
 use edenapi::HttpClientConfig;
@@ -32,6 +33,7 @@ use futures::stream;
 use futures::FutureExt;
 use futures::StreamExt;
 use futures::TryStreamExt;
+use http_client::HttpVersion;
 use mercurial_types::blobs::HgBlobChangeset;
 use mercurial_types::HgChangesetId;
 use mercurial_types::HgFileNodeId;
@@ -47,7 +49,6 @@ use slog::Logger;
 use url::Url;
 mod util;
 
-const MAX_BLOB_BYTES: u64 = 100 * 1024 * 1024; // 100 MB
 const MAX_RETRIES: usize = 3;
 
 pub struct EdenapiSender {
@@ -71,15 +72,8 @@ impl EdenapiSender {
             cert_path: Some(tls_args.tls_certificate.into()),
             key_path: Some(tls_args.tls_private_key.into()),
             ca_path: Some(tls_args.tls_ca.into()),
-            convert_cert: false,
-
             client_info: Some(ci),
-            disable_tls_verification: false,
-            max_concurrent_requests: None,
-            unix_socket_domains: HashSet::new(),
-            unix_socket_path: None,
-            verbose: false,
-            verbose_stats: false,
+            ..Default::default()
         };
 
         info!(logger, "Connecting to {}", url.to_string());
@@ -88,6 +82,7 @@ impl EdenapiSender {
             .repo_name(&reponame)
             .server_url(url)
             .http_config(http_config)
+            .http_version(HttpVersion::V11)
             .timeout(Duration::from_secs(300))
             .build()?;
 
@@ -113,51 +108,38 @@ impl EdenapiSender {
         &self,
         contents: Vec<(AnyFileContentId, FileContents)>,
     ) -> Result<()> {
-        // Batch contents by size
-        let mut batches = Vec::new();
-        let mut current_batch = Vec::new();
-        let mut current_size = 0;
-        for (id, blob) in contents {
-            let size = blob.size();
-            if current_size + size > MAX_BLOB_BYTES {
-                let batch = std::mem::take(&mut current_batch);
-                batches.push(batch);
-                current_size = 0;
-            }
-            current_batch.push((id, blob));
-            current_size += size;
-        }
-        if !current_batch.is_empty() {
-            batches.push(current_batch);
-        }
-
         let repo_blobstore = self.repo_blobstore.clone();
         let ctx = self.ctx.clone();
-        for batch in batches {
-            let mut full_items = Vec::new();
 
-            for (id, blob) in batch {
-                cloned!(ctx, repo_blobstore);
-                let stream = stream_file_bytes(&repo_blobstore, &ctx, blob, Range::all())?;
-                let bytes = util::concatenate_bytes(stream.try_collect::<Vec<_>>().await?);
-                full_items.push((id, bytes.into()));
-            }
+        let mut full_items = Vec::new();
 
-            let expected_responses = full_items.len();
-            let response = self
-                .client
-                .process_files_upload(full_items, None, None)
-                .await?;
-
-            let actual_responses = response.entries.try_collect::<Vec<_>>().await?.len();
-
-            ensure!(
-                expected_responses == actual_responses,
-                "Content upload: Expected {} responses, got {}",
-                expected_responses,
-                actual_responses
-            );
+        for (id, blob) in contents {
+            cloned!(ctx, repo_blobstore);
+            let stream = stream_file_bytes(&repo_blobstore, &ctx, blob, Range::all())?;
+            let bytes = util::concatenate_bytes(stream.try_collect::<Vec<_>>().await?);
+            full_items.push((id, bytes.into()));
         }
+
+        let expected_responses = full_items.len();
+        let response = self
+            .client
+            .process_files_upload(full_items, None, None)
+            .await?;
+
+        util::log_stats_to_scuba(
+            ctx.scuba().clone(),
+            &response.stats.await?,
+            paths::UPLOAD_FILE,
+        );
+
+        let actual_responses = response.entries.try_collect::<Vec<_>>().await?.len();
+
+        ensure!(
+            expected_responses == actual_responses,
+            "Content upload: Expected {} responses, got {}",
+            expected_responses,
+            actual_responses
+        );
 
         Ok(())
     }
@@ -181,6 +163,13 @@ impl EdenapiSender {
         let expected_responses = entries.len();
         let res = self.client.upload_trees_batch(entries).await?;
         let actual_responses = res.entries.try_collect::<Vec<_>>().await?.len();
+
+        util::log_stats_to_scuba(
+            self.ctx.scuba().clone(),
+            &res.stats.await?,
+            paths::UPLOAD_TREES,
+        );
+
         ensure!(
             expected_responses == actual_responses,
             "Trees upload: Expected {} responses, got {}",
@@ -208,6 +197,13 @@ impl EdenapiSender {
         let expected_responses = filenodes.len();
         let res = self.client.upload_filenodes_batch(filenodes).await?;
         let actual_responses = res.entries.try_collect::<Vec<_>>().await?.len();
+
+        util::log_stats_to_scuba(
+            self.ctx.scuba().clone(),
+            &res.stats.await?,
+            paths::UPLOAD_FILENODES,
+        );
+
         ensure!(
             expected_responses == actual_responses,
             "Filenodes upload: Expected {} responses, got {}",
@@ -258,6 +254,12 @@ impl EdenapiSender {
 
         let expected_responses = entries.len();
         let res = self.client.upload_identical_changesets(entries).await?;
+        util::log_stats_to_scuba(
+            self.ctx.scuba().clone(),
+            &res.stats.await?,
+            paths::UPLOAD_IDENTICAL_CHANGESET,
+        );
+
         let responses = res.entries.try_collect::<Vec<_>>().await?;
         ensure!(
             expected_responses == responses.len(),

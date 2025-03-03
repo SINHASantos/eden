@@ -43,6 +43,8 @@ mononoke_queries! {
         Option<Timestamp>,
         RequestStatus,
         Option<ClaimedBy>,
+        Option<u8>,
+        Option<Timestamp>,
     ) {
         "SELECT id,
             request_type,
@@ -55,7 +57,9 @@ mononoke_queries! {
             ready_at,
             polled_at,
             status,
-            claimed_by
+            claimed_by,
+            num_retries,
+            failed_at
         FROM long_running_request_queue
         WHERE id = {id}"
     }
@@ -73,6 +77,8 @@ mononoke_queries! {
         Option<Timestamp>,
         RequestStatus,
         Option<ClaimedBy>,
+        Option<u8>,
+        Option<Timestamp>,
     ) {
         "SELECT id,
             request_type,
@@ -85,7 +91,9 @@ mononoke_queries! {
             ready_at,
             polled_at,
             status,
-            claimed_by
+            claimed_by,
+            num_retries,
+            failed_at
         FROM long_running_request_queue
         WHERE id = {id} AND request_type = {request_type}"
     }
@@ -103,8 +111,10 @@ mononoke_queries! {
         Option<Timestamp>,
         RequestStatus,
         Option<ClaimedBy>,
+        Option<u8>,
+        Option<Timestamp>,
     ) {
-        "SELECT id,
+        mysql("SELECT id,
             request_type,
             repo_id,
             args_blobstore_key,
@@ -115,12 +125,33 @@ mononoke_queries! {
             ready_at,
             polled_at,
             status,
-            claimed_by
+            claimed_by,
+            num_retries,
+            failed_at
         FROM long_running_request_queue
         WHERE status = 'new' AND repo_id IS NULL
         ORDER BY created_at ASC
         LIMIT 1
-        "
+        ")
+        sqlite("SELECT id,
+            request_type,
+            repo_id,
+            args_blobstore_key,
+            result_blobstore_key,
+            created_at,
+            started_processing_at,
+            inprogress_last_updated_at,
+            ready_at,
+            polled_at,
+            status,
+            claimed_by,
+            num_retries,
+            failed_at
+        FROM long_running_request_queue
+        WHERE status = 'new' AND repo_id IS NULL
+        ORDER BY created_at ASC
+        LIMIT 1
+        ")
     }
 
     read GetOneNewRequestForRepos(>list supported_repo_ids: RepositoryId) -> (
@@ -136,6 +167,8 @@ mononoke_queries! {
         Option<Timestamp>,
         RequestStatus,
         Option<ClaimedBy>,
+        Option<u8>,
+        Option<Timestamp>,
     ) {
         mysql("SELECT id,
             request_type,
@@ -148,9 +181,10 @@ mononoke_queries! {
             ready_at,
             polled_at,
             status,
-            claimed_by
+            claimed_by,
+            num_retries,
+            failed_at
         FROM long_running_request_queue
-        FORCE INDEX (request_dequeue)
         WHERE status = 'new' AND repo_id IN {supported_repo_ids}
         ORDER BY created_at ASC
         LIMIT 1
@@ -166,7 +200,9 @@ mononoke_queries! {
             ready_at,
             polled_at,
             status,
-            claimed_by
+            claimed_by,
+            num_retries,
+            failed_at
         FROM long_running_request_queue
         WHERE status = 'new' AND repo_id IN {supported_repo_ids}
         ORDER BY created_at ASC
@@ -274,6 +310,24 @@ mononoke_queries! {
         "
     }
 
+    write MarkRequestFailed(id: RowId, request_type: RequestType, failed_at: Timestamp) {
+        none,
+        "
+        UPDATE long_running_request_queue
+        SET status = 'failed', failed_at = {failed_at}
+        WHERE id = {id} AND request_type = {request_type} AND status = 'inprogress'
+        "
+    }
+
+    write MarkRequestAsNewForRetry(id: RowId, request_type: RequestType, num_retries: u8) {
+        none,
+        "
+        UPDATE long_running_request_queue
+        SET status = 'new', claimed_by = NULL, inprogress_last_updated_at = NULL, num_retries = {num_retries}
+        WHERE id = {id} AND request_type = {request_type} AND status = 'inprogress'
+        "
+    }
+
     write TestMark(id: RowId, status: RequestStatus) {
         none,
         "UPDATE long_running_request_queue
@@ -295,8 +349,10 @@ mononoke_queries! {
         Option<Timestamp>,
         RequestStatus,
         Option<ClaimedBy>,
+        Option<u8>,
+        Option<Timestamp>,
     ) {
-        "SELECT id,
+       mysql( "SELECT id,
             request_type,
             repo_id,
             args_blobstore_key,
@@ -307,12 +363,34 @@ mononoke_queries! {
             ready_at,
             polled_at,
             status,
-            claimed_by
+            claimed_by,
+            num_retries,
+            failed_at
+        FROM long_running_request_queue
+        FORCE INDEX (list_requests_any)
+        WHERE (
+            inprogress_last_updated_at > {last_update_newer_than} OR
+            (status = 'new' AND created_at > {last_update_newer_than})
+        )")
+        sqlite( "SELECT id,
+            request_type,
+            repo_id,
+            args_blobstore_key,
+            result_blobstore_key,
+            created_at,
+            started_processing_at,
+            inprogress_last_updated_at,
+            ready_at,
+            polled_at,
+            status,
+            claimed_by,
+            num_retries,
+            failed_at
         FROM long_running_request_queue
         WHERE (
             inprogress_last_updated_at > {last_update_newer_than} OR
             (status = 'new' AND created_at > {last_update_newer_than})
-        )"
+        )")
     }
 
     read ListRequestsForRepos(last_update_newer_than: Timestamp, >list repo_ids: RepositoryId) -> (
@@ -328,8 +406,10 @@ mononoke_queries! {
         Option<Timestamp>,
         RequestStatus,
         Option<ClaimedBy>,
+        Option<u8>,
+        Option<Timestamp>,
     ) {
-        "SELECT id,
+        mysql("SELECT id,
             request_type,
             repo_id,
             args_blobstore_key,
@@ -340,12 +420,34 @@ mononoke_queries! {
             ready_at,
             polled_at,
             status,
-            claimed_by
+            claimed_by,
+            num_retries,
+            failed_at
+        FROM long_running_request_queue
+        FORCE INDEX (list_requests)
+        WHERE repo_id IN {repo_ids} AND (
+            inprogress_last_updated_at > {last_update_newer_than} OR
+            (status = 'new' AND created_at > {last_update_newer_than})
+        )")
+        sqlite("SELECT id,
+            request_type,
+            repo_id,
+            args_blobstore_key,
+            result_blobstore_key,
+            created_at,
+            started_processing_at,
+            inprogress_last_updated_at,
+            ready_at,
+            polled_at,
+            status,
+            claimed_by,
+            num_retries,
+            failed_at
         FROM long_running_request_queue
         WHERE repo_id IN {repo_ids} AND (
             inprogress_last_updated_at > {last_update_newer_than} OR
             (status = 'new' AND created_at > {last_update_newer_than})
-        )"
+        )")
     }
 
     read GetQueueLengthForRepos(>list repo_ids: RepositoryId) -> (
@@ -377,7 +479,7 @@ mononoke_queries! {
     ) {
         "SELECT status, min(created_at), min(inprogress_last_updated_at), min(ready_at)
         FROM long_running_request_queue
-        WHERE repo_id IN {repo_ids} AND status != 'polled'
+        WHERE repo_id IN {repo_ids} AND status NOT IN ('polled', 'failed')
         GROUP BY status
         "
     }
@@ -387,7 +489,7 @@ mononoke_queries! {
     ) {
         "SELECT repo_id, status, min(created_at), min(inprogress_last_updated_at), min(ready_at)
         FROM long_running_request_queue
-        WHERE repo_id IN {repo_ids} AND status != 'polled'
+        WHERE repo_id IN {repo_ids} AND status NOT IN ('polled', 'failed')
         GROUP BY repo_id, status
         "
     }
@@ -397,7 +499,7 @@ mononoke_queries! {
     ) {
         "SELECT status, min(created_at), min(inprogress_last_updated_at), min(ready_at)
         FROM long_running_request_queue
-        WHERE status != 'polled'
+        WHERE status NOT IN ('polled', 'failed')
         GROUP BY status
         "
     }
@@ -407,7 +509,7 @@ mononoke_queries! {
     ) {
         "SELECT repo_id, status, min(created_at), min(inprogress_last_updated_at), min(ready_at)
         FROM long_running_request_queue
-        WHERE status != 'polled'
+        WHERE status NOT IN ('polled', 'failed')
         GROUP BY repo_id, status
         "
     }
@@ -427,6 +529,8 @@ fn row_to_entry(
         Option<Timestamp>,
         RequestStatus,
         Option<ClaimedBy>,
+        Option<u8>,
+        Option<Timestamp>,
     ),
 ) -> LongRunningRequestEntry {
     let (
@@ -442,6 +546,8 @@ fn row_to_entry(
         polled_at,
         status,
         claimed_by,
+        num_retries,
+        failed_at,
     ) = row;
     LongRunningRequestEntry {
         id,
@@ -456,6 +562,8 @@ fn row_to_entry(
         polled_at,
         status,
         claimed_by,
+        num_retries,
+        failed_at,
     }
 }
 
@@ -760,6 +868,60 @@ impl LongRunningRequestsQueue for SqlLongRunningRequestsQueue {
             .await?,
         })
     }
+
+    async fn update_for_retry_or_fail(
+        &self,
+        _ctx: &CoreContext,
+        req_id: &RequestId,
+        max_retry_allowed: u8,
+    ) -> Result<bool> {
+        let txn = self
+            .connections
+            .write_connection
+            .start_transaction()
+            .await?;
+
+        let (mut txn, rows) = GetRequest::query_with_transaction(txn, &req_id.0, &req_id.1).await?;
+        let will_retry = match rows.into_iter().next() {
+            None => bail!("Failed to get request: {:?}", req_id),
+            Some(row) => {
+                let entry = row_to_entry(row);
+                match &entry.status {
+                    RequestStatus::InProgress => {
+                        let next_retry = entry.num_retries.unwrap_or(0) + 1;
+                        if next_retry > max_retry_allowed {
+                            txn = MarkRequestFailed::query_with_transaction(
+                                txn,
+                                &req_id.0,
+                                &req_id.1,
+                                &Timestamp::now(),
+                            )
+                            .await?
+                            .0;
+                            Ok(false)
+                        } else {
+                            txn = MarkRequestAsNewForRetry::query_with_transaction(
+                                txn,
+                                &req_id.0,
+                                &req_id.1,
+                                &next_retry,
+                            )
+                            .await?
+                            .0;
+                            Ok(true)
+                        }
+                    }
+                    _ => bail!(
+                        "Request {:?} is not in progress, it can't be retried",
+                        req_id
+                    ),
+                }
+            }
+        };
+        txn.commit().await?;
+
+        will_retry
+    }
 }
 
 async fn get_queue_length(
@@ -805,7 +967,7 @@ async fn get_queue_age(
                 RequestStatus::New => (status, created_at),
                 RequestStatus::InProgress => (status, inprogress_last_updated_at.unwrap_or(0)),
                 RequestStatus::Ready => (status, ready_at.unwrap_or(0)),
-                RequestStatus::Polled => (status, 0), // should not happen, but if it does we'll ignore
+                RequestStatus::Polled | RequestStatus::Failed => (status, 0), // should not happen, but if it does we'll ignore
             }
         },
     )
@@ -831,7 +993,7 @@ async fn get_queue_age_by_repo(
                     (repo_id, status, inprogress_last_updated_at.unwrap_or(0))
                 }
                 RequestStatus::Ready => (repo_id, status, ready_at.unwrap_or(0)),
-                RequestStatus::Polled => (repo_id, status, 0), // should not happen, but if it does we'll ignore
+                RequestStatus::Polled | RequestStatus::Failed => (repo_id, status, 0), // should not happen, but if it does we'll ignore
             }
         },
     )

@@ -8,10 +8,13 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::time::Duration;
+use std::vec::IntoIter;
 
 use futures::prelude::*;
 use url::Url;
 
+use crate::claimer::RequestClaimer;
 use crate::driver::MultiDriver;
 use crate::errors::Abort;
 use crate::errors::HttpClientError;
@@ -46,6 +49,7 @@ pub struct HttpClient {
     pool: Pool,
     event_listeners: HttpClientEventListeners,
     config: Config,
+    claimer: RequestClaimer,
 }
 
 #[derive(Clone, Debug)]
@@ -57,7 +61,14 @@ pub struct Config {
 
     pub client_info: Option<String>,
     pub disable_tls_verification: bool,
+    // This sets curl's max connection limit, and (if `limit_requests==true`) causes this
+    // library to limit the number of in-flight requests separately, _before_ the
+    // requests are given to curl.
     pub max_concurrent_requests: Option<usize>,
+    // Escape hatch to turn off our request limiting.
+    pub limit_requests: bool,
+    // Escape hatch to turn off our response body limiting.
+    pub limit_response_buffering: bool,
     pub unix_socket_domains: HashSet<String>,
     pub unix_socket_path: Option<String>,
     pub verbose: bool,
@@ -84,6 +95,8 @@ impl Default for Config {
             client_info: None,
             disable_tls_verification: false,
             max_concurrent_requests: None, // No limit by default
+            limit_requests: true,
+            limit_response_buffering: true,
             unix_socket_domains: HashSet::new(),
             unix_socket_path: None,
             verbose: false,
@@ -98,8 +111,11 @@ impl HttpClient {
     }
 
     pub fn from_config(config: Config) -> Self {
+        let claimer = RequestClaimer::new(config.limit_requests, config.max_concurrent_requests);
+
         Self {
             config,
+            claimer,
             pool: Pool::new(),
             event_listeners: Default::default(),
         }
@@ -112,6 +128,7 @@ impl HttpClient {
 
     pub fn max_concurrent_requests(mut self, max: Option<usize>) -> Self {
         self.config.max_concurrent_requests = max;
+        self.claimer = self.claimer.with_limit(max);
         self
     }
 
@@ -123,9 +140,12 @@ impl HttpClient {
     ///
     /// The closure returns a boolean. If false, this function will
     /// return early and all other pending transfers will be aborted.
-    pub fn send<I, F>(&self, requests: I, mut response_cb: F) -> Result<Stats, HttpClientError>
+    pub fn send<F>(
+        &self,
+        requests: Vec<Request>,
+        mut response_cb: F,
+    ) -> Result<Stats, HttpClientError>
     where
-        I: IntoIterator<Item = Request>,
         F: FnMut(Result<Response, HttpClientError>) -> Result<(), Abort>,
     {
         let mut multi = self.pool.multi();
@@ -198,7 +218,7 @@ impl HttpClient {
 
         for req in requests {
             let request_info = req.ctx().info().clone();
-            let (receiver, streams) = ChannelReceiver::new();
+            let (receiver, streams) = ChannelReceiver::new(self.config.limit_response_buffering);
 
             // Create a blocking streaming HTTP request to be dispatched on a
             // separate IO task.
@@ -224,46 +244,84 @@ impl HttpClient {
     /// Note that this function is not asynchronous; it WILL BLOCK
     /// until all of the transfers are complete, and will return
     /// the total stats across all transfers when complete.
-    pub fn stream<I>(&self, requests: I) -> Result<Stats, HttpClientError>
-    where
-        I: IntoIterator<Item = StreamRequest>,
-    {
-        let mut multi = self.pool.multi();
-        multi
-            .get_mut()
-            .set_max_total_connections(self.config.max_concurrent_requests.unwrap_or(0))?;
-        let driver = MultiDriver::new(multi.get(), self.config.verbose_stats);
-        for mut request in requests {
-            self.event_listeners
-                .trigger_new_request(request.request.ctx_mut());
-            let handle: Easy2H = request.try_into()?;
-            driver.add(handle)?;
-        }
+    pub fn stream(&self, requests: Vec<StreamRequest>) -> Result<Stats, HttpClientError> {
+        // Add as many of remaining requests to the handle as we can, limited by the claimer.
+        let try_add =
+            |h: &MultiDriver, reqs: &mut IntoIter<StreamRequest>| -> Result<(), HttpClientError> {
+                for claim in self.claimer.try_claim_requests(reqs.len()) {
+                    let mut request = match reqs.next() {
+                        Some(request) => request,
+                        // Shouldn't happen, but just in case.
+                        None => break,
+                    };
 
-        let mut tls_error = false;
-        let result = driver
-            .perform(|res| {
-                if let Err((_, e)) = &res {
-                    let e: HttpClientError = e.clone().into();
-                    if let HttpClientError::Tls(_) = e {
-                        tls_error = true;
-                    }
+                    self.event_listeners
+                        .trigger_new_request(request.request.ctx_mut());
+                    h.add(request.into_easy(claim)?)?;
                 }
-                self.report_result_and_drop_receiver(res)
-            })
-            .inspect(|stats| {
-                self.event_listeners.trigger_stats(stats);
-            });
 
-        drop(driver);
+                Ok(())
+            };
 
-        // Don't reuse the connection if we've hit auth issues. We've seen cases where we reuse
-        // expired credentials.
-        if tls_error {
-            multi.discard();
+        let mut requests = requests.into_iter();
+        let mut stats = Stats::default();
+
+        while requests.len() > 0 {
+            let mut multi = self.pool.multi();
+            multi
+                .get_mut()
+                // TODO: don't conflate connections with requests
+                .set_max_total_connections(self.config.max_concurrent_requests.unwrap_or(0))?;
+
+            let driver = MultiDriver::new(multi.get(), self.config.verbose_stats);
+
+            // Add requests to the driver. This can add anywhere from zero to all the requests.
+            try_add(&driver, &mut requests)?;
+
+            let mut tls_error = false;
+            let result = driver
+                .perform(|res| {
+                    if let Err((_, e)) = &res {
+                        let e: HttpClientError = e.clone().into();
+                        if let HttpClientError::Tls(_) = e {
+                            tls_error = true;
+                        }
+                    }
+
+                    self.report_result_and_drop_receiver(res)?;
+
+                    // A request finished - let's see if there are pending requests we can now add
+                    // to this multi. This allows pending requests to proceed without needing to
+                    // wait for _all_ in-progress requests to finish. Note that there may be other
+                    // curl multis active bound by the same request limit, so it is still possible
+                    // for our pending requests to wait longer than they need to (i.e. when a
+                    // request finishes on a different multi, our loop here will still wait for one
+                    // of our requests to finish before trying to enqueue new requests).
+                    try_add(&driver, &mut requests).map_err(|err| Abort::WithReason(err.into()))
+                })
+                .inspect(|stats| {
+                    self.event_listeners.trigger_stats(stats);
+                });
+
+            drop(driver);
+
+            // Don't reuse the connection if we've hit auth issues. We've seen cases where we reuse
+            // expired credentials.
+            if tls_error {
+                multi.discard();
+            }
+
+            stats += result?;
+
+            if requests.len() > 0 {
+                // We still have pending requests. This likely mean requests on a
+                // different multi are using up all the request slots. Add a small sleep
+                // to avoid spinning CPU while we wait for requests slots.
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
 
-        result
+        Ok(stats)
     }
 
     /// Obtain the `HttpClientEventListeners` to register callbacks.
@@ -318,7 +376,11 @@ impl HttpClient {
 
     /// Create a request with this client's config applied.
     pub fn new_request(&self, url: Url, method: Method) -> Request {
-        self.configure_request(Request::new(url, method))
+        self.configure_request(Request::new(
+            url,
+            method,
+            self.claimer.with_limit(self.config.max_concurrent_requests),
+        ))
     }
 
     /// Create a GET request with this client's config applied.
@@ -367,6 +429,8 @@ impl HttpClient {
         req.set_verify_tls_cert(!self.config.disable_tls_verification);
         req.set_verify_tls_host(!self.config.disable_tls_verification);
 
+        req.set_limit_response_buffering(self.config.limit_response_buffering);
+
         req
     }
 }
@@ -412,21 +476,22 @@ mod tests {
 
         let server_url = Url::parse(&server.url())?;
 
+        let client = HttpClient::new();
+
         let url1 = server_url.join("test1")?;
-        let req1 = Request::get(url1);
+        let req1 = client.get(url1);
 
         let url2 = server_url.join("test2")?;
-        let req2 = Request::get(url2);
+        let req2 = client.get(url2);
 
         let url3 = server_url.join("test3")?;
-        let req3 = Request::get(url3);
+        let req3 = client.get(url3);
 
         let mut not_received = HashSet::new();
         not_received.insert(body1.to_vec());
         not_received.insert(body2.to_vec());
         not_received.insert(body3.to_vec());
 
-        let client = HttpClient::new();
         let stats = client.send(vec![req1, req2, req3], |res| {
             let res = res.unwrap();
             assert_eq!(res.head.status, StatusCode::CREATED);
@@ -472,19 +537,20 @@ mod tests {
 
         let server_url = Url::parse(&server.url())?;
 
+        let client = HttpClient::new();
+
         let url1 = server_url.join("test1")?;
         let rcv1 = TestReceiver::new();
-        let req1 = Request::get(url1).into_streaming(Box::new(rcv1.clone()));
+        let req1 = client.get(url1).into_streaming(Box::new(rcv1.clone()));
 
         let url2 = server_url.join("test2")?;
         let rcv2 = TestReceiver::new();
-        let req2 = Request::get(url2).into_streaming(Box::new(rcv2.clone()));
+        let req2 = client.get(url2).into_streaming(Box::new(rcv2.clone()));
 
         let url3 = server_url.join("test3")?;
         let rcv3 = TestReceiver::new();
-        let req3 = Request::get(url3).into_streaming(Box::new(rcv3.clone()));
+        let req3 = client.get(url3).into_streaming(Box::new(rcv3.clone()));
 
-        let client = HttpClient::new();
         let stats = client.stream(vec![req1, req2, req3])?;
 
         mock1.assert();
@@ -535,16 +601,17 @@ mod tests {
 
         let server_url = Url::parse(&server.url())?;
 
+        let client = HttpClient::new();
+
         let url1 = server_url.join("test1")?;
-        let req1 = Request::get(url1);
+        let req1 = client.get(url1);
 
         let url2 = server_url.join("test2")?;
-        let req2 = Request::get(url2);
+        let req2 = client.get(url2);
 
         let url3 = server_url.join("test3")?;
-        let req3 = Request::get(url3);
+        let req3 = client.get(url3);
 
-        let client = HttpClient::new();
         let (futures, stats) = client.send_async(vec![req1, req2, req3])?;
 
         let mut responses = Vec::new();
@@ -589,7 +656,6 @@ mod tests {
             .create();
 
         let url = server_url.join("test1")?;
-        let request = Request::get(url);
 
         let (tx, rx) = crossbeam::channel::unbounded();
         let (msg_tx, msg_rx) = crossbeam::channel::unbounded();
@@ -658,6 +724,8 @@ mod tests {
             assert_eq!(msg_rx.recv().unwrap(), "on_download_bytes");
             assert_eq!(msg_rx.recv().unwrap(), "on_succeeded_request");
         };
+
+        let request = client.get(url);
 
         let stats = client.send(vec![request.clone()], |_| Ok(()))?;
         assert_eq!(stats, rx.recv()?);

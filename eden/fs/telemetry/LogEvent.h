@@ -221,6 +221,10 @@ struct FinishedCheckout : public EdenFSEvent {
   uint64_t accessedBlobs = 0;
   uint64_t accessedBlobsAuxData = 0;
   uint64_t numConflicts = 0;
+  uint64_t numLoadedInodes = 0;
+  uint64_t numUnloadedInodes = 0;
+  uint64_t numPeriodicLinkedUnloadedInodes = 0;
+  uint64_t numPeriodicUnlinkedUnloadedInodes = 0;
 
   FinishedCheckout(
       std::string mode,
@@ -232,7 +236,11 @@ struct FinishedCheckout : public EdenFSEvent {
       uint64_t accessedTrees,
       uint64_t accessedBlobs,
       uint64_t accessedBlobsAuxData,
-      uint64_t numConflicts)
+      uint64_t numConflicts,
+      uint64_t numLoadedInodes,
+      uint64_t numUnloadedInodes,
+      uint64_t numPeriodicLinkedUnloadedInodes,
+      uint64_t numPeriodicUnlinkedUnloadedInodes)
       : mode(std::move(mode)),
         duration(duration),
         success(success),
@@ -242,7 +250,11 @@ struct FinishedCheckout : public EdenFSEvent {
         accessedTrees(accessedTrees),
         accessedBlobs(accessedBlobs),
         accessedBlobsAuxData(accessedBlobsAuxData),
-        numConflicts(numConflicts) {}
+        numConflicts(numConflicts),
+        numLoadedInodes(numLoadedInodes),
+        numUnloadedInodes(numUnloadedInodes),
+        numPeriodicLinkedUnloadedInodes(numPeriodicLinkedUnloadedInodes),
+        numPeriodicUnlinkedUnloadedInodes(numPeriodicUnlinkedUnloadedInodes) {}
 
   void populate(DynamicEvent& event) const override {
     event.addString("mode", mode);
@@ -255,6 +267,10 @@ struct FinishedCheckout : public EdenFSEvent {
     event.addInt("accessed_blobs", accessedBlobs);
     event.addInt("accessed_blobs_metadata", accessedBlobsAuxData);
     event.addInt("num_conflicts", numConflicts);
+    event.addInt("loaded_inodes", numLoadedInodes);
+    event.addInt("unloaded_inodes", numUnloadedInodes);
+    event.addInt("linked_unloaded_inodes", numPeriodicLinkedUnloadedInodes);
+    event.addInt("unlinked_unloaded_inodes", numPeriodicUnlinkedUnloadedInodes);
   }
 
   const char* getType() const override {
@@ -276,6 +292,20 @@ struct StaleContents : public EdenFSEvent {
 
   const char* getType() const override {
     return "stale_contents";
+  }
+};
+
+struct NFSStaleError : public EdenFSEvent {
+  uint64_t ino;
+
+  explicit NFSStaleError(uint64_t ino) : ino(ino) {}
+
+  void populate(DynamicEvent& event) const override {
+    event.addInt("ino", ino);
+  }
+
+  const char* getType() const override {
+    return "nfs_stale_error";
   }
 };
 
@@ -519,6 +549,29 @@ struct InodeMetadataMismatch : public EdenFSEvent {
 
   const char* getType() const override {
     return "inode_metadata_mismatch";
+  }
+};
+
+struct InodeLoadingFailed : public EdenFSEvent {
+  std::string error;
+  uint64_t ino;
+  bool causedByX2P = false;
+
+  explicit InodeLoadingFailed(std::string error, uint64_t ino)
+      : error(std::move(error)), ino(ino) {
+    if (error.find("x-x2pagentd-error")) {
+      causedByX2P = true;
+    }
+  }
+
+  void populate(DynamicEvent& event) const override {
+    event.addString("load_error", error);
+    event.addInt("ino", ino);
+    event.addBool("caused_by_x2p", causedByX2P);
+  }
+
+  const char* getType() const override {
+    return "inode_loading_failed";
   }
 };
 

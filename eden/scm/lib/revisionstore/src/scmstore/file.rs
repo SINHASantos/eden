@@ -34,6 +34,8 @@ use minibytes::Bytes;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
 use progress_model::AggregatingProgressBar;
+use progress_model::ProgressBar;
+use progress_model::Registry;
 use rand::Rng;
 use storemodel::SerializationFormat;
 use tracing::debug;
@@ -80,10 +82,6 @@ pub struct FileStore {
     // Make prefetch() calls request aux data.
     pub(crate) prefetch_aux_data: bool,
 
-    // Largest set of keys prefetch() accepts before chunking.
-    // Configured by scmstore.max-prefetch-size, where 0 means unlimited.
-    pub(crate) max_prefetch_size: usize,
-
     // Local-only stores
     pub(crate) indexedlog_local: Option<Arc<IndexedLogHgIdDataStore>>,
     pub(crate) lfs_local: Option<Arc<LfsStore>>,
@@ -107,8 +105,6 @@ pub struct FileStore {
     pub(crate) activity_logger: Option<Arc<Mutex<ActivityLogger>>>,
     pub(crate) metrics: Arc<RwLock<FileStoreMetrics>>,
 
-    pub(crate) lfs_progress: Arc<AggregatingProgressBar>,
-
     // Don't flush on drop when we're using FileStore in a "disposable" context, like backingstore
     pub flush_on_drop: bool,
 
@@ -117,6 +113,10 @@ pub struct FileStore {
 
     // The threshold for using CAS cache
     pub(crate) cas_cache_threshold_bytes: Option<u64>,
+
+    // This bar "aggregates" across concurrent uses of this FileStore from different
+    // threads (so that only a single progress bar shows up to the user).
+    pub(crate) progress_bar: Arc<AggregatingProgressBar>,
 }
 
 impl Drop for FileStore {
@@ -163,6 +163,8 @@ impl FileStore {
             return FetchResults::new(Box::new(std::iter::empty()));
         }
 
+        let bar = self.progress_bar.create_or_extend_local(0);
+
         let (found_tx, found_rx) = unbounded();
         let mut state = FetchState::new(
             keys,
@@ -172,7 +174,13 @@ impl FileStore {
             self.lfs_threshold_bytes.is_some(),
             fetch_mode,
             self.cas_cache_threshold_bytes,
+            bar.clone(),
         );
+
+        // When ignoring results, we won't advance the progress bar, so udpate the "total".
+        if !fetch_mode.ignore_result() {
+            bar.increase_total(state.pending_len() as u64);
+        }
 
         if tracing::enabled!(target: "file_fetches", tracing::Level::TRACE) {
             let attrs = [
@@ -215,6 +223,10 @@ impl FileStore {
         let fetch_remote = fetch_mode.contains(FetchMode::REMOTE);
 
         let process_func = move || {
+            // Set bar as this thread's active bar. We don't do it when we create the bar
+            // since we might be in a different thread now.
+            let _bar = ProgressBar::push_active(bar, Registry::main());
+
             let start_instant = Instant::now();
 
             // Only copy keys for activity logger if we have an activity logger;
@@ -346,7 +358,11 @@ impl FileStore {
         // Only kick off a thread if there's a substantial amount of work.
         if keys_len > 1000 {
             let cri = get_client_request_info_thread_local();
+            let active_bar = Registry::main().get_active_progress_bar();
             std::thread::spawn(move || {
+                // Propagate parent progress bar into the thread so things nest well.
+                Registry::main().set_active_progress_bar(active_bar);
+
                 if let Some(cri) = cri {
                     set_client_request_info_thread_local(cri);
                 }
@@ -498,7 +514,6 @@ impl FileStore {
 
             prefetch_aux_data: false,
             compute_aux_data: false,
-            max_prefetch_size: 0,
 
             indexedlog_local: None,
             lfs_local: None,
@@ -515,11 +530,12 @@ impl FileStore {
 
             aux_cache: None,
 
-            lfs_progress: AggregatingProgressBar::new("fetching", "LFS"),
             flush_on_drop: true,
             format: SerializationFormat::Hg,
 
             cas_cache_threshold_bytes: None,
+
+            progress_bar: AggregatingProgressBar::new("", ""),
         }
     }
 
@@ -547,7 +563,6 @@ impl FileStore {
 
             prefetch_aux_data: self.prefetch_aux_data,
             compute_aux_data: self.compute_aux_data,
-            max_prefetch_size: self.max_prefetch_size,
 
             indexedlog_local: self.indexedlog_cache.clone(),
             lfs_local: self.lfs_cache.clone(),
@@ -564,13 +579,13 @@ impl FileStore {
 
             aux_cache: None,
 
-            lfs_progress: self.lfs_progress.clone(),
-
             // Conservatively flushing on drop here, didn't see perf problems and might be needed by Python
             flush_on_drop: true,
             format: self.format(),
 
             cas_cache_threshold_bytes: self.cas_cache_threshold_bytes.clone(),
+
+            progress_bar: self.progress_bar.clone(),
         }
     }
 
@@ -621,26 +636,12 @@ impl FileStore {
             attrs |= FileAttributes::AUX;
         }
 
-        let mut missing = Vec::new();
-
-        let max_size = match self.max_prefetch_size {
-            0 => keys.len(),
-            max => max,
-        };
-
-        for chunk in &keys.into_iter().chunks(max_size) {
-            missing.extend_from_slice(
-                &self
-                    .fetch(
-                        chunk,
-                        attrs,
-                        FetchMode::AllowRemote | FetchMode::IGNORE_RESULT,
-                    )
-                    .missing()?,
-            );
-        }
-
-        Ok(missing)
+        self.fetch(
+            keys,
+            attrs,
+            FetchMode::AllowRemote | FetchMode::IGNORE_RESULT,
+        )
+        .missing()
     }
 }
 
