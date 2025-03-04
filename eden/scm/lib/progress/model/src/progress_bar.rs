@@ -54,16 +54,23 @@ pub struct ProgressBar {
     // intended to be a planned "phase" that is displayed to the user
     // before it starts and after it finishes. Only impacts rendering.
     adhoc: bool,
+
+    // Whether this bar is intended to be shared across threads as the "active" bar.
+    // Causes bar to not finish when being popped as active bar.
+    shared: bool,
 }
 
 pub struct Builder {
+    // Registry to (optionally) register the bar with.
     registry: Registry,
+    // Whether to register the bar. Bars must be registered to be rendered.
     register: bool,
     topic: Cow<'static, str>,
     total: u64,
     unit: Cow<'static, str>,
     parent: Option<Arc<ProgressBar>>,
     adhoc: bool,
+    shared: bool,
 }
 
 impl Builder {
@@ -76,6 +83,7 @@ impl Builder {
             unit: "".into(),
             parent: None,
             adhoc: true,
+            shared: false,
         }
     }
 
@@ -114,6 +122,11 @@ impl Builder {
         self
     }
 
+    pub fn shared(mut self, s: bool) -> Self {
+        self.shared = s;
+        self
+    }
+
     pub fn active(self) -> ActiveProgressBar {
         let registry = self.registry.clone();
         let bar = self.thread_local_parent().register(true).pending();
@@ -133,6 +146,7 @@ impl Builder {
             finished_at: Default::default(),
             parent: self.parent,
             adhoc: self.adhoc,
+            shared: self.shared,
         });
         if self.register {
             self.registry.register_progress_bar(&bar);
@@ -222,7 +236,11 @@ impl ProgressBar {
     /// Mark `bar` as finished and unset it as the active progress bar. This is
     /// exposed for Python use - you probably don't want to call it directly.
     pub fn pop_active(bar: &Arc<Self>, registry: &Registry) {
-        bar.finish();
+        // Shared bars are used as "active" bars in multiple threads - don't assume the
+        // bar is done after first pop.
+        if !bar.shared {
+            bar.finish();
+        }
 
         if let Some(active) = registry.get_active_progress_bar() {
             // Only update things if we are the active bar.
@@ -364,11 +382,22 @@ impl std::ops::Deref for ActiveProgressBar {
     }
 }
 
+// ProgressBar guard that removes contained bar as "active" thread-local bar when dropped.
+// ActiveProgressBar cannot be sent to other threads because it is a thread-local concept.
 pub struct ActiveProgressBar {
     bar: Arc<ProgressBar>,
     registry: Registry,
     // Disallow Sending to other threads.
     _phantom: PhantomData<Rc<()>>,
+}
+
+impl ActiveProgressBar {
+    // Get the underlying progres bar. This is useful to pass to other threads when you
+    // fan out work. You should not use the returned bar as a thread-local "active" bar
+    // since it is already the active bar in the starting thread.
+    pub fn bar(&self) -> Arc<ProgressBar> {
+        self.bar.clone()
+    }
 }
 
 impl Drop for ActiveProgressBar {
@@ -399,10 +428,10 @@ impl AggregatingProgressBar {
         })
     }
 
-    /// If progress bar exists, increase its total, otherwise create a
-    /// new progress bar. You should avoid calling set_position or
-    /// set_total on the returned ProgressBar.
-    pub fn create_or_extend(&self, additional_total: u64) -> Arc<ProgressBar> {
+    /// If progress bar exists, increase its total, otherwise create a new "detcahed"
+    /// progress bar. You should avoid calling set_position or set_total on the returned
+    /// ProgressBar.
+    pub fn create_or_extend_detached(&self, additional_total: u64) -> Arc<ProgressBar> {
         let mut bar = self.bar.lock();
 
         match bar.upgrade() {
@@ -421,6 +450,31 @@ impl AggregatingProgressBar {
             }
         }
     }
+
+    /// If progress bar exists, increase its total, otherwise create a new progress bar
+    /// inheriting thread local parent. You should avoid calling set_position or set_total
+    /// on the returned ProgressBar.
+    pub fn create_or_extend_local(&self, additional_total: u64) -> Arc<ProgressBar> {
+        let mut bar = self.bar.lock();
+
+        match bar.upgrade() {
+            Some(bar) => {
+                bar.increase_total(additional_total);
+                bar
+            }
+            None => {
+                let new_bar = Builder::new()
+                    .topic(self.topic.clone())
+                    .unit(self.unit.clone())
+                    .total(additional_total)
+                    .thread_local_parent()
+                    .shared(true)
+                    .pending();
+                *bar = Arc::downgrade(&new_bar);
+                new_bar
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -432,22 +486,22 @@ mod tests {
         let agg = AggregatingProgressBar::new("eat", "apples");
 
         {
-            let bar1 = agg.create_or_extend(10);
+            let bar1 = agg.create_or_extend_detached(10);
             bar1.increase_position(5);
-            assert_eq!((5, 10), agg.create_or_extend(0).position_total());
+            assert_eq!((5, 10), agg.create_or_extend_detached(0).position_total());
 
             {
-                let bar2 = agg.create_or_extend(5);
+                let bar2 = agg.create_or_extend_detached(5);
                 bar2.increase_position(5);
-                assert_eq!((10, 15), agg.create_or_extend(0).position_total());
+                assert_eq!((10, 15), agg.create_or_extend_detached(0).position_total());
             }
 
-            assert_eq!((10, 15), agg.create_or_extend(0).position_total());
+            assert_eq!((10, 15), agg.create_or_extend_detached(0).position_total());
         }
 
         Registry::main().remove_orphan_progress_bar();
 
-        assert_eq!((0, 0), agg.create_or_extend(0).position_total());
+        assert_eq!((0, 0), agg.create_or_extend_detached(0).position_total());
     }
 
     #[test]
@@ -605,5 +659,29 @@ mod tests {
         drop(bar1);
 
         assert!(reg.get_active_progress_bar().is_none());
+    }
+
+    #[test]
+    fn test_reusing_active_bar() {
+        let reg = Registry::default();
+
+        let bar = Builder::new()
+            .registry(&reg)
+            .thread_local_parent()
+            .shared(true)
+            .pending();
+
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let _active = ProgressBar::push_active(bar.clone(), &reg);
+            });
+
+            s.spawn(|| {
+                let _active = ProgressBar::push_active(bar.clone(), &reg);
+            });
+        });
+
+        // Bar is still running.
+        assert_eq!(bar.state(), BarState::Running);
     }
 }

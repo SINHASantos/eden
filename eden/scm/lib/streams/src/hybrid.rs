@@ -5,7 +5,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::hash::Hash;
@@ -17,6 +16,8 @@ use futures::stream::StreamExt;
 use futures::task::Context;
 use futures::task::Poll;
 use futures::Stream;
+
+use crate::countedmap::CountedMap;
 
 /// Resolve a stream of `I`s (inputs) into a stream of `O`s (outputs).
 ///
@@ -41,7 +42,7 @@ struct HybridStreamState<I, O, E> {
     request: Option<BoxStream<'static, Result<(I, O), E>>>,
 
     /// Result from consumed `request` stream.
-    response: HashMap<I, O>,
+    response: CountedMap<I, O>,
 
     /// Defines how to resolve I to O.
     resolver: Box<dyn HybridResolver<I, O, E> + Send + Sync + 'static>,
@@ -77,7 +78,7 @@ enum ResolveState<I, O> {
 impl<I, O, E> HybridStream<I, O, E>
 where
     I: Eq + Hash + Clone + Send + Sync + Debug + 'static,
-    O: Send + Sync + Debug + 'static,
+    O: Send + Sync + Debug + Clone + 'static,
     E: 'static,
 {
     /// Create a new `HybridStream`.
@@ -108,7 +109,7 @@ where
 impl<I, O, E> Stream for HybridStream<I, O, E>
 where
     I: Eq + Hash + Clone + Send + Sync + Debug + 'static,
-    O: Send + Sync + Debug + 'static,
+    O: Send + Sync + Debug + Clone + 'static,
     E: 'static,
 {
     type Item = Result<(I, O), E>;
@@ -121,7 +122,7 @@ where
 impl<I, O, E> HybridStreamState<I, O, E>
 where
     I: Eq + Hash + Clone + Debug,
-    O: Debug,
+    O: Debug + Clone,
 {
     /// A future to produce one `next` item.
     async fn next_item(&mut self) -> Result<Option<(I, O)>, E> {
@@ -234,6 +235,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::Mutex;
 
@@ -267,20 +269,53 @@ mod tests {
             // Exercise ".await" in this function.
             sleep(Duration::from_millis(1)).await;
             // Return nothing for 404.
-            let output_iter = input
-                .to_vec()
-                .into_iter()
-                .filter(|&i| i != 404)
-                .map(move |i| {
-                    let o = i.to_string();
-                    cached.lock().unwrap().insert(i, o.clone());
-                    // Return an error for 500.
-                    if i == 500 {
-                        Err(error("cannot resolve 500"))
-                    } else {
-                        Ok((i, o))
-                    }
-                });
+            let input = input.to_vec();
+            let output_iter = input.into_iter().filter(|&i| i != 404).map(move |i| {
+                let o = i.to_string();
+                cached.lock().unwrap().insert(i, o.clone());
+                // Return an error for 500.
+                if i == 500 {
+                    Err(error("cannot resolve 500"))
+                } else {
+                    Ok((i, o))
+                }
+            });
+            Ok(Box::pin(stream::iter(output_iter)))
+        }
+
+        fn retry_error(&self, attempt: usize, input: &[I]) -> E {
+            error(format!(
+                "give up after {} attempts for input {:?}",
+                attempt, input
+            ))
+        }
+    }
+
+    #[derive(Default)]
+    struct UnorderedResolver {
+        cached: Arc<Mutex<HashMap<usize, String>>>,
+    }
+
+    #[async_trait]
+    impl HybridResolver<I, O, E> for UnorderedResolver {
+        fn resolve_local(&mut self, input: &I) -> Result<Option<O>, E> {
+            Ok(self.cached.lock().unwrap().get(input).cloned())
+        }
+
+        async fn resolve_remote(
+            &self,
+            input: &[I],
+        ) -> Result<BoxStream<'static, Result<(I, O), E>>, E> {
+            let cached = self.cached.clone();
+            // Exercise ".await" in this function.
+            sleep(Duration::from_millis(1)).await;
+            // Reverse the order of the input.
+            let input = input.to_vec();
+            let output_iter = input.into_iter().rev().map(move |i| {
+                let o = i.to_string();
+                cached.lock().unwrap().insert(i.clone(), o.clone());
+                Ok((i, o))
+            });
             Ok(Box::pin(stream::iter(output_iter)))
         }
 
@@ -341,5 +376,20 @@ mod tests {
             stream.next().await.unwrap().unwrap_err().to_string(),
             "cannot resolve 500",
         );
+    }
+
+    #[tokio::test]
+    async fn test_unordered_stream_with_duplicate_elements() {
+        let input = stream::iter(vec![0, 1, 3, 5, 10, 10].into_iter().map(Ok));
+        let resolver = UnorderedResolver::default();
+        let mut stream = HybridStream::new(Box::pin(input), resolver, 10, 0);
+        assert_eq!(u(stream.next().await), (0, "0".to_string()));
+        assert_eq!(u(stream.next().await), (1, "1".to_string()));
+        assert_eq!(u(stream.next().await), (3, "3".to_string()));
+        assert_eq!(u(stream.next().await), (5, "5".to_string()));
+        assert_eq!(u(stream.next().await), (10, "10".to_string()));
+        // the duplicate element 10 should not cause an error.
+        assert_eq!(u(stream.next().await), (10, "10".to_string()));
+        assert!(stream.next().await.is_none());
     }
 }

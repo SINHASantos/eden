@@ -11,6 +11,7 @@ use anyhow::Result;
 use bookmarks::BookmarkKey;
 use bookmarks::BookmarksRef;
 use cas_client::build_mononoke_cas_client;
+use cas_client::get_prod_usecase_from_reponame;
 use changesets_uploader::CasChangesetsUploader;
 use changesets_uploader::PriorLookupPolicy;
 use changesets_uploader::UploadPolicy;
@@ -62,9 +63,10 @@ pub async fn cas_store_upload(
 ) -> Result<()> {
     let cas_changesets_uploader = CasChangesetsUploader::new(build_mononoke_cas_client(
         ctx.fb,
-        ctx,
+        ctx.clone(),
         repo.repo_identity.name(),
         args.verbose,
+        &get_prod_usecase_from_reponame(ctx, repo.repo_identity.name()),
     )?);
 
     // Resolve the changeset id

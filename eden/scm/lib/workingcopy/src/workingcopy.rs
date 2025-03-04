@@ -22,6 +22,7 @@ use edenfs_client::EdenFsClient;
 use identity::Identity;
 use journal::Journal;
 use manifest::FileType;
+use manifest::FsNodeMetadata;
 use manifest::Manifest;
 use manifest_tree::ReadTreeManifest;
 use manifest_tree::TreeManifest;
@@ -41,12 +42,14 @@ use status::FileStatus;
 use status::Status;
 use status::StatusBuilder;
 use storemodel::FileStore;
+use submodule::parse_gitmodules;
+use submodule::Submodule;
 use tracing::debug;
 use treestate::filestate::StateFlags;
 use treestate::treestate::TreeState;
 use types::hgid::NULL_ID;
-use types::repo::StorageFormat;
 use types::HgId;
+use types::RepoPath;
 use types::RepoPathBuf;
 use util::file::atomic_write;
 use util::file::read_to_string_if_exists;
@@ -63,9 +66,9 @@ use crate::filesystem::FileSystemType;
 use crate::filesystem::PendingChange;
 use crate::filesystem::PhysicalFileSystem;
 use crate::filesystem::WatchmanFileSystem;
-use crate::git::parse_submodules;
 use crate::status::compute_status;
 use crate::util::added_files;
+use crate::util::sniff_wdir_parents;
 use crate::util::walk_treestate;
 use crate::watchman_client::DeferredWatchmanClient;
 
@@ -87,7 +90,6 @@ pub struct WorkingCopy {
     vfs: VFS,
     config: Arc<dyn Config>,
     ident: Identity,
-    format: StorageFormat,
     treestate: Arc<Mutex<TreeState>>,
     tree_resolver: ArcReadTreeManifest,
     filestore: ArcFileStore,
@@ -98,6 +100,7 @@ pub struct WorkingCopy {
     pub journal: Journal,
     watchman_client: Arc<DeferredWatchmanClient>,
     notify_parents_change_func: Option<Box<dyn Fn(&[HgId]) -> Result<()> + Send + Sync>>,
+    support_submodules: bool,
 }
 
 const ACTIVE_BOOKMARK_FILE: &str = "bookmarks.current";
@@ -106,7 +109,6 @@ impl WorkingCopy {
     pub fn new(
         path: &Path,
         config: &Arc<dyn Config>,
-        format: StorageFormat,
         tree_resolver: ArcReadTreeManifest,
         filestore: ArcFileStore,
         locker: Arc<RepoLocker>,
@@ -118,6 +120,9 @@ impl WorkingCopy {
         let vfs = VFS::new(path.to_path_buf())?;
 
         let is_eden = has_requirement("eden");
+
+        let support_submodules =
+            has_requirement("git") && config.get_or("git", "submodules", || true)?;
 
         // In case the "requires" file gets corrupted, check `.eden` directory
         // and prevent treating edenfs as non-edenfs.
@@ -188,7 +193,6 @@ impl WorkingCopy {
         Ok(WorkingCopy {
             vfs,
             config: config.clone(),
-            format,
             ident,
             treestate,
             tree_resolver,
@@ -200,6 +204,7 @@ impl WorkingCopy {
             journal,
             watchman_client,
             notify_parents_change_func: None,
+            support_submodules,
         })
     }
 
@@ -403,17 +408,15 @@ impl WorkingCopy {
         }
 
         let mut ignore_dirs = vec![PathBuf::from(self.ident.dot_dir())];
-        if self.format.is_git() {
-            // Ignore file within submodules. Python has some additional logic layered on
-            // top to add submodule info into status results.
-            let git_modules_path = self.vfs.join(".gitmodules".try_into()?);
-            if git_modules_path.exists() {
-                ignore_dirs.extend(
-                    parse_submodules(&fs_err::read(&git_modules_path)?)?
-                        .into_iter()
-                        .map(|s| PathBuf::from(s.path)),
-                );
-            }
+        // Ignore file within submodules. Python has some additional logic layered on
+        // top to add submodule info into status results.
+        let submodules = self.parse_submodule_config()?;
+        if !submodules.is_empty() {
+            ignore_dirs.extend(
+                submodules
+                    .iter()
+                    .map(move |s| PathBuf::from(s.path.clone())),
+            );
         }
 
         let pending_changes = self
@@ -479,6 +482,49 @@ impl WorkingCopy {
                 self.filter_accidential_symlink_changes(status_builder, p1_manifest)?;
         }
 
+        // Calculate submodule status.
+        if !submodules.is_empty() {
+            if let Some(tree) =
+                Self::current_manifests(&self.treestate.lock(), &self.tree_resolver)?
+                    .into_iter()
+                    .next()
+            {
+                for subm in submodules.iter() {
+                    let path = RepoPath::from_str(&subm.path)?;
+                    // The submodule path is treated as a file.
+                    // See https://sapling-scm.com/docs/git/submodule.
+                    if !matcher.matches_file(path)? {
+                        continue;
+                    }
+                    let subm_path = self.vfs.root().join(&subm.path);
+                    // PERF: This does not do batch fetching properly.
+                    let tree_node = tree.get(path)?.and_then(|m| match m {
+                        FsNodeMetadata::File(f) => match f.file_type {
+                            FileType::GitSubmodule => Some(f.hgid),
+                            _ => None,
+                        },
+                        FsNodeMetadata::Directory(_) => None,
+                    });
+                    // The submodule working copy should use the same dotdir.
+                    let file_node = sniff_wdir_parents(&subm_path, Some(self.ident))?
+                        .p1()
+                        .copied();
+                    if file_node == tree_node {
+                        status_builder.forget(path);
+                        continue;
+                    } else {
+                        let paths = vec![path.to_owned()];
+                        status_builder = match (tree_node, file_node) {
+                            (None, Some(_)) => status_builder.added(paths),
+                            (Some(_), None) => status_builder.removed(paths),
+                            (None, None) => status_builder,
+                            (Some(_), Some(_)) => status_builder.modified(paths),
+                        };
+                    }
+                }
+            }
+        }
+
         let status = status_builder.build();
 
         span.record("status_len", status.len());
@@ -523,6 +569,30 @@ impl WorkingCopy {
         }
 
         Ok(status_builder)
+    }
+
+    /// Parse the `.gitmodules` config from the working copy.
+    ///
+    /// Respect submodule related configs. If git.submodules=false, or the repo
+    /// does not use git format, return an empty list.
+    fn parse_submodule_config(&self) -> Result<Vec<Submodule>> {
+        if !self.support_submodules {
+            tracing::debug!(target: "workingcopy::submodule", "submodules are disabled");
+            return Ok(Vec::new());
+        }
+
+        let git_modules_path = self.vfs.join(".gitmodules".try_into()?);
+        let parsed = if git_modules_path.exists() {
+            let origin_url = self.config.get("paths", "default");
+            let parsed = parse_gitmodules(&fs_err::read(&git_modules_path)?, origin_url.as_deref());
+            tracing::debug!(target: "workingcopy::submodule", "parsed {} submodules", parsed.len());
+            parsed
+        } else {
+            tracing::debug!(target: "workingcopy::submodule", ".gitmodules does not exist");
+            Vec::new()
+        };
+
+        Ok(parsed)
     }
 
     pub fn copymap(&self, matcher: DynMatcher) -> Result<Vec<(RepoPathBuf, RepoPathBuf)>> {

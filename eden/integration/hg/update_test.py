@@ -1473,3 +1473,60 @@ class PrjFSStressTornReads(EdenHgTestCase):
             # throws if eden exits uncleanly - which it does if there is some
             # sort of crash.
             shutdown_thread.join()
+
+
+@hg_test
+# pyre-ignore[13]: T62487924
+class UpdateDedicatedExecutorTest(EdenHgTestCase):
+    # pyre-fixme[13]: Attribute `commit1` is never initialized.
+    commit1: str
+    # pyre-fixme[13]: Attribute `commit2` is never initialized.
+    commit2: str
+    # pyre-fixme[13]: Attribute `commit3` is never initialized.
+    commit3: str
+    enable_fault_injection: bool = True
+
+    def edenfs_logging_settings(self) -> Dict[str, str]:
+        return {
+            "eden.fs.inodes.TreeInode": "DBG5",
+            "eden.fs.inodes.CheckoutAction": "DBG5",
+            "eden.fs.inodes.CheckoutContext": "DBG5",
+        }
+
+    def edenfs_extra_config(self) -> Optional[Dict[str, List[str]]]:
+        parent_config = super().edenfs_extra_config()
+        if parent_config is None:
+            parent_config = {}
+        if "thrift" not in parent_config:
+            parent_config["thrift"] = []
+
+        parent_config["thrift"].append("use-checkout-executor = true")
+
+        return parent_config
+
+    def populate_backing_repo(self, repo: hgrepo.HgRepository) -> None:
+        repo.write_file("hello.txt", "hola")
+        repo.write_file(".gitignore", "ignoreme\n")
+        repo.write_file("foo/.gitignore", "*.log\n")
+        repo.write_file("foo/bar.txt", "test\n")
+        repo.write_file("foo/subdir/test.txt", "test\n")
+        self.commit1 = repo.commit("Initial commit.")
+
+        repo.write_file("foo/.gitignore", "*.log\n/_*\n")
+        self.commit2 = repo.commit("Update foo/.gitignore")
+
+        repo.write_file("foo/bar.txt", "updated in commit 3\n")
+        self.commit3 = repo.commit("Update foo/.gitignore")
+
+    def test_checkout_on_dedicated_executor(self) -> None:
+        """Test that checkout can be completed on a dedicated executor."""
+        self.assert_status_empty()
+
+        self.write_file("hello.txt", "saluton")
+        self.assert_status({"hello.txt": "M"})
+
+        self.repo.update(".", clean=True)
+        self.assertEqual("hola", self.read_file("hello.txt"))
+        self.assert_status_empty()
+        self.write_file("goodbye.txt", "cya")
+        self.assert_status({"goodbye.txt": "?"})

@@ -329,6 +329,27 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
+   * Whether Eden should use a dedicated executor for checkout requests. This is
+   * meant to help with checkoutRevision performance while using serial
+   * execution for other Thrift requests. This feature can be used even if not
+   * using serial execution for other Thrift requests, but if serial execution
+   * is being used, its a good idea to turn on this config as well.
+   */
+  ConfigSetting<bool> thriftUseCheckoutExecutor{
+      "thrift:use-checkout-executor",
+      false,
+      this};
+
+  /**
+   * Number of threads that will service the checkoutRevision Thrift endpoint
+   * when using its own executor.
+   */
+  ConfigSetting<uint64_t> numCheckoutThreads{
+      "thrift:checkout-revision-num-servicing-threads",
+      std::thread::hardware_concurrency(),
+      this};
+
+  /**
    * How often to collect Thrift server metrics. The default value mirrors the
    * value from facebook::fb303::TServerCounters::kDefaultSampleRate
    */
@@ -1090,18 +1111,6 @@ class EdenConfig : private ConfigSettingManager {
       10000,
       this};
 
-  /**
-   * The number of threads to use for retrying failed Sapling import requests
-   * (per repo).
-   *
-   * Why 8? 1 is materially slower but 24 is no better than 4 in a simple
-   * microbenchmark that touches all files.  8 is better than 4 in the case
-   * that we need to fetch a bunch from the network.
-   * See benchmarks in the doc linked from D5067763.
-   * Note: this number would benefit from occasional revisiting.
-   */
-  ConfigSetting<uint8_t> hgNumRetryThreads{"hg:num-retry-threads", 8, this};
-
   // [backingstore]
 
   /**
@@ -1387,17 +1396,6 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
-   * Controls if EdenFS runs a checkout operation on EdenServer's
-   * EdenCPUThreadPool or using the Thrift CPU workers.
-   *
-   * This is a temporary option to help us mitigate and understand S399431.
-   */
-  ConfigSetting<bool> runCheckoutOnEdenCPUThreadpool{
-      "experimental:run-checkout-on-eden-threadpool",
-      false,
-      this};
-
-  /**
    * Controls if EdenFS runs a prefetch operation serially or not.
    *
    * This is a temporary option to help us mitigate and understand S399431.
@@ -1513,6 +1511,15 @@ class EdenConfig : private ConfigSettingManager {
    */
   ConfigSetting<bool> notifyHealthReportIssues{
       "notifications:notify-health-report-issues",
+      false,
+      this};
+
+  /**
+   * Whether EdenFS ready status should be shown via Windows
+   * notifications
+   */
+  ConfigSetting<bool> notifyEdenReady{
+      "notifications:notify-eden-ready",
       false,
       this};
 

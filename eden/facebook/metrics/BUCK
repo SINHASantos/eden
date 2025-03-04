@@ -1,0 +1,55 @@
+load("@fbcode_macros//build_defs:python_library.bzl", "python_library")
+load("//bento:buck_macros.bzl", "bento_test_kernel")
+
+oncall("source_control")
+
+python_library(
+    name = "usc",
+    srcs = ["usc.py"],
+    deps = [
+        "fbsource//third-party/pypi/pandas:pandas",
+        "//pvc2:pvc2",
+    ],
+)
+
+bento_test_kernel(
+    kernel_name = "eden",
+    notebooks = ["notebooks/usc_probability_distribution.py"],
+    target_name = "usc_probability_distribution",
+)
+
+bento_test_kernel(
+    kernel_name = "eden",
+    notebooks = ["notebooks/usc_deep_dive.py"],
+    target_name = "usc_deep_dive",
+)
+
+bento_test_kernel(
+    kernel_name = "eden",
+    notebooks = ["notebooks/usc_top_commands.py"],
+    target_name = "usc_top_commands",
+)
+
+bento_test_kernel(
+    kernel_name = "eden",
+    notebooks = ["notebooks/usc_top_commands_by_os.py"],
+    target_name = "usc_top_commands_by_os",
+)
+
+bento_test_kernel(
+    kernel_name = "eden",
+    notebooks = ["notebooks/usc_aggregates.py"],
+    target_name = "usc_aggregates",
+)
+
+bento_test_kernel(
+    kernel_name = "eden",
+    notebooks = ["notebooks/usc_by_command.py"],
+    target_name = "usc_by_command",
+)
+
+bento_test_kernel(
+    kernel_name = "eden",
+    notebooks = ["notebooks/usc_by_os.py"],
+    target_name = "usc_by_os",
+)

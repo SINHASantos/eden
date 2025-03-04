@@ -8,6 +8,8 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
+use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -16,10 +18,12 @@ use async_trait::async_trait;
 use cached_config::ConfigHandle;
 use fbinit::FacebookInit;
 use mononoke_macros::mononoke;
+use ods_counters::periodic_fetch_counter;
 use ods_counters::CounterManager;
 use ods_counters::OdsCounterManager;
 use permission_checker::MononokeIdentitySet;
 use permission_checker::MononokeIdentitySetExt;
+use rate_limiting_config::ExternalOdsCounter;
 use scuba_ext::MononokeScubaSampleBuilder;
 use stats::prelude::*;
 use thiserror::Error;
@@ -84,7 +88,7 @@ pub struct RateLimitEnvironment {
     fb: FacebookInit,
     category: String,
     config: ConfigHandle<MononokeRateLimitConfig>,
-    counter_manager: OdsCounterManager,
+    counter_manager: Arc<RwLock<OdsCounterManager>>,
 }
 
 impl RateLimitEnvironment {
@@ -92,8 +96,23 @@ impl RateLimitEnvironment {
         fb: FacebookInit,
         category: String,
         config: ConfigHandle<MononokeRateLimitConfig>,
-        counter_manager: OdsCounterManager,
+        counter_manager: Arc<RwLock<OdsCounterManager>>,
     ) -> Self {
+        for limit in &config.get().load_shed_limits {
+            match &limit.raw_config.load_shedding_metric {
+                LoadSheddingMetric::external_ods_counter(counter) => counter_manager
+                    .write()
+                    .expect("Poisoned lock")
+                    .add_counter(counter.entity.clone(), counter.key.clone(), None),
+                _ => {}
+            };
+        }
+
+        mononoke::spawn_task(periodic_fetch_counter(
+            counter_manager.clone(),
+            Duration::from_secs(60),
+        ));
+
         Self {
             fb,
             category,
@@ -102,28 +121,15 @@ impl RateLimitEnvironment {
         }
     }
 
-    pub async fn get_rate_limiter(&mut self) -> BoxRateLimiter {
+    pub fn get_rate_limiter(&self) -> BoxRateLimiter {
         let config = self.config.get();
-        for limit in &config.load_shed_limits {
-            match &limit.raw_config.load_shedding_metric {
-                LoadSheddingMetric::external_ods_counter(counter) => {
-                    self.counter_manager
-                        .add_counter(counter.entity.clone(), counter.key.clone())
-                        .await;
-                }
-                _ => {}
-            };
-        }
 
-        let mut counter_manager_clone = self.counter_manager.clone();
-
-        mononoke::spawn_task(async move {
-            counter_manager_clone
-                .run_periodic_fetch(Duration::from_secs(1))
-                .await;
-        });
-
-        create_rate_limiter(self.fb, self.category.clone(), config)
+        create_rate_limiter(
+            self.fb,
+            self.category.clone(),
+            config,
+            self.counter_manager.clone(),
+        )
     }
 }
 
@@ -201,6 +207,7 @@ impl LoadShedLimit {
         identities: Option<&MononokeIdentitySet>,
         main_id: Option<&str>,
         scuba: &mut MononokeScubaSampleBuilder,
+        ods_counters: Arc<RwLock<OdsCounterManager>>,
     ) -> LoadShedResult {
         let applies_to_client = match &self.target {
             Some(t) => t.matches_client(identities, main_id),
@@ -212,19 +219,35 @@ impl LoadShedLimit {
         }
 
         // Fetch the counter
-        let value = match self.raw_config.load_shedding_metric.clone() {
+        let (metric_string, value) = match self.raw_config.load_shedding_metric.clone() {
             LoadSheddingMetric::local_fb303_counter(metric) => {
                 let metric = metric.to_string();
-                STATS::load_shed_counter.get_value(fb, (metric.clone(),))
+                (
+                    metric.clone(),
+                    STATS::load_shed_counter.get_value(fb, (metric,)),
+                )
             }
-            _ => None,
+            LoadSheddingMetric::external_ods_counter(ExternalOdsCounter {
+                entity,
+                key,
+                reduce,
+            }) => {
+                let value = ods_counters
+                    .read()
+                    .expect("Poisoned lock")
+                    .get_counter_value(&key, &entity, reduce.as_deref())
+                    .map(|v| v as i64);
+                (
+                    format!("Ods key:{} entity:{} reduce:{:?}", entity, key, reduce),
+                    value,
+                )
+            }
+            _ => ("".to_string(), None),
         };
-
-        let metric = self.raw_config.metric.to_string();
 
         match value {
             Some(value) if value > self.raw_config.limit => {
-                log_or_enforce_status(self.raw_config.clone(), metric, value, scuba)
+                log_or_enforce_status(self.raw_config.clone(), metric_string, value, scuba)
             }
             _ => LoadShedResult::Pass,
         }
@@ -552,6 +575,7 @@ mod test {
                 ],
                 load_shed_limits: vec![],
             }),
+            OdsCounterManager::new(fb),
         );
 
         let mut idents = MononokeIdentitySet::new();

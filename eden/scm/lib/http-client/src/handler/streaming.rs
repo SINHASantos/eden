@@ -14,6 +14,7 @@ use curl::easy::SeekResult;
 use curl::easy::WriteError;
 
 use super::HandlerExt;
+use crate::claimer::RequestClaim;
 use crate::header::Header;
 use crate::progress::Progress;
 use crate::receiver::Receiver;
@@ -24,15 +25,21 @@ pub struct Streaming {
     bytes_sent: usize,
     request_context: RequestContext,
     is_active: bool,
+    claim: RequestClaim,
 }
 
 impl Streaming {
-    pub(crate) fn new(receiver: Box<dyn Receiver>, request_context: RequestContext) -> Self {
+    pub(crate) fn new(
+        receiver: Box<dyn Receiver>,
+        request_context: RequestContext,
+        claim: RequestClaim,
+    ) -> Self {
         Self {
             receiver: Some(receiver),
             bytes_sent: 0,
             request_context,
             is_active: false,
+            claim,
         }
     }
 
@@ -54,14 +61,29 @@ impl Handler for Streaming {
         self.request_context
             .event_listeners
             .trigger_download_bytes(self.request_context(), data.len());
-        if let Some(ref mut receiver) = self.receiver {
-            if receiver.chunk(data.into()).is_err() {
-                // WriteError can only return "Pause", so instead we need to return an incorrect
-                // number of bytes written, which will trigger curl to end the request.
-                return Ok(0);
+
+        match self.receiver {
+            Some(ref mut receiver) => {
+                match receiver.chunk(data.into()) {
+                    // Normal case - receiver handled all the bytes.
+                    Ok(false) => Ok(data.len()),
+                    // Receiver wants us to pause the transfer.
+                    Ok(true) => {
+                        tracing::trace!("receiver.chunk() wants to pause");
+                        tracing::trace!(target: "curl_pause", "pausing write");
+                        Err(WriteError::Pause)
+                    }
+                    // WriteError can only return "Pause", so instead we need to return an incorrect
+                    // number of bytes written, which will trigger curl to end the request.
+                    Err(err) => {
+                        tracing::trace!(?err, "receiver.chunk() return error");
+                        Ok(0)
+                    }
+                }
             }
+            // No receiver - indicate everything is okay (why??)
+            None => Ok(data.len()),
         }
-        Ok(data.len())
     }
 
     fn read(&mut self, data: &mut [u8]) -> Result<usize, ReadError> {
@@ -156,6 +178,10 @@ impl HandlerExt for Streaming {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
+
+    fn needs_unpause(&mut self) -> bool {
+        self.receiver.as_mut().is_some_and(|r| r.needs_unpause())
+    }
 }
 
 #[cfg(test)]
@@ -178,8 +204,11 @@ mod tests {
         let mut buf2 = [0xFF; 3];
         let mut buf3 = [0xFF; 4];
 
-        let mut handler =
-            Streaming::new(Box::new(NullReceiver), RequestContext::dummy().body(data));
+        let mut handler = Streaming::new(
+            Box::new(NullReceiver),
+            RequestContext::dummy().body(data),
+            RequestClaim::default(),
+        );
 
         assert_eq!(handler.read(&mut buf1[..]).unwrap(), 5);
         assert_eq!(handler.read(&mut buf2[..]).unwrap(), 3);
@@ -193,7 +222,11 @@ mod tests {
     #[test]
     fn test_write() {
         let receiver = TestReceiver::new();
-        let mut handler = Streaming::new(Box::new(receiver.clone()), RequestContext::dummy());
+        let mut handler = Streaming::new(
+            Box::new(receiver.clone()),
+            RequestContext::dummy(),
+            RequestClaim::default(),
+        );
 
         let chunks = vec![vec![1, 2, 3], vec![5, 6], vec![7, 8, 9, 0]];
 
@@ -207,8 +240,11 @@ mod tests {
     #[test]
     fn test_seek() {
         let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0];
-        let mut handler =
-            Streaming::new(Box::new(NullReceiver), RequestContext::dummy().body(data));
+        let mut handler = Streaming::new(
+            Box::new(NullReceiver),
+            RequestContext::dummy().body(data),
+            RequestClaim::default(),
+        );
 
         assert_matches!(handler.seek(SeekFrom::Start(3)), SeekResult::Ok);
         assert_eq!(handler.bytes_sent, 3);
@@ -235,7 +271,11 @@ mod tests {
     #[test]
     fn test_headers() {
         let receiver = TestReceiver::new();
-        let mut handler = Streaming::new(Box::new(receiver.clone()), RequestContext::dummy());
+        let mut handler = Streaming::new(
+            Box::new(receiver.clone()),
+            RequestContext::dummy(),
+            RequestClaim::default(),
+        );
 
         assert!(handler.header(&b"Content-Length: 1234\r\n"[..]));
         assert!(handler.header(&[1, 2, 58, 3, 4][..])); // Valid UTF-8 but not alphanumeric.
@@ -256,7 +296,11 @@ mod tests {
     #[test]
     fn test_progress() {
         let receiver = TestReceiver::new();
-        let mut handler = Streaming::new(Box::new(receiver.clone()), RequestContext::dummy());
+        let mut handler = Streaming::new(
+            Box::new(receiver.clone()),
+            RequestContext::dummy(),
+            RequestClaim::default(),
+        );
 
         let reporter = ProgressReporter::default();
         handler

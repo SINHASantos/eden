@@ -16,7 +16,7 @@
   >         "bypass_readonly": ["$CLIENT0_ID_TYPE:$CLIENT0_ID_DATA", "X509_SUBJECT_NAME:CN=localhost,O=Mononoke,C=US,ST=CA", "X509_SUBJECT_NAME:CN=client0,O=Mononoke,C=US,ST=CA"]
   >       }
   >     },
-  >     "orig_shadow": {
+  >     "dest": {
   >       "actions": {
   >         "read": ["$CLIENT0_ID_TYPE:$CLIENT0_ID_DATA","SERVICE_IDENTITY:server", "X509_SUBJECT_NAME:CN=localhost,O=Mononoke,C=US,ST=CA", "X509_SUBJECT_NAME:CN=client0,O=Mononoke,C=US,ST=CA"],
   >         "write": ["$CLIENT0_ID_TYPE:$CLIENT0_ID_DATA","SERVICE_IDENTITY:server", "X509_SUBJECT_NAME:CN=localhost,O=Mononoke,C=US,ST=CA", "X509_SUBJECT_NAME:CN=client0,O=Mononoke,C=US,ST=CA"],
@@ -28,7 +28,7 @@
   > ACLS
 
   $ REPOID=0 REPONAME=orig ACL_NAME=orig setup_common_config
-  $ REPOID=1 REPONAME=orig_shadow ACL_NAME=orig_shadow setup_common_config
+  $ REPOID=1 REPONAME=dest ACL_NAME=dest setup_common_config
 
   $ start_and_wait_for_mononoke_server
 
@@ -56,24 +56,20 @@
   $ hg log > $TESTTMP/hglog.out
 
 Sync all bookmarks moves
-  $ with_stripped_logs mononoke_modern_sync sync-once orig orig_shadow --start-id 0
+  $ with_stripped_logs mononoke_modern_sync sync-once orig dest --start-id 0 | grep -v "Uploaded" 
   Running sync-once loop
   Connecting to https://localhost:$LOCAL_PORT/edenapi/
   Established EdenAPI connection
   Initialized channels
   Calculating segments for entry 1
-  Skipping 0 commits, starting sync of 1 commits 
-  Found error: Trees upload: Expected 1 responses, got 0, retrying attempt #0
-  Found error: Trees upload: Expected 1 responses, got 0, retrying attempt #1
-  Found error: Trees upload: Expected 1 responses, got 0, retrying attempt #2
-  Error processing files/trees: Failed to upload trees: HgManifestId(HgNodeHash(Sha1(c1afe800646ee45232ab5e70c57247b78dbf3899)))
-  
-  Caused by:
-      Trees upload: Expected 1 responses, got 0
-  Execution error: Error while waiting for commit to be synced Error processing changesets: Files/trees error received. Winding down changesets sender.
-  
-  Caused by:
-      0: Failed to upload trees: HgManifestId(HgNodeHash(Sha1(c1afe800646ee45232ab5e70c57247b78dbf3899)))
-      1: Trees upload: Expected 1 responses, got 0
+  Resuming from latest entry checkpoint 0
+  Skipping 0 batches from entry 1
+  Skipping 0 commits within batch
+  Found 1 missing commits
+  Found error: Trees upload: Expected [1-9] responses, got 0, retrying attempt #0 (re)
+  Found error: Trees upload: Expected [1-9] responses, got 0, retrying attempt #1 (re)
+  Found error: Trees upload: Expected [1-9] responses, got 0, retrying attempt #2 (re)
+  Failed to upload trees: Trees upload: Expected [1-9] responses, got 0 (re)
+  Trees flush failed: Trees upload: Expected [1-9] responses, got 0 (re)
+  Execution error: Error while waiting for commit to be synced Error processing changesets: Error waiting for files/trees error received oneshot canceled
   Error: Execution failed
-  [1]

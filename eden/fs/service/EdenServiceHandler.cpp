@@ -66,6 +66,8 @@
 #endif
 #include "eden/fs/privhelper/PrivHelper.h"
 #include "eden/fs/prjfs/PrjfsChannel.h"
+#include "eden/fs/rust/redirect_ffi/include/ffi.h"
+#include "eden/fs/rust/redirect_ffi/src/lib.rs.h"
 #include "eden/fs/service/EdenServer.h"
 #include "eden/fs/service/ThriftGetObjectImpl.h"
 #include "eden/fs/service/ThriftGlobImpl.h"
@@ -2347,7 +2349,7 @@ void EdenServiceHandler::sync_changesSinceV2(
           "fromPosition={}:{}:{}, includedRoots:{}, excludedRoots:{}, includedSuffixes:{}, excludedSuffixes:{}",
           fromPosition.mountGeneration().value(),
           fromPosition.sequenceNumber().value(),
-          fromPosition.snapshotHash().value(),
+          logHash(fromPosition.snapshotHash().value()),
           toLogArg(includedRoots),
           toLogArg(excludedRoots),
           toLogArg(includedSuffixes),
@@ -5500,6 +5502,30 @@ EdenServiceHandler::semifuture_debugInvalidateNonMaterialized(
         std::move(invalFut).semi());
     return std::make_unique<DebugInvalidateResponse>();
   }
+}
+
+void EdenServiceHandler::listRedirections(
+    ListRedirectionsResponse& response,
+    std::unique_ptr<ListRedirectionsRequest> request) {
+  auto mountId = request->mount();
+  auto helper = INSTRUMENT_THRIFT_CALL(DBG3, *mountId);
+
+  const auto& configDir = server_->getEdenDir();
+  const auto& edenEtcDir =
+      server_->getServerState()->getEdenConfig()->getSystemConfigDir();
+
+  auto redirsFFI = list_redirections(
+      absolutePathFromThrift(*mountId->mountPoint_ref()).stringWithoutUNC(),
+      configDir.stringWithoutUNC(),
+      edenEtcDir.stringWithoutUNC());
+
+  std::vector<Redirection> redirs(redirsFFI.size());
+  std::transform(
+      redirsFFI.begin(), redirsFFI.end(), redirs.begin(), [](auto&& redirFFI) {
+        return redirectionFromFFI(std::move(redirFFI));
+      });
+
+  response.redirections_ref() = std::move(redirs);
 }
 
 void EdenServiceHandler::getStatInfo(

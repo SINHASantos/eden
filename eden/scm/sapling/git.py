@@ -809,9 +809,13 @@ def parsesubmodules(ctx):
 
     data = ctx[".gitmodules"].data()
     submodules = []
-    for name, url, path in bindings.workingcopy.parsegitsubmodules(data):
+    try:
+        origin_url = repo.ui.paths["default"].loc or None
+    except KeyError:
+        origin_url = None
+    for s in bindings.submodule.parse_gitmodules(data, origin_url):
         submodules.append(
-            Submodule(name, url, path, weakref.proxy(repo)),
+            Submodule(s["name"], s["url"], s["path"], weakref.proxy(repo)),
         )
 
     return submodules
@@ -836,8 +840,8 @@ def maybe_cleanup_submodule_in_treestate(repo):
         return
 
     remove = repo.dirstate._map._tree.remove
-    for _name, _url, path in bindings.workingcopy.parsegitsubmodules(data):
-        remove(path)
+    for s in bindings.submodule.parse_gitmodules(data):
+        remove(s["path"])
 
 
 def submodulecheckout(ctx, match=None, force=False, mctx=None):
@@ -992,8 +996,13 @@ class Submodule:
                 " creating submodule workingcopy at %s with backing repo %s\n"
                 % (repopath, backingrepo.root)
             )
+            # Prefer parentrepo's dotdir.
+            share_ui = backingrepo.ui
+            if share_ui.identity.dotdir() != ui.identity.dotdir():
+                share_ui = share_ui.copy()
+                share_ui.identity = ui.identity
             repo = hg.share(
-                backingrepo.ui,
+                share_ui,
                 backingrepo.root,
                 repopath,
                 update=False,
