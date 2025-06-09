@@ -1,5 +1,7 @@
 load("@fbcode_macros//build_defs:python_binary.bzl", "python_binary")
 load("@fbcode_macros//build_defs:python_library.bzl", "python_library")
+load("@fbcode_macros//build_defs:rust_binary.bzl", "rust_binary")
+load("@fbcode_macros//build_defs:rust_library.bzl", "rust_library")
 
 oncall("scm_client_infra")
 
@@ -66,5 +68,50 @@ python_binary(
         ":edenfs_config_util",
         "//eden/fs/cli:lib",
         "//eden/fs/cli:telemetry",
+    ],
+)
+
+rust_library(
+    name = "edenfs_config_manager_lib_rust",
+    srcs = ["edenfs_config_manager_lib.rs"],
+    crate_root = "edenfs_config_manager_lib.rs",
+    os_deps = [
+        (
+            "linux",
+            [
+                "fbsource//third-party/rust:sys-info",
+                "//common/rust/configerator:configerator_client",
+            ],
+        ),
+    ],
+    deps = [
+        "fbsource//third-party/rust:anyhow",
+        "fbsource//third-party/rust:chrono",
+        "fbsource//third-party/rust:chrono-tz",
+        "fbsource//third-party/rust:const_format",
+        "fbsource//third-party/rust:hex",
+        "fbsource//third-party/rust:md-5",
+        "fbsource//third-party/rust:rand",
+        "fbsource//third-party/rust:serde_json",
+        "fbsource//third-party/rust:tempfile",
+        "fbsource//third-party/rust:toml",
+        "//common/rust/shed/fbinit:fbinit",
+        "//common/rust/shed/hostcaps:hostcaps",
+        "//common/rust/shed/hostname:hostname",
+        "//configerator/structs/scm/eden/config:edenfs_config-rust",
+        "//eden/fs/cli_rs/edenfs-utils:edenfs-utils",
+    ],
+)
+
+rust_binary(
+    name = "edenfs_config_manager_rust",
+    srcs = ["edenfs_config_manager.rs"],
+    crate_root = "edenfs_config_manager.rs",
+    deps = [
+        "fbsource//third-party/rust:anyhow",
+        "fbsource//third-party/rust:clap",
+        ":edenfs_config_manager_lib_rust",
+        "//cli/rust/cli:cli",
+        "//common/rust/shed/fbinit:fbinit",
     ],
 )
