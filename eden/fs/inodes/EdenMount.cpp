@@ -699,15 +699,18 @@ void EdenMount::transitionToFsChannelInitializationErrorState() {
       case State::INITIALIZING:
       case State::RUNNING:
       case State::UNINITIALIZED:
-        XLOG(ERR)
-            << "FS channel initialization error occurred for an EdenMount in the unexpected "
-            << oldState << " state";
+        XLOGF(
+            ERR,
+            "FS channel initialization error occurred for an EdenMount in the unexpected {} state",
+            oldState);
         break;
 
       case State::STARTING:
-        XLOG(FATAL)
-            << "compare_exchange_strong failed when transitioning EdenMount's state from "
-            << oldState << " to " << newState;
+        XLOGF(
+            FATAL,
+            "compare_exchange_strong failed when transitioning EdenMount's state from {} to {}",
+            oldState,
+            newState);
         break;
     }
   }
@@ -995,8 +998,11 @@ void EdenMount::destroy() {
       break;
   }
 
-  XLOG(FATAL) << "EdenMount::destroy() called on mount " << getPath()
-              << " in unexpected state " << oldState;
+  XLOGF(
+      FATAL,
+      "EdenMount::destroy() called on mount {} in unexpected state {}",
+      getPath(),
+      oldState);
 }
 
 folly::SemiFuture<SerializedInodeMap> EdenMount::shutdown(
@@ -1759,9 +1765,12 @@ ImmediateFuture<CheckoutResult> EdenMount::checkout(
                            << " more checkout conflicts";
                 break;
               }
-              XLOG(DBG2) << "Checkout conflict on: " << conflict << " of type "
-                         << conflict.type().value() << " with dtype "
-                         << static_cast<int>(conflict.dtype().value());
+              XLOGF(
+                  DBG2,
+                  "Checkout conflict on: {} of type {} with dtype {}",
+                  conflict,
+                  conflict.type().value(),
+                  static_cast<int>(conflict.dtype().value()));
               printedConflicts++;
             }
           }

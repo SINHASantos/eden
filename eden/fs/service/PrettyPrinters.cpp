@@ -8,57 +8,43 @@
 #include "eden/fs/service/PrettyPrinters.h"
 
 #include <folly/Conv.h>
-#include <ostream>
 
 namespace {
 template <typename ThriftEnum>
-std::ostream& outputThriftEnum(
-    std::ostream& os,
-    ThriftEnum value,
-    folly::StringPiece typeName) {
-  const char* name = apache::thrift::TEnumTraits<ThriftEnum>::findName(value);
-  if (name) {
-    return os << name;
-  } else {
-    return os << typeName << "::" << int(value);
-  }
-}
-
-template <typename ThriftEnum>
 void appendThriftEnum(
-    ThriftEnum value,
+    const ThriftEnum& value,
     std::string* result,
     folly::StringPiece typeName) {
   const char* name = apache::thrift::TEnumTraits<ThriftEnum>::findName(value);
   if (name) {
-    result->append(name);
+    folly::toAppend(name, result);
   } else {
-    result->append(folly::to<std::string>(typeName, "::", int(value)));
+    folly::toAppend(typeName, "::", int(value), result);
   }
 }
 } // unnamed namespace
 
 namespace facebook::eden {
 
-std::ostream& operator<<(std::ostream& os, ConflictType conflictType) {
-  return outputThriftEnum(os, conflictType, "ConflictType");
+void toAppend(const ConflictType& conflictType, std::string* result) {
+  appendThriftEnum(conflictType, result, "ConflictType");
 }
 
-std::ostream& operator<<(std::ostream& os, const CheckoutConflict& conflict) {
-  os << "CheckoutConflict(type=" << *conflict.type() << ", path=\""
-     << *conflict.path() << "\", message=\"" << *conflict.message() << "\")";
-  return os;
+void toAppend(const CheckoutConflict& conflict, std::string* result) {
+  folly::toAppend("CheckoutConflict(type=", result);
+  appendThriftEnum(*conflict.type(), result, "ConflictType");
+  folly::toAppend(", path=\"", result);
+  folly::toAppend(*conflict.path(), result);
+  folly::toAppend("\", message=\"", result);
+  folly::toAppend(*conflict.message(), result);
+  folly::toAppend("\")", result);
 }
 
-std::ostream& operator<<(std::ostream& os, ScmFileStatus scmFileStatus) {
-  return outputThriftEnum(os, scmFileStatus, "ScmFileStatus");
+void toAppend(const ScmFileStatus& scmFileStatus, std::string* result) {
+  appendThriftEnum(scmFileStatus, result, "ScmFileStatus");
 }
 
-std::ostream& operator<<(std::ostream& os, MountState mountState) {
-  return outputThriftEnum(os, mountState, "MountState");
-}
-
-void toAppend(MountState mountState, std::string* result) {
+void toAppend(const MountState& mountState, std::string* result) {
   appendThriftEnum(mountState, result, "MountState");
 }
 

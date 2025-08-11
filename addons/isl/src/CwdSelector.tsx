@@ -35,7 +35,7 @@ import {DropdownField, DropdownFields} from './DropdownFields';
 import {useCommandEvent} from './ISLShortcuts';
 import {codeReviewProvider} from './codeReview/CodeReviewInfo';
 import {T, t} from './i18n';
-import {useAtomGet, writeAtom} from './jotaiUtils';
+import {writeAtom} from './jotaiUtils';
 import platform from './platform';
 import {serverCwd} from './repositoryData';
 import {submodulesByRoot, repositoryInfo} from './serverAPIState';
@@ -49,7 +49,8 @@ export function relativePath(root: AbsolutePath, path: AbsolutePath) {
   if (root == null || path === '') {
     return '';
   }
-  return path.replace(root, '');
+  const sep = guessPathSep(path);
+  return maybeTrimPrefix(path.replace(root, ''), sep);
 }
 
 /**
@@ -68,14 +69,30 @@ export function joinPaths(root: AbsolutePath, path: CwdRelativePath): AbsolutePa
  * maybeTrim('abc/', '/') -> 'abc'
  * maybeTrim('abc', '/') -> 'abc'
  */
-function maybeTrim(s: string, c: string): string {
+function maybeTrimSuffix(s: string, c: string): string {
   return s.endsWith(c) ? s.slice(0, -c.length) : s;
 }
 
-function getRepoLabel(repoRoot: AbsolutePath, cwd: string) {
+function maybeTrimPrefix(s: string, c: string): string {
+  return s.startsWith(c) ? s.slice(c.length) : s;
+}
+
+function getMainSelectorLabel(
+  directRepoRoot: AbsolutePath,
+  nestedRepoRoots: AbsolutePath[] | undefined,
+  cwd: string,
+) {
   const sep = guessPathSep(cwd);
-  const repoBasename = maybeTrim(basename(repoRoot, sep), sep);
-  const repoRelativeCwd = relativePath(repoRoot, cwd);
+
+  // If there are multiple nested repo roots,
+  // show the first one as there will be following selectors for the rest
+  if (nestedRepoRoots && nestedRepoRoots.length > 1) {
+    return maybeTrimPrefix(basename(nestedRepoRoots[0], sep), sep);
+  }
+
+  // Otherwise, build the label with the direct and only repo root
+  const repoBasename = maybeTrimPrefix(basename(directRepoRoot, sep), sep);
+  const repoRelativeCwd = relativePath(directRepoRoot, cwd);
   if (repoRelativeCwd === '') {
     return repoBasename;
   }
@@ -137,78 +154,151 @@ const styles = stylex.create({
 export function CwdSelector() {
   const info = useAtomValue(repositoryInfo);
   const currentCwd = useAtomValue(serverCwd);
-  const additionalToggles = useCommandEvent('ToggleCwdDropdown');
-  const allCwdOptions = useCwdOptions();
-  const cwdOptions = allCwdOptions.filter(opt => opt.valid);
   const allSubmoduleOptions = useSubmoduleOptions(info);
-  const submoduleOptions = allSubmoduleOptions?.filter(opt => opt.valid);
-  const hasSubmodules = submoduleOptions != null && submoduleOptions.length > 0;
   if (info == null) {
     return null;
   }
+  // The most direct root of the cwd
   const repoRoot = info.repoRoot;
-  const repoLabel = getRepoLabel(repoRoot, currentCwd);
+  // The list of repo roots down to the cwd, in order from furthest to closest
+  const repoRoots = info.repoRoots;
+
+  const mainLabel = getMainSelectorLabel(repoRoot, repoRoots, currentCwd);
 
   return (
     <div {...stylex.props(styles.container)}>
-      <Tooltip
-        trigger="click"
-        component={dismiss => <CwdDetails dismiss={dismiss} />}
-        additionalToggles={additionalToggles.asEventTarget()}
-        group="topbar"
-        placement="bottom"
-        title={
-          <T replace={{$shortcut: <Kbd keycode={KeyCode.C} modifiers={[Modifier.ALT]} />}}>
-            Repository info & cwd ($shortcut)
-          </T>
-        }>
-        {hasSubmodules || cwdOptions.length < 2 ? (
-          <Button
-            icon
-            data-testid="cwd-dropdown-button"
-            {...stylex.props(hasSubmodules && styles.hideRightBorder)}>
-            <Icon icon="folder" />
-            {repoLabel}
-          </Button>
-        ) : (
-          // use a ButtonDropdown as a shortcut to quickly change cwd
-          <ButtonDropdown
-            data-testid="cwd-dropdown-button"
-            kind="icon"
-            options={cwdOptions}
-            selected={
-              cwdOptions.find(opt => opt.id === currentCwd) ?? {
-                id: currentCwd,
-                label: repoLabel,
-                valid: true,
-              }
-            }
-            icon={<Icon icon="folder" />}
-            onClick={
-              () => null // fall through to the Tooltip
-            }
-            onChangeSelected={value => {
-              if (value.id !== currentCwd) {
-                changeCwd(value.id);
-              }
-            }}></ButtonDropdown>
-        )}
-      </Tooltip>
-      {/* Submodule dropdown if available */}
-      {hasSubmodules && (
-        <SubmoduleSelector
-          options={submoduleOptions}
-          selected={submoduleOptions.find(opt => opt.id === relativePath(repoRoot, currentCwd))}
-          onChangeSelected={value => {
-            if (value.id !== relativePath(repoRoot, currentCwd)) {
-              changeCwd(joinPaths(repoRoot, value.id));
-            }
-          }}
-          hideRightBorder={false}
-        />
-      )}
+      <MainCwdSelector
+        currentCwd={currentCwd}
+        label={mainLabel}
+        hideRightBorder={
+          (repoRoots && repoRoots.length > 1) ||
+          (allSubmoduleOptions?.get(repoRoot)?.length ?? 0) > 0
+        }
+      />
+      <SubmoduleSelectorGroup repoRoots={repoRoots} submoduleOptions={allSubmoduleOptions} />
     </div>
   );
+}
+
+/**
+ * The leftmost tooltip that can show cwd and repo details.
+ */
+function MainCwdSelector({
+  currentCwd,
+  label,
+  hideRightBorder,
+}: {
+  currentCwd: AbsolutePath;
+  label: string;
+  hideRightBorder: boolean;
+}) {
+  const allCwdOptions = useCwdOptions();
+  const cwdOptions = allCwdOptions.filter(opt => opt.valid);
+  const additionalToggles = useCommandEvent('ToggleCwdDropdown');
+
+  return (
+    <Tooltip
+      trigger="click"
+      component={dismiss => <CwdDetails dismiss={dismiss} />}
+      additionalToggles={additionalToggles.asEventTarget()}
+      group="topbar"
+      placement="bottom"
+      title={
+        <T replace={{$shortcut: <Kbd keycode={KeyCode.C} modifiers={[Modifier.ALT]} />}}>
+          Repository info & cwd ($shortcut)
+        </T>
+      }>
+      {hideRightBorder || cwdOptions.length < 2 ? (
+        <Button
+          icon
+          data-testid="cwd-dropdown-button"
+          {...stylex.props(hideRightBorder && styles.hideRightBorder)}>
+          <Icon icon="folder" />
+          {label}
+        </Button>
+      ) : (
+        // use a ButtonDropdown as a shortcut to quickly change cwd
+        <ButtonDropdown
+          data-testid="cwd-dropdown-button"
+          kind="icon"
+          options={cwdOptions}
+          selected={
+            cwdOptions.find(opt => opt.id === currentCwd) ?? {
+              id: currentCwd,
+              label,
+              valid: true,
+            }
+          }
+          icon={<Icon icon="folder" />}
+          onClick={
+            () => null // fall through to the Tooltip
+          }
+          onChangeSelected={value => {
+            if (value.id !== currentCwd) {
+              changeCwd(value.id);
+            }
+          }}></ButtonDropdown>
+      )}
+    </Tooltip>
+  );
+}
+
+function SubmoduleSelectorGroup({
+  repoRoots,
+  submoduleOptions,
+}: {
+  repoRoots: AbsolutePath[] | undefined;
+  submoduleOptions: Map<
+    AbsolutePath,
+    {id: RepoRelativePath; label: string; valid: boolean}[] | undefined
+  >;
+}) {
+  const currentCwd = useAtomValue(serverCwd);
+  // console.log('submoduleOptions', submoduleOptions);
+  if (repoRoots == null) {
+    return null;
+  }
+
+  const numRoots = repoRoots.length;
+  const directRepoRoot = repoRoots[numRoots - 1];
+  const submodulesToBeSelected = submoduleOptions.get(directRepoRoot);
+
+  const out = [];
+  for (let i = 1; i < numRoots; i++) {
+    const currRoot = repoRoots[i];
+    const prevRoot = repoRoots[i - 1];
+    const submodules = submoduleOptions.get(prevRoot);
+    if (submodules != null && submodules.length > 0) {
+      out.push(
+        <SubmoduleSelector
+          options={submodules}
+          selected={submodules?.find(opt => opt.id === relativePath(prevRoot, currRoot))}
+          onChangeSelected={value => {
+            if (value.id !== relativePath(prevRoot, currRoot)) {
+              changeCwd(joinPaths(prevRoot, value.id));
+            }
+          }}
+          hideRightBorder={i < numRoots - 1 || submodulesToBeSelected != undefined}
+        />,
+      );
+    }
+  }
+
+  if (submodulesToBeSelected != undefined) {
+    out.push(
+      <SubmoduleSelector
+        options={submodulesToBeSelected}
+        onChangeSelected={value => {
+          if (value.id !== relativePath(directRepoRoot, currentCwd)) {
+            changeCwd(joinPaths(directRepoRoot, value.id));
+          }
+        }}
+        hideRightBorder={false}
+      />,
+    );
+  }
+
+  return out;
 }
 
 function CwdDetails({dismiss}: {dismiss: () => unknown}) {
@@ -262,17 +352,23 @@ function useCwdOptions() {
 
 function useSubmoduleOptions(
   info: ValidatedRepoInfo | undefined,
-): {id: RepoRelativePath; label: string; valid: boolean}[] | undefined {
-  const fetchedSubmodules = useAtomGet(submodulesByRoot, info?.repoRoot);
-  if (info == null) {
-    return undefined;
-  }
+): Map<AbsolutePath, {id: RepoRelativePath; label: string; valid: boolean}[] | undefined> {
+  const repoRoots = info?.repoRoots;
+  const submodulesMap = useAtomValue(submodulesByRoot);
 
-  return fetchedSubmodules?.value?.map(m => ({
-    id: m.path,
-    label: m.name,
-    valid: m.active,
-  }));
+  return new Map(
+    repoRoots?.map(root => {
+      const fetchedSubmodules = submodulesMap.get(root);
+      return [
+        root,
+        fetchedSubmodules?.value?.map(m => ({
+          id: m.path,
+          label: m.name,
+          valid: m.active,
+        })),
+      ];
+    }),
+  );
 }
 
 function guessPathSep(path: string): '/' | '\\' {
@@ -337,7 +433,7 @@ function SubmoduleSelector<T extends {label: ReactNode; id: string}>({
   hideRightBorder = true,
 }: {
   options: ReadonlyArray<T>;
-  selected: T | undefined;
+  selected?: T;
   onChangeSelected: (newSelected: T) => unknown;
   hideRightBorder?: boolean;
 }) {

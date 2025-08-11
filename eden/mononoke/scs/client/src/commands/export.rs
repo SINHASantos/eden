@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -35,6 +36,8 @@ use futures::stream::TryStreamExt;
 use scs_client_raw::ScsClient;
 use scs_client_raw::thrift;
 use source_control::FileChunk;
+use source_control::FileIdSpecifier;
+use source_control::FileInfoParams;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufWriter;
@@ -104,9 +107,12 @@ pub(super) struct CommandArgs {
     #[clap(long)]
     /// Filename of a file containing a list of paths (relative to PATH) to exclude
     exclude_path_list_file: Option<String>,
-    #[clap(long)]
+    #[clap(long, hide = true)]
     /// Exclude files >= specified byte size.
     file_size_threshold: Option<ByteSize>,
+    #[clap(long, hide = true)]
+    /// Exclude binary files >= specified byte size.
+    binary_file_size_threshold: Option<ByteSize>,
     #[clap(long)]
     /// Perform additional requests to try for case insensitive matches
     case_insensitive: bool,
@@ -129,17 +135,20 @@ async fn stream_tree_elements(
         path: path.to_string(),
         ..Default::default()
     });
-    let response = connection
-        .tree_list(
-            &tree,
-            &thrift::TreeListParams {
-                offset: 0,
-                limit: source_control::TREE_LIST_MAX_LIMIT,
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(|e| e.handle_selection_error(&commit.repo))?;
+
+    let params = thrift::TreeListParams {
+        offset: 0,
+        limit: source_control::TREE_LIST_MAX_LIMIT,
+        ..Default::default()
+    };
+    let response = request_with_retries(
+        connection.clone(),
+        tree.clone(),
+        params,
+        async |client, tree, params| client.tree_list(tree, params).await,
+    )
+    .await
+    .map_err(|e| e.handle_selection_error(&commit.repo))?;
 
     Ok(stream::iter(response.entries)
         .map(|entry| Ok(entry.name))
@@ -150,14 +159,19 @@ async fn stream_tree_elements(
             )
             .map({
                 let connection = connection.clone();
+                let tree = tree.clone();
                 move |offset| {
-                    connection.tree_list(
-                        &tree,
-                        &thrift::TreeListParams {
-                            offset,
-                            limit: source_control::TREE_LIST_MAX_LIMIT,
-                            ..Default::default()
-                        },
+                    let params = thrift::TreeListParams {
+                        offset,
+                        limit: source_control::TREE_LIST_MAX_LIMIT,
+                        ..Default::default()
+                    };
+
+                    request_with_retries(
+                        connection.clone(),
+                        tree.clone(),
+                        params,
+                        async |client, tree, params| client.tree_list(tree, params).await,
                     )
                 }
             })
@@ -316,10 +330,9 @@ fn export_tree_entry(
             if filter.matches_file(&casefold.of(&name)) {
                 Some(ExportItem::File {
                     path: join_path(path, &name),
-                    id: info.id,
+                    file: info,
                     tx,
                     destination: destination.join(&name),
-                    size: info.file_size as u64,
                     type_: entry.r#type,
                 })
             } else {
@@ -354,10 +367,14 @@ async fn export_tree(
         limit: TREE_CHUNK_SIZE,
         ..Default::default()
     };
-    let response = connection
-        .tree_list(&tree, &params)
-        .await
-        .map_err(|e| e.handle_selection_error(&repo))?;
+    let response = request_with_retries(
+        connection.clone(),
+        tree.clone(),
+        params.clone(),
+        async |client, tree, params| client.tree_list(tree, params).await,
+    )
+    .await
+    .map_err(|e| e.handle_selection_error(&repo))?;
     let count = response.count;
     let other_tree_chunks =
         stream::iter((TREE_CHUNK_SIZE..count).step_by(TREE_CHUNK_SIZE as usize))
@@ -374,11 +391,15 @@ async fn export_tree(
                             ..Default::default()
                         };
                         anyhow::Ok(
-                            connection
-                                .tree_list(&tree, &params)
-                                .await
-                                .map_err(|e| e.handle_selection_error(&repo))?
-                                .entries,
+                            request_with_retries(
+                                connection,
+                                tree.clone(),
+                                params,
+                                async |client, tree, params| client.tree_list(tree, params).await,
+                            )
+                            .await
+                            .map_err(|e| e.handle_selection_error(&repo))?
+                            .entries,
                         )
                     }
                 }
@@ -408,24 +429,46 @@ async fn export_tree(
 async fn export_file(
     connection: ScsClient,
     repo: thrift::RepoSpecifier,
-    id: Vec<u8>,
+    file: thrift::FileInfo,
     tx: FileSender,
     destination: PathBuf,
-    size: u64,
     _type_: thrift::EntryType,
-    file_size_threshold: Option<u64>,
+    file_filter: FileFilter,
 ) -> Result<()> {
     let mut file_metadata = FileMetadata {
-        size,
+        size: file.file_size as u64,
         path: destination.clone(),
         entry_type: _type_,
     };
 
-    let responses = if file_size_threshold.is_some_and(|t| size >= t) {
+    let too_big = match file_filter.filter_size(file.file_size as u64) {
+        FilterDecision::Allow => false,
+        FilterDecision::TooBig => true,
+        FilterDecision::MaybeTooBig => {
+            // Fetch full file metadata.
+            // TODO: make tree_list() optionally include the fully populated FileInfo.
+            let file_info = request_with_retries(
+                connection.clone(),
+                source_control::FileSpecifier::by_id(FileIdSpecifier {
+                    repo: repo.clone(),
+                    id: file.id.clone(),
+                    ..Default::default()
+                }),
+                FileInfoParams::default(),
+                async |client, file, params| client.file_info(file, params).await,
+            )
+            .await?;
+
+            file_filter.too_big(&file_info)
+        }
+    };
+
+    let responses = if too_big {
         // File is above size threshold - export placeholder content.
         let placeholder = format!(
-            "This is a placeholder for a large file\n\nOriginal file id: {}\nOriginal file size: {size}\n",
-            faster_hex::hex_string(&id),
+            "This is a placeholder for a large file\n\nOriginal file id: {}\nOriginal file size: {}\n",
+            faster_hex::hex_string(&file.id),
+            file.file_size,
         );
         file_metadata.size = placeholder.len() as u64;
         stream::once(future::ready(
@@ -441,29 +484,33 @@ async fn export_file(
             .boxed(),
         ))
         .right_stream()
-    } else if size > 0 {
-        let file = thrift::FileSpecifier::by_id(thrift::FileIdSpecifier {
+    } else if file.file_size > 0 {
+        let file_spec = thrift::FileSpecifier::by_id(thrift::FileIdSpecifier {
             repo: repo.clone(),
-            id,
+            id: file.id,
             ..Default::default()
         });
-        stream::iter((0..size).step_by(FILE_CHUNK_SIZE as usize))
+        stream::iter((0..file.file_size).step_by(FILE_CHUNK_SIZE as usize))
             .map({
                 move |offset| {
                     cloned!(repo);
                     let params = thrift::FileContentChunkParams {
-                        offset: offset as i64,
+                        offset,
                         size: FILE_CHUNK_SIZE,
                         ..Default::default()
                     };
-                    connection
-                        .file_content_chunk(&file, &params)
-                        .map_err(move |e| e.handle_selection_error(&repo))
-                        .map_ok({
-                            cloned!(file_metadata);
-                            move |chunk| (file_metadata, chunk)
-                        })
-                        .boxed()
+                    request_with_retries(
+                        connection.clone(),
+                        file_spec.clone(),
+                        params,
+                        async |client, file, params| client.file_content_chunk(file, params).await,
+                    )
+                    .map_err(move |e| e.handle_selection_error(&repo))
+                    .map_ok({
+                        cloned!(file_metadata);
+                        move |chunk| (file_metadata, chunk)
+                    })
+                    .boxed()
                 }
             })
             .left_stream()
@@ -496,7 +543,7 @@ async fn export_item(
     item: ExportItem,
     casefold: Casefold,
     create_dirs: CreateDirs,
-    file_size_threshold: Option<u64>,
+    file_filter: FileFilter,
     files_written: Arc<AtomicU64>,
 ) -> Result<(Option<String>, Vec<ExportItem>)> {
     match item {
@@ -523,23 +570,12 @@ async fn export_item(
         }
         ExportItem::File {
             path,
-            id,
             tx,
+            file,
             destination,
-            size,
             type_,
         } => {
-            export_file(
-                connection,
-                repo,
-                id,
-                tx,
-                destination,
-                size,
-                type_,
-                file_size_threshold,
-            )
-            .await?;
+            export_file(connection, repo, file, tx, destination, type_, file_filter).await?;
             files_written.fetch_add(1, Ordering::Relaxed);
             Ok((Some(path), Vec::new()))
         }
@@ -556,10 +592,9 @@ enum ExportItem {
     },
     File {
         path: String,
-        id: Vec<u8>,
+        file: thrift::FileInfo,
         tx: FileSender,
         destination: PathBuf,
-        size: u64,
         type_: thrift::EntryType,
     },
 }
@@ -747,6 +782,52 @@ enum Destination {
     Stdout,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FileFilter {
+    size_threshold: Option<u64>,
+    binary_size_threshold: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FilterDecision {
+    Allow,
+    TooBig,
+    MaybeTooBig,
+}
+
+impl FileFilter {
+    fn filter_size(&self, size: u64) -> FilterDecision {
+        if let Some(threshold) = self.size_threshold {
+            if size >= threshold {
+                return FilterDecision::TooBig;
+            }
+        }
+
+        if let Some(threshold) = self.binary_size_threshold {
+            if size >= threshold {
+                // Not sure if the file is binary yet.
+                return FilterDecision::MaybeTooBig;
+            }
+        }
+
+        FilterDecision::Allow
+    }
+
+    fn too_big(&self, file: &thrift::FileInfo) -> bool {
+        if self.filter_size(file.file_size as u64) == FilterDecision::TooBig {
+            return true;
+        }
+
+        if let Some(threshold) = self.binary_size_threshold {
+            if file.file_size as u64 >= threshold && file.is_binary {
+                return true;
+            }
+        }
+
+        false
+    }
+}
+
 pub(super) async fn run(app: ScscApp, args: CommandArgs) -> Result<()> {
     let destination = match args.output.as_ref() {
         "-" => {
@@ -827,7 +908,10 @@ pub(super) async fn run(app: ScscApp, args: CommandArgs) -> Result<()> {
         ..Default::default()
     };
 
-    let file_size_threshold = args.file_size_threshold.map(|bs| bs.0);
+    let file_filter = FileFilter {
+        size_threshold: args.file_size_threshold.map(|bs| bs.0),
+        binary_size_threshold: args.binary_file_size_threshold.map(|bs| bs.0),
+    };
 
     let params = thrift::CommitPathInfoParams {
         ..Default::default()
@@ -916,10 +1000,9 @@ pub(super) async fn run(app: ScscApp, args: CommandArgs) -> Result<()> {
             }
             ExportItem::File {
                 path,
-                id: info.id,
+                file: info,
                 tx,
                 destination: root,
-                size: info.file_size as u64,
                 type_,
             }
         }
@@ -937,7 +1020,7 @@ pub(super) async fn run(app: ScscApp, args: CommandArgs) -> Result<()> {
                 item,
                 casefold,
                 create_dirs,
-                file_size_threshold,
+                file_filter,
                 files_written.clone(),
             )
             .boxed()
@@ -969,4 +1052,35 @@ pub(super) async fn run(app: ScscApp, args: CommandArgs) -> Result<()> {
     app.target.render_stderr(&(), render).await?;
     file_writer.await??;
     downloader.await?
+}
+
+async fn request_with_retries<V, E: std::fmt::Debug, S, P>(
+    client: ScsClient,
+    specifier: S,
+    params: P,
+    do_query: impl AsyncFn(&ScsClient, &S, &P) -> Result<V, E>,
+) -> Result<V, E> {
+    const MAX_RETRIES: usize = 10;
+
+    const MIN_BACKOFF: Duration = Duration::from_secs(1);
+    const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+    let mut backoff = MIN_BACKOFF;
+
+    let mut retries = MAX_RETRIES;
+    loop {
+        match do_query(&client, &specifier, &params).await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                eprintln!("SCS error (retries={retries}, backoff={backoff:?}): {e:?}");
+                if retries == 0 {
+                    return Err(e);
+                }
+                retries -= 1;
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+                backoff = backoff.min(MAX_BACKOFF);
+            }
+        }
+    }
 }
